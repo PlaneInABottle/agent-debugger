@@ -1,6 +1,5 @@
 // agent-debugger: agent-first CLI debugger. Java + Python + Node + Browser.
 
-mod adapter;
 mod bridge;
 mod client;
 mod dap;
