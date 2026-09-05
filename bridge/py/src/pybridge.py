@@ -660,7 +660,12 @@ class Session:
             body = self.dap_request("setBreakpoints",
                                     {"source": {"path": path},
                                      "breakpoints": [it["bp"] for it in items]})
-            for item, got in zip(items, body.get("breakpoints", [])):
+            got_list = body.get("breakpoints", [])
+            for idx, item in enumerate(items):
+                # Defensive: if the adapter returns fewer entries than
+                # requested, zip() would silently drop stops. Missing entries
+                # report pending rather than vanishing.
+                got = got_list[idx] if idx < len(got_list) else {}
                 verified = bool(got.get("verified", False))
                 spec = f"{self.rel_file(path)}:{item['line']}"
                 if item["kind"] == "break" and item.get("cond"):
