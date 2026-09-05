@@ -54,6 +54,32 @@ const NODEBRIDGE_SOURCE: &str = include_str!("../bridge/node/src/nodebridge.js")
 
 const BROWSERBRIDGE_SOURCE: &str = include_str!("../bridge/browser/src/browserbridge.js");
 
+/// Shared JS wire core, required relatively by both CDP bridges.
+/// Single source in the repo; provisioned next to each bridge on disk.
+const JS_SHARED: &[(&str, &str)] = &[
+    ("cdp_conn.js", include_str!("../bridge/js/cdp_conn.js")),
+    ("framing.js", include_str!("../bridge/js/framing.js")),
+];
+
+/// Write the shared JS core into a bridge dir when changed.
+fn ensure_js_shared(dir: &std::path::Path) -> anyhow::Result<bool> {
+    let mut changed = false;
+    for (name, source) in JS_SHARED {
+        let dest = dir.join(name);
+        let same = std::fs::read_to_string(&dest)
+            .map(|existing| existing == *source)
+            .unwrap_or(false);
+        if !same {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.to_string_lossy()))?;
+            std::fs::write(&dest, source)
+                .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", dest.to_string_lossy()))?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 pub fn adapter_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(home)
@@ -285,14 +311,19 @@ pub fn ensure_ws() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Write the embedded nodebridge when it changed; return its path.
+/// Write the embedded nodebridge (+ shared core) when changed; return path.
 pub fn ensure_nodebridge() -> anyhow::Result<PathBuf> {
     let dir = node_dir();
     let dest = dir.join("nodebridge.js");
-    let stale = match std::fs::read_to_string(&dest) {
+    // Independent checks: `||` would short-circuit and skip the shared
+    // write exactly when the bridge itself is stale (observed live: new
+    // bridge with requires, shared files missing, startup crash).
+    let bridge_stale = match std::fs::read_to_string(&dest) {
         Ok(existing) => existing != NODEBRIDGE_SOURCE,
         Err(_) => true,
     };
+    let shared_stale = ensure_js_shared(&dir)?;
+    let stale = bridge_stale || shared_stale;
     if stale {
         std::fs::create_dir_all(&dir)
             .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.to_string_lossy()))?;
@@ -316,10 +347,13 @@ pub fn browser_dir() -> PathBuf {
 pub fn ensure_browserbridge() -> anyhow::Result<PathBuf> {
     let dir = browser_dir();
     let dest = dir.join("browserbridge.js");
-    let stale = match std::fs::read_to_string(&dest) {
+    // Same no-short-circuit rule as ensure_nodebridge (see above).
+    let bridge_stale = match std::fs::read_to_string(&dest) {
         Ok(existing) => existing != BROWSERBRIDGE_SOURCE,
         Err(_) => true,
     };
+    let shared_stale = ensure_js_shared(&dir)?;
+    let stale = bridge_stale || shared_stale;
     if stale {
         std::fs::create_dir_all(&dir)
             .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.to_string_lossy()))?;

@@ -46,7 +46,12 @@ const path = require('path');
 const { pathToFileURL } = require('url');
 
 class Usage extends Error {}
-class BridgeErr extends Error {}
+// Wire core lives in the shared modules (single source under bridge/js/,
+// provisioned next to this bridge):
+//   ./cdp_conn.js  BridgeErr + CdpConn (id-matched CDP over ws)
+//   ./framing.js   readFrame + writeFrame (Content-Length + JSON)
+const { BridgeErr, CdpConn } = require('./cdp_conn.js');
+const { readFrame, writeFrame } = require('./framing.js');
 class CloseSession extends Error {}
 
 const MAX_STRING = 200;
@@ -62,69 +67,8 @@ const NOISE_LINES = new Set([
   'For help, see: https://nodejs.org/learn/getting-started/debugging',
 ]);
 
-// ---------------------------------------------------------------- framing
 
-function readFrame(conn) {
-  return new Promise((resolve, reject) => {
-    let buf = Buffer.alloc(0);
-    const onData = (chunk) => {
-      buf = Buffer.concat([buf, chunk]);
-      const sep = buf.indexOf('\r\n\r\n');
-      if (sep < 0) return;
-      let length = -1;
-      for (const line of buf.subarray(0, sep).toString('ascii').split('\r\n')) {
-        const i = line.indexOf(':');
-        if (i > 0 && line.slice(0, i).trim().toLowerCase() === 'content-length') {
-          length = parseInt(line.slice(i + 1).trim(), 10);
-        }
-      }
-      if (Number.isNaN(length) || length < 0) {
-        cleanup();
-        reject(new BridgeErr('bad frame: no Content-Length'));
-        return;
-      }
-      if (buf.length < sep + 4 + length) return;
-      const body = buf.subarray(sep + 4, sep + 4 + length);
-      cleanup();
-      try {
-        resolve(JSON.parse(body.toString('utf-8')));
-      } catch (e) {
-        reject(new BridgeErr('bad frame: ' + e.message));
-      }
-    };
-    const onClose = () => {
-      cleanup();
-      reject(new BridgeErr('truncated frame'));
-    };
-    const cleanup = () => {
-      conn.removeListener('data', onData);
-      conn.removeListener('close', onClose);
-    };
-    conn.on('data', onData);
-    conn.on('close', onClose);
-  });
-}
 
-function writeFrame(conn, obj) {
-  // Never throws synchronously: writing to a dead socket raises sync
-  // (writeAfterFIN) instead of calling back with err. A connect+drop health
-  // check (e.g. our own `status` probe) used to kill the whole daemon here.
-  return new Promise((resolve, reject) => {
-    let msg;
-    try {
-      const body = Buffer.from(JSON.stringify(obj), 'utf-8');
-      msg = Buffer.concat([Buffer.from(`Content-Length: ${body.length}\r\n\r\n`), body]);
-    } catch (e) {
-      reject(e);
-      return;
-    }
-    try {
-      conn.write(msg, (err) => (err ? reject(err) : resolve()));
-    } catch (e) {
-      reject(e);
-    }
-  });
-}
 
 // ---------------------------------------------------------------- args
 
@@ -254,81 +198,6 @@ function loadWs() {
 }
 
 /** Minimal CDP client: id-matched requests plus an event handler. */
-class CdpConn {
-  constructor(ws, onClose) {
-    this.ws = ws;
-    this.seq = 0;
-    this.pending = new Map();
-    this.onEvent = null;
-    this.closed = false;
-    ws.on('message', (data) => {
-      let msg;
-      try {
-        msg = JSON.parse(data.toString());
-      } catch (_) {
-        return;
-      }
-      if (msg.id !== undefined && this.pending.has(msg.id)) {
-        const { resolve } = this.pending.get(msg.id);
-        this.pending.delete(msg.id);
-        resolve(msg);
-      } else if (msg.method && this.onEvent) {
-        this.onEvent(msg);
-      }
-    });
-    ws.on('close', () => {
-      this.closed = true;
-      for (const { reject } of this.pending.values()) {
-        reject(new BridgeErr('CDP connection closed'));
-      }
-      this.pending.clear();
-      if (onClose) {
-        try {
-          onClose();
-        } catch (_) { /* best effort */ }
-      }
-    });
-    ws.on('error', () => { /* close follows */ });
-  }
-
-  request(method, params = {}, timeoutMs = 30000) {
-    if (this.closed) return Promise.reject(new BridgeErr('CDP connection closed'));
-    const id = ++this.seq;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new BridgeErr(`CDP ${method} timed out after ${Math.round(timeoutMs / 1000)}s`));
-      }, timeoutMs);
-      this.pending.set(id, {
-        resolve: (msg) => {
-          clearTimeout(timer);
-          if (msg.error) {
-            reject(new BridgeErr(`CDP ${method} failed: ${msg.error.message || JSON.stringify(msg.error)}`));
-          } else {
-            resolve(msg.result || {});
-          }
-        },
-        reject: (e) => {
-          clearTimeout(timer);
-          reject(e);
-        },
-      });
-      this.ws.send(JSON.stringify({ id, method, params }), (err) => {
-        if (err) {
-          this.pending.delete(id);
-          clearTimeout(timer);
-          reject(new BridgeErr(`CDP ${method} send failed: ${err.message}`));
-        }
-      });
-    });
-  }
-
-  close() {
-    try {
-      this.ws.close();
-    } catch (_) { /* best effort */ }
-  }
-}
 
 // ---------------------------------------------------------------- session
 
