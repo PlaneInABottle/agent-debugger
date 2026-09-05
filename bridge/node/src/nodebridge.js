@@ -988,6 +988,9 @@ class Session {
 
   async cmdStep(req, timeout) {
     this.requireLive();
+    // Stepping needs a stopped frame to step from (uniform contract on
+    // all bridges); continuing works from running (it just waits).
+    this.requireStopped();
     const mode = req.mode || 'over';
     const method = { over: 'Debugger.stepOver', into: 'Debugger.stepInto', out: 'Debugger.stepOut' }[mode];
     if (!method) throw new BridgeErr(`bad step mode: ${mode}`);
@@ -1008,10 +1011,14 @@ class Session {
 
   async cmdContinue(req, timeout) {
     this.requireLive();
-    this.paused = null;
-    this.cachedLocals = [];
-    await this.cdp.request('Debugger.resume');
-    this.publishState(false);
+    if (this.paused) {
+      this.paused = null;
+      this.cachedLocals = [];
+      await this.cdp.request('Debugger.resume');
+      this.publishState(false);
+    }
+    // Running already: nothing to resume (a bare resume errors on some
+    // targets) — just wait for the next stop.
     return this.resumeAndWait(timeout);
   }
 
@@ -1193,6 +1200,9 @@ async function main(argv) {
     die(`cannot create ${cfg.dir}: ${e.message}`, 1);
   }
   writeOwner(cfg.dir);
+  // Verify loudly: a silent owner-write failure would surface later as
+  // a baffling instant self-reap (amOwner false → abandonment exit).
+  if (!amOwner(cfg.dir)) die(`cannot claim session dir ${cfg.dir} (owner write failed)`, 1);
   const server = net.createServer();
   server.on('error', (e) => die(`session socket: ${e.message}`, 1));
   // Permanent queue: Node emits 'connection' eagerly, even with no listener
