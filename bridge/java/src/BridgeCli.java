@@ -3,6 +3,13 @@ import java.util.ArrayList;
 
 // argv parsing and stop-spec validation for attach/launch/session modes. Moved verbatim from JdiBridge.java.
 class BridgeCli {
+    static long timeoutMillis(String raw) throws UsageException {
+        try {
+            long seconds = Long.parseLong(raw);
+            if (seconds >= 1 && seconds <= 3600) return seconds * 1000;
+        } catch (NumberFormatException ignored) {}
+        throw new UsageException("timeout must be between 1 and 3600 seconds");
+    }
     static void run(String[] argv) throws Exception {
         if (argv.length == 0) throw new UsageException("usage: JdiBridge attach|launch|session [options]");
         Config cfg = new Config();
@@ -25,7 +32,7 @@ class BridgeCli {
                 case "--logpoint": parseLogpoint(cfg, next(argv, ++i, "--logpoint")); break;
                 case "--watch": parseWatchpoint(cfg, next(argv, ++i, "--watch")); break;
                 case "--exit": parseExit(cfg, next(argv, ++i, "--exit")); break;
-                case "--timeout": cfg.timeoutMs = Long.parseLong(next(argv, ++i, "--timeout")) * 1000; break;
+                case "--timeout": cfg.timeoutMs = timeoutMillis(next(argv, ++i, "--timeout")); break;
                 case "--dir": cfg.sessionDir = next(argv, ++i, "--dir"); break;
                 case "--kind": cfg.sessionKind = next(argv, ++i, "--kind"); break;
                 default: throw new UsageException("unknown arg: " + a);

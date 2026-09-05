@@ -58,17 +58,11 @@ class BridgeConn {
         }
     }
 
-    /** Quote one launching-connector token when it contains whitespace.
-     * OpenJDK groups double-quoted sections but has no working escape for
-     * an inner quote (it corrupts the token AND the following ones), so an
-     * argument containing `"` is passed through raw exactly like before —
-     * spaces still split there, but previously-working quoteless args keep
-     * working. Backslashes pass through untouched (verified byte-identical).
-     * Only the common real case changes: paths/args with spaces, which
-     * used to split silently into several argv entries. */
-    static String quoteArg(String s) {
-        boolean ws = s.indexOf(' ') >= 0 || s.indexOf('\t') >= 0;
-        if (!ws || s.indexOf('"') >= 0) return s;
+    /** Reject tokens the connector cannot represent instead of corrupting argv. */
+    static String quoteArg(String s) throws BridgeException {
+        if (s.isEmpty() || s.indexOf('"') >= 0 || s.indexOf('\n') >= 0 || s.indexOf('\r') >= 0) {
+            throw new BridgeException("JDI launcher cannot preserve empty arguments, double quotes or newlines; launch externally and attach");
+        }
         return "\"" + s + "\"";
     }
 

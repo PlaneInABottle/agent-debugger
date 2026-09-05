@@ -36,25 +36,35 @@ class BridgeProto {
     }
 
     static String readFrame(InputStream in) throws Exception {
+        long deadline = System.nanoTime() + 5_000_000_000L;
         ByteArrayOutputStream header = new ByteArrayOutputStream();
         int[] last = new int[]{-1, -1, -1, -1};
         int b;
         while ((b = in.read()) >= 0) {
+            if (System.nanoTime() >= deadline) throw new BridgeException("frame read timed out");
             header.write(b);
+            if (header.size() > 8192) throw new BridgeException("frame header too large");
             last[0] = last[1]; last[1] = last[2]; last[2] = last[3]; last[3] = b;
             if (last[0] == '\r' && last[1] == '\n' && last[2] == '\r' && last[3] == '\n') break;
         }
+        if (b < 0) throw new BridgeException("truncated frame");
         int length = -1;
         for (String line : header.toString("US-ASCII").split("\r\n")) {
             int colon = line.indexOf(':');
             if (colon > 0 && line.substring(0, colon).trim().equalsIgnoreCase("Content-Length")) {
-                length = Integer.parseInt(line.substring(colon + 1).trim());
+                try {
+                    length = Integer.parseInt(line.substring(colon + 1).trim());
+                } catch (NumberFormatException e) {
+                    throw new BridgeException("bad Content-Length");
+                }
             }
         }
         if (length < 0) throw new BridgeException("bad frame: no Content-Length");
+        if (length > 1024 * 1024) throw new BridgeException("frame body too large");
         byte[] body = new byte[length];
         int off = 0;
         while (off < length) {
+            if (System.nanoTime() >= deadline) throw new BridgeException("frame read timed out");
             int n = in.read(body, off, length - off);
             if (n < 0) throw new BridgeException("truncated frame");
             off += n;

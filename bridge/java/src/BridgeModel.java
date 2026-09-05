@@ -59,23 +59,17 @@ class SessionState {
         ServerSocket server;
         ThreadReference thread;
         Location location;
-        // Publication protocol (waiter thread vs drain thread): stop fields
-        // above are written before `suspended` flips, and readers check
-        // `suspended` first — both volatile, so a reader that sees
-        // suspended==true also sees the whole stop. Never reorder.
-        volatile boolean suspended; // true between stops, false while target runs
-        volatile boolean exited;
+        // All session state is owned by the single serving/event thread.
+        boolean suspended;
+        boolean exited;
         Map<String, String> lastTop; // top-frame locals at previous stop
         String lastChanged = "[]"; // JSON array of new/changed local names
         String stopInfo; // JSON object describing WHY we stopped (watch/exit/exception)
-        java.util.Set<String> planted = java.util.concurrent.ConcurrentHashMap.newKeySet(); // classes already planted
+        java.util.Set<String> planted = new java.util.HashSet<>(); // classes already planted
         Path dir; // session dir (logs.jsonl lives here)
         int logCount;
         String ownerNonce; // session ownership token (see amOwner)
         String lastStopJson; // pre-rendered {"file","line","method"}, null until first stop
-        Map<String, Integer> hitCounts = new java.util.concurrent.ConcurrentHashMap<>(); // hit-key -> stops fired (served by `breaks`)
-        final Object queueLock = new Object(); // guards waiterActive/drainIdle
-        boolean waiterActive; // a continue/step owns the event queue right now
-        boolean drainIdle; // drainer parked in wait(): safe for waiter to proceed
+        Map<String, Integer> hitCounts = new java.util.HashMap<>(); // hit-key -> stops fired (served by `breaks`)
     }
 class CloseSession extends Exception {}
