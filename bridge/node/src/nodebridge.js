@@ -537,7 +537,7 @@ class Session {
         process.stderr.write(`warn: ${msg}\n`);
         this.stopStates.push({
           spec: this.dispSpec(l, 'logpoint'), kind: 'logpoint',
-          state: 'shadowed', detail: msg,
+          state: 'shadowed', detail: msg, hits: 0,
         });
         continue;
       }
@@ -554,13 +554,14 @@ class Session {
       if (item.brk && item.brk.cond) params.condition = item.brk.cond;
       const res = await this.cdp.request('Debugger.setBreakpointByUrl', params);
       const bpId = res.breakpointId;
-      const rec = { spec: this.dispSpec(spec, kind), kind };
+      const rec = { spec: this.dispSpec(spec, kind), kind, hits: 0 };
       if (kind === 'logpoint') rec.detail = spec.template;
       if (!bpId) {
         const msg = `breakpoint rejected: ${spec.path}:${spec.line}`;
         process.stderr.write(`warn: ${msg}\n`);
         rec.state = 'rejected';
         rec.detail = kind === 'logpoint' ? `${spec.template} (${msg})` : msg;
+        rec.hits = 0;
         this.stopStates.push(rec);
         continue;
       }
@@ -597,7 +598,22 @@ class Session {
       this.stopStates.push(rec);
     }
     if (this.cfg.wantExc) {
-      this.stopStates.push({ spec: 'exc', kind: 'exc', state: 'armed' });
+      this.stopStates.push({ spec: 'exc', kind: 'exc', state: 'armed', hits: 0 });
+    }
+  }
+
+  /** Attribute a pause to the records it hit (served as `hits` by
+   *  `breaks`). Counts exactly what the adapter reports in hitBreakpoints —
+   *  step landings normally carry none, so they don't inflate counters. */
+  countHits(p) {
+    for (const id of p.hitBreakpoints || []) {
+      const entry = this.breakIdToRec.get(id);
+      if (entry && typeof entry.rec.hits === 'number') entry.rec.hits += 1;
+    }
+    if (p.reason === 'exception') {
+      for (const rec of this.stopStates) {
+        if (rec.kind === 'exc' && typeof rec.hits === 'number') rec.hits += 1;
+      }
     }
   }
 
@@ -664,6 +680,7 @@ class Session {
     const frames = this.userFrames(p.callFrames || []);
     const logHits = hits.filter((id) => this.logpointIds.has(id));
     const realHits = hits.filter((id) => !this.logpointIds.has(id));
+    this.countHits(p);
     for (const id of logHits) {
       await this.fireLogpoint(id, frames);
     }

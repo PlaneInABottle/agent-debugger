@@ -56,6 +56,11 @@ agent-debugger --session cart context  # where it is parked (if stopped)
   `shadowed` (logpoint killed by a same-line break), `armed` (no receipt
   available: exc/watch/exit/method), `rejected`. `detail` carries the
   logpoint template / slide target / pending reason.
+- `breaks` also reports `hits` per stop: how many reported stops it fired.
+  Step landings never count (only real hits do), so a dead breakpoint
+  honestly reads 0. `hits:null` means uncountable, not zero (Python
+  logpoints fire inside debugpy, invisibly). After compaction, hits tell
+  you which of your breakpoints are actually live.
 - Name sessions after the task (`--session cart-npe`): the name is the
   only "why" that survives, and it costs nothing extra.
 - Never `rm -rf` a session dir instead of `close` (bridges self-reap, but

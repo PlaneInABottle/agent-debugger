@@ -832,6 +832,7 @@ public class JdiBridge {
         int logCount;
         String ownerNonce; // session ownership token (see amOwner)
         String lastStopJson; // pre-rendered {"file","line","method"}, null until first stop
+        Map<String, Integer> hitCounts = new java.util.HashMap<>(); // hit-key -> stops fired (served by `breaks`)
         final Object queueLock = new Object(); // guards waiterActive
         boolean waiterActive; // a continue/step owns the event queue right now
     }
@@ -1463,6 +1464,7 @@ public class JdiBridge {
                     st.suspended = true;
                     st.stopInfo = null; // plain stop supersedes any previous reason
                     trackChanges(st);
+                    countBreakHit(st, bp.location());
                     stop = snapshot(vm, st.cfg, st.thread, st.location, st.out);
                 } else if (event instanceof com.sun.jdi.event.StepEvent) {
                     com.sun.jdi.event.StepEvent se = (com.sun.jdi.event.StepEvent) event;
@@ -1483,6 +1485,7 @@ public class JdiBridge {
                     st.suspended = true;
                     st.stopInfo = exceptionInfo(ee);
                     trackChanges(st);
+                    countExcHits(st, ee);
                     stop = snapshot(vm, st.cfg, st.thread, st.location, st.out);
                 } else if (event instanceof com.sun.jdi.event.ModificationWatchpointEvent) {
                     com.sun.jdi.event.ModificationWatchpointEvent we =
@@ -1492,6 +1495,7 @@ public class JdiBridge {
                     st.suspended = true;
                     st.stopInfo = watchInfo(we.field(), "write", we.valueToBe());
                     trackChanges(st);
+                    try { bump(st, "watch|" + we.field().declaringType().name() + "." + we.field().name()); } catch (Exception ignored) {}
                     stop = snapshot(vm, st.cfg, st.thread, st.location, st.out);
                 } else if (event instanceof com.sun.jdi.event.AccessWatchpointEvent) {
                     com.sun.jdi.event.AccessWatchpointEvent we =
@@ -1501,6 +1505,7 @@ public class JdiBridge {
                     st.suspended = true;
                     st.stopInfo = watchInfo(we.field(), "read", we.valueCurrent());
                     trackChanges(st);
+                    try { bump(st, "watch|" + we.field().declaringType().name() + "." + we.field().name()); } catch (Exception ignored) {}
                     stop = snapshot(vm, st.cfg, st.thread, st.location, st.out);
                 } else if (event instanceof com.sun.jdi.event.MethodExitEvent) {
                     com.sun.jdi.event.MethodExitEvent me = (com.sun.jdi.event.MethodExitEvent) event;
@@ -1510,6 +1515,7 @@ public class JdiBridge {
                     st.suspended = true;
                     st.stopInfo = exitInfo(me);
                     trackChanges(st);
+                    try { bump(st, "exit|" + me.method().declaringType().name() + "." + me.method().name()); } catch (Exception ignored) {}
                     stop = snapshot(vm, st.cfg, st.thread, st.location, st.out);
                 } else if (event instanceof ClassPrepareEvent) {
                     ClassPrepareEvent cp = (ClassPrepareEvent) event;
@@ -1825,6 +1831,31 @@ public class JdiBridge {
         if (st.exited) throw new BridgeException("target VM has exited — close this session");
     }
 
+    /** Attribute a reported breakpoint stop to its line/method records.
+     *  Step landings never reach here (StepEvent branch doesn't count), so
+     *  dead breakpoints honestly read 0. */
+    static void countBreakHit(SessionState st, Location loc) {
+        String cls = "?";
+        int line = -1;
+        String method = "?";
+        try { cls = loc.declaringType().name(); } catch (Exception ignored) {}
+        try { line = loc.lineNumber(); } catch (Exception ignored) {}
+        try { method = loc.method().name(); } catch (Exception ignored) {}
+        List<Integer> lines = st.cfg.breakpoints.get(cls);
+        if (lines != null && lines.contains(line)) bump(st, "break|" + cls + "|" + line);
+        List<String> methods = st.cfg.methodBreaks.get(cls);
+        if (methods != null && methods.contains(method)) bump(st, "method|" + cls + "." + method);
+    }
+
+    /** Attribute a reported exception stop to each matching exc filter. */
+    static void countExcHits(SessionState st, com.sun.jdi.event.ExceptionEvent ee) {
+        String actual = "?";
+        try { actual = ee.exception().referenceType().name(); } catch (Exception ignored) {}
+        for (String f : st.cfg.excFilters) {
+            if (actual.equals(f) || actual.endsWith("." + f)) bump(st, "exc|" + f);
+        }
+    }
+
     /** A stopping (line/method) breakpoint planted at this location? */
     static boolean hasStoppingBreak(Config cfg, Location loc) {
         String cls = "?";
@@ -1859,7 +1890,8 @@ public class JdiBridge {
                 if (cond != null) spec += "|" + cond;
                 first = breakRec(sb, first, spec, "break",
                         loaded ? "verified" : "pending",
-                        loaded ? null : "class not loaded yet (deferred)");
+                        loaded ? null : "class not loaded yet (deferred)",
+                        hitsOf(st, "break|" + e.getKey() + "|" + line));
             }
         }
         for (Map.Entry<String, List<String>> e : cfg.methodBreaks.entrySet()) {
@@ -1870,36 +1902,62 @@ public class JdiBridge {
                 if (cond != null) spec += "|" + cond;
                 first = breakRec(sb, first, spec, "method",
                         loaded ? "verified" : "pending",
-                        loaded ? null : "class not loaded yet (deferred)");
+                        loaded ? null : "class not loaded yet (deferred)",
+                        hitsOf(st, "method|" + e.getKey() + "." + m));
             }
         }
         for (String f : cfg.excFilters) {
-            first = breakRec(sb, first, "exc:" + f, "exc", "armed", null);
+            first = breakRec(sb, first, "exc:" + f, "exc", "armed", null,
+                    hitsOf(st, "exc|" + f));
         }
         for (Logpoint lp : cfg.logpoints) {
-            first = breakRec(sb, first, lp.cls + ":" + lp.line, "logpoint", "armed", lp.template);
+            first = breakRec(sb, first, lp.cls + ":" + lp.line, "logpoint", "armed", lp.template,
+                    hitsOf(st, "logpoint|" + lp.cls + "|" + lp.line));
         }
         for (Watchpoint w : cfg.watchpoints) {
             String mode = w.onRead && w.onWrite ? "read,write" : (w.onRead ? "read" : "write");
-            first = breakRec(sb, first, w.cls + "." + w.field, "watch", "armed", mode);
+            first = breakRec(sb, first, w.cls + "." + w.field, "watch", "armed", mode,
+                    hitsOf(st, "watch|" + w.cls + "." + w.field));
         }
         for (Map.Entry<String, List<String>> e : cfg.exitMethods.entrySet()) {
             for (String m : e.getValue()) {
-                first = breakRec(sb, first, e.getKey() + "." + m, "exit", "armed", null);
+                first = breakRec(sb, first, e.getKey() + "." + m, "exit", "armed", null,
+                        hitsOf(st, "exit|" + e.getKey() + "." + m));
             }
         }
         return sb.append("]}").toString();
     }
 
     static boolean breakRec(StringBuilder sb, boolean first,
-            String spec, String kind, String state, String detail) {
+            String spec, String kind, String state, String detail, int hits) {
         if (!first) sb.append(',');
         sb.append("{\"spec\":").append(quote(spec));
         sb.append(",\"kind\":").append(quote(kind));
         sb.append(",\"state\":").append(quote(state));
         if (detail != null) sb.append(",\"detail\":").append(quote(detail));
+        sb.append(",\"hits\":").append(hits);
         sb.append('}');
         return false;
+    }
+
+    /** Hit-key counters behind `breaks`' hits. Keys mirror the specs:
+     *  break|cls|line, method|cls|m, exc|filter, logpoint|cls|line,
+     *  watch|cls|field, exit|cls|m. Step landings never bump — only reported
+     *  stops do, so dead breakpoints honestly read 0. */
+    static void bump(SessionState st, String key) {
+        try {
+            Integer n = st.hitCounts.get(key);
+            st.hitCounts.put(key, n == null ? 1 : n + 1);
+        } catch (Exception ignored) {}
+    }
+
+    static int hitsOf(SessionState st, String key) {
+        try {
+            Integer n = st.hitCounts.get(key);
+            return n == null ? 0 : n;
+        } catch (Exception ignored) {
+            return 0;
+        }
     }
 
     static String toJsonArray(List<String> items) {
@@ -1917,6 +1975,15 @@ public class JdiBridge {
         if (templates.isEmpty()) return;
         List<StackFrame> frames = safeFrames(thread);
         if (frames.isEmpty()) return;
+        if (st != null) {
+            // Logpoint fires are observable here (unlike py's DAP-native
+            // ones), including on cond-false non-stops — count the fire.
+            String cls = "?";
+            int line = -1;
+            try { cls = loc.declaringType().name(); } catch (Exception ignored) {}
+            try { line = loc.lineNumber(); } catch (Exception ignored) {}
+            bump(st, "logpoint|" + cls + "|" + line);
+        }
         for (String t : templates) {
             String line;
             try {

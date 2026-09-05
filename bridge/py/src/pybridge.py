@@ -336,6 +336,10 @@ class Session:
         self.log_count = 0
         self.configured = False  # True once launch/attach handshake completes
         self.stop_states = []  # arm-time records served by `breaks`
+        # Match keys aligned with stop_states by index: ("break", abspath,
+        # line) | ("method", funcname) | ("exc",) | ("logpoint", abspath,
+        # line). Logpoints are DAP-native (fire invisibly) — never counted.
+        self._hitkeys = []
         self.session_port = 0  # our TCP port (set in main, for republishing)
         self.last_stop = None  # {"file","line","method"} of the latest stop
 
@@ -550,6 +554,39 @@ class Session:
         self.last_func = func
         self.last_changed = json.dumps(changed)
 
+    def count_hits(self, reason):
+        """Attribute a stop to the records it fired (served as `hits` by
+        `breaks`). Step landings are NOT hits — counting them would tell the
+        agent dead breakpoints fire. Logpoints are DAP-native (fire
+        invisibly), so their hits stay null: uncountable, not zero."""
+        if reason == "step":
+            return
+        if reason == "exception":
+            for rec in self.stop_states:
+                if rec["kind"] == "exc" and isinstance(rec.get("hits"), int):
+                    rec["hits"] += 1
+            return
+        if not self.frames:
+            return
+        f0 = self.frames[0]
+        src = (f0.get("source") or {})
+        try:
+            here = os.path.abspath(src.get("path", ""))
+        except (TypeError, ValueError):
+            return
+        name = f0.get("name", "?")
+        for rec, key in zip(self.stop_states, self._hitkeys):
+            if not isinstance(rec.get("hits"), int):
+                continue
+            if key[0] == "break" and len(key) == 3:
+                try:
+                    if os.path.abspath(key[1]) == here and key[2] == f0.get("line"):
+                        rec["hits"] += 1
+                except (TypeError, ValueError):
+                    pass
+            elif key[0] == "method" and name == key[1]:
+                rec["hits"] += 1
+
     def publish_state(self, stopped):
         """Rewrite session.json so `status` shows live truth (parked stop +
         time) with zero prior memory. lastStop survives resume/exit — it
@@ -690,7 +727,8 @@ class Session:
                 if item["kind"] == "break" and item.get("cond"):
                     spec += f"|{item['cond']}"
                 rec = {"spec": spec, "kind": item["kind"],
-                       "state": "verified" if verified else "pending"}
+                       "state": "verified" if verified else "pending",
+                       "hits": 0 if item["kind"] == "break" else None}
                 if item["kind"] == "logpoint":
                     # Resume needs the template ("what was I collecting?"),
                     # not just the line. Cheap (one short string).
@@ -705,15 +743,19 @@ class Session:
                         f"warn: breakpoint unverified: {path}:{item['line']} "
                         f"({msg})\n")
                 self.stop_states.append(rec)
+                self._hitkeys.append((item["kind"], path, item["line"]))
         for func in self.cfg.methods:
             self.dap_request("setFunctionBreakpoints",
                              {"breakpoints": [{"name": func}]})
             self.stop_states.append(
-                {"spec": f"method:{func}", "kind": "method", "state": "armed"})
+                {"spec": f"method:{func}", "kind": "method", "state": "armed",
+                 "hits": 0})
+            self._hitkeys.append(("method", func))
         if self.cfg.want_exc:
             self.dap_request("setExceptionBreakpoints", {"filters": ["uncaught"]})
             self.stop_states.append(
-                {"spec": "exc", "kind": "exc", "state": "armed"})
+                {"spec": "exc", "kind": "exc", "state": "armed", "hits": 0})
+            self._hitkeys.append(("exc",))
 
     def pump(self, timeout):
         """Wait for the next stopped/exited; returns 'stopped' or raises."""
@@ -767,6 +809,7 @@ class Session:
                 else:
                     self.stop_info = None
                 self.track_changes()
+                self.count_hits(reason)
                 self.publish_state(True)
                 return "stopped"
             return None
