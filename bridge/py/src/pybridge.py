@@ -694,7 +694,6 @@ class Session:
         self.dap_request("configurationDone", {})
         self._drain_response("attach")
         self.configured = True
-        self.configured = True
 
     def arm_breakpoints(self):
         # DAP setBreakpoints REPLACES a file's breakpoints per call, so line
@@ -816,7 +815,7 @@ class Session:
                 self.thread_id = body.get("threadId")
                 self.suspended = True
                 try:
-                    self.refresh_frames()
+                    self.refresh_frames(timeout=15)
                 except BridgeErr:
                     # Dead thread reports as failed stackTrace rather than
                     # empty stackFrames — same ghost path as below.
@@ -827,9 +826,8 @@ class Session:
                     # BrokenPipe kills the worker). Parking a frameless
                     # '?' stop poisons the session (later continues target
                     # a dead thread). Retry briefly for slow suspends
-                    # (bounded: short timeouts, not the 30s default);
-                    # if still empty, skip and keep waiting for a real
-                    # stop instead of reporting a ghost.
+                    # (bounded 5s fetches); if still empty, skip and keep
+                    # waiting for a real stop instead of reporting a ghost.
                     for _ in range(3):
                         try:
                             time.sleep(0.1)
@@ -847,6 +845,18 @@ class Session:
                                 f"dap: ghost stop skipped (thread {self.thread_id} "
                                 f"has no frames; reason={reason})\n")
                             sys.stderr.flush()
+                        except Exception:
+                            pass
+                        # A skipped stop must not leave the target frozen
+                        # while we report running: resume best-effort (a
+                        # dead thread answers with an error, ignored).
+                        # Tradeoff, stated plainly: in the rare case of a
+                        # live stop with persistently unreadable frames,
+                        # we resume past it instead of parking a '?' ghost
+                        # that poisons every later command.
+                        try:
+                            self.dap_request("continue", {"threadId": self.thread_id},
+                                             timeout=5)
                         except Exception:
                             pass
                         self.thread_id = None
@@ -983,6 +993,9 @@ class Session:
 
     def cmd_step(self, req, timeout):
         self.require_live()
+        # Stepping needs a stopped thread to step from (uniform contract
+        # on all bridges); continuing works from running (it waits).
+        self.require_stopped()
         mode = req.get("mode", "over")
         cmd = {"over": "next", "into": "stepIn", "out": "stepOut"}.get(mode)
         if not cmd:
@@ -994,6 +1007,11 @@ class Session:
 
     def cmd_continue(self, req, timeout):
         self.require_live()
+        if self.thread_id is None:
+            # Never stopped: nothing to resume (a null threadId only
+            # produces adapter errors) — the target already runs,
+            # so go straight to waiting for the next stop.
+            return self._resume_and_wait(timeout)
         self.dap_request("continue", {"threadId": self.thread_id})
         return self._resume_and_wait(timeout)
 
@@ -1096,6 +1114,19 @@ class Session:
                 self.adapter.terminate()
             except Exception:
                 pass
+            # Reap, don't just signal: terminate() alone can leave the
+            # adapter lingering (or zombied). Bounded wait, then kill.
+            try:
+                self.adapter.wait(timeout=5)
+            except Exception:
+                try:
+                    self.adapter.kill()
+                except Exception:
+                    pass
+                try:
+                    self.adapter.wait(timeout=5)
+                except Exception:
+                    pass
 
 
 class _Close(Exception):
@@ -1250,6 +1281,12 @@ def main(argv):
                  "lastStop": st.last_stop, "updatedAt": int(time.time())}))
             serve(st, server, nonce)
         except (Usage, BridgeErr) as e:
+            # Failed setup must not leak the spawned adapter/target:
+            # clean up first, then report (the CLI removes the dir).
+            try:
+                st.cleanup()
+            except Exception:
+                pass
             write_file(os.path.join(cfg.dir, "error.json"),
                        json.dumps({"error": str(e)}))
             raise
