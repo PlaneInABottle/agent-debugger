@@ -29,7 +29,7 @@ pub fn session_dir(name: &str) -> PathBuf {
 fn check_name(name: &str) -> anyhow::Result<()> {
     // Backslash is rejected outright too: a legal filename char on Unix
     // but a separator on Windows — session names never need it.
-    if name.contains('\\') {
+    if name.contains(['\\', '/', '\0']) {
         anyhow::bail!("invalid session name '{name}' (single path segment only)");
     }
     let mut comps = std::path::Path::new(name).components();
@@ -39,8 +39,32 @@ fn check_name(name: &str) -> anyhow::Result<()> {
     }
 }
 
+fn checked_session_dir(name: &str) -> anyhow::Result<PathBuf> {
+    check_name(name)?;
+    let dir = session_dir(name);
+    check_dir_real(&dir)?;
+    Ok(dir)
+}
+
+/// A session dir must be a real directory, never a symlink: otherwise an
+/// attacker-planted entry could redirect sidecar writes (or `close`'s
+/// recursive delete) outside the sessions root. TOCTOU between check and
+/// use is accepted as best-effort; creation paths below use exclusive
+/// create_dir so a swapped-in link fails instead of being followed.
+fn check_dir_real(dir: &std::path::Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            anyhow::bail!("session path must not be a symlink: {}", dir.display())
+        }
+        Ok(meta) if !meta.file_type().is_dir() => {
+            anyhow::bail!("session path must be a real directory: {}", dir.display())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn read_session(name: &str) -> anyhow::Result<Value> {
-    let file = session_dir(name).join("session.json");
+    let file = checked_session_dir(name)?.join("session.json");
     let raw = std::fs::read_to_string(&file)
         .map_err(|_| anyhow::anyhow!("no session '{name}' (start or attach first)"))?;
     serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("corrupt session file: {e}"))
@@ -255,18 +279,41 @@ fn setup_bridge(dir: &std::path::Path, spec: &SpawnSpec) -> anyhow::Result<std::
         .map_err(|e| anyhow::anyhow!("{program} not found or failed to start: {e}"))?;
     // Detached by design: the short-lived CLI exits, the bridge keeps the
     // debug session alive (reparented). Ownership transfers to the wait
-    // loop below (mem::forget on success, kill on failure paths).
+    // loop below (handle dropped on success, kill on failure paths).
     Ok(child)
 }
 
 /// Spawn the bridge daemon and wait for the first stop.
 pub fn spawn(name: &str, spec: &SpawnSpec) -> anyhow::Result<Value> {
-    check_name(name)?;
-    let dir = session_dir(name);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(spec.wait_secs))
+        .ok_or_else(|| anyhow::anyhow!("timeout is too large"))?;
+    let dir = checked_session_dir(name)?;
     if dir.join("session.json").exists() {
         anyhow::bail!("session '{name}' already exists (close it first)");
     }
-    std::fs::create_dir_all(&dir)
+    std::fs::create_dir_all(sessions_dir())
+        .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", sessions_dir().display()))?;
+    // A leftover dir without session.json is a failed attempt, not a live
+    // session: clear it so the name is reusable. A live session is caught
+    // by the session.json check above. Re-validate immediately before the
+    // recursive delete: the earlier check_dir_real covered a TOCTOU window
+    // in which a planted symlink (or file) could redirect the clear outside
+    // the sessions root. Only a real directory is removed.
+    match std::fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            anyhow::bail!("session path must not be a symlink: {}", dir.display())
+        }
+        Ok(meta) if !meta.file_type().is_dir() => {
+            anyhow::bail!("session path must be a real directory: {}", dir.display())
+        }
+        Ok(_) => std::fs::remove_dir_all(&dir)
+            .map_err(|e| anyhow::anyhow!("cannot clear stale {}: {e}", dir.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => anyhow::bail!("cannot clear stale {}: {e}", dir.display()),
+    }
+    // Exclusive creation prevents two concurrent starts racing on one name.
+    std::fs::create_dir(&dir)
         .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.to_string_lossy()))?;
     // Clear leftovers from a previous failed attempt.
     let _ = std::fs::remove_file(dir.join("session.json"));
@@ -288,12 +335,12 @@ pub fn spawn(name: &str, spec: &SpawnSpec) -> anyhow::Result<Value> {
     let reap = |child: &mut Option<std::process::Child>| {
         if let Some(mut c) = child.take() {
             let _ = c.kill();
+            let _ = c.wait();
         }
     };
 
     // Detached by design: the short-lived CLI exits, the bridge keeps the
     // debug session alive (reparented). Never kill on success.
-    let deadline = Instant::now() + Duration::from_secs(spec.wait_secs);
     loop {
         // error.json first: a fast-exiting target can leave BOTH files
         // behind (session.json from the death publish, error.json from
@@ -305,8 +352,7 @@ pub fn spawn(name: &str, spec: &SpawnSpec) -> anyhow::Result<Value> {
             anyhow::bail!("{msg}");
         }
         if dir.join("session.json").exists() {
-            // Forget the child (no kill on drop); session owns it now.
-            std::mem::forget(child.take().expect("bridge child alive until handoff"));
+            // Retain the handle until the first request is validated.
             // Initial data: live context when stopped, else a thread dump.
             let stopped = std::fs::read_to_string(dir.join("session.json"))
                 .ok()
@@ -402,9 +448,9 @@ fn read_log_tail(dir: &std::path::Path) -> String {
     }
 }
 
-/// Close a session: ask the bridge to disconnect, always remove the dir.
+/// Close a session; retain management state if the daemon stays alive.
 pub fn close(name: &str) -> anyhow::Result<Value> {
-    check_name(name)?;
+    let dir = checked_session_dir(name)?;
     // Whether the bridge ACKed the close. A false here (with the port
     // already dead) means the daemon died on its own; a false with the port
     // alive means it is wedged — the dir is still removed, but the caller
@@ -435,8 +481,12 @@ pub fn close(name: &str) -> anyhow::Result<Value> {
         // A refused close, or a daemon still listening after 15s, is not
         // a confirmed close — even though the dir is removed below.
         confirmed = confirmed && observed_dead;
+        if !observed_dead {
+            anyhow::bail!(
+                "session '{name}' still listens on port {port}; state preserved for retry"
+            );
+        }
     }
-    let dir = session_dir(name);
     if !dir.exists() {
         anyhow::bail!("no session '{name}'");
     }
@@ -452,7 +502,11 @@ pub fn status() -> Value {
     let mut sessions = Vec::new();
     if let Ok(entries) = std::fs::read_dir(sessions_dir()) {
         for entry in entries.flatten() {
-            sessions.push(session_entry(&entry.path()));
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && checked_session_dir(&entry.file_name().to_string_lossy()).is_ok()
+            {
+                sessions.push(session_entry(&entry.path()));
+            }
         }
     }
     sessions.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
@@ -646,6 +700,31 @@ mod tests {
         assert_eq!(v["port"], json!(0));
         assert_eq!(v["alive"], json!(false));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_dir_real_rejects_symlink_and_non_dir() {
+        // Stale-dir clear re-validates with symlink_metadata right before
+        // remove_dir_all: a planted link or file must never be deleted.
+        // No races here — the test only classifies paths it just created.
+        let base = tmpdir("check-real");
+        let real = base.join("real");
+        std::fs::create_dir(&real).unwrap();
+        assert!(check_dir_real(&real).is_ok());
+        assert!(check_dir_real(&base.join("missing")).is_ok());
+        let file = base.join("f");
+        std::fs::write(&file, "x").unwrap();
+        assert!(check_dir_real(&file).is_err());
+        #[cfg(unix)]
+        {
+            let link = base.join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert!(check_dir_real(&link).is_err());
+            let dangling = base.join("dangling");
+            std::os::unix::fs::symlink(base.join("nope"), &dangling).unwrap();
+            assert!(check_dir_real(&dangling).is_err());
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

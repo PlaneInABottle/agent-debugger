@@ -48,7 +48,7 @@ pub(crate) struct Stops {
     #[arg(long, alias = "exit")]
     pub(crate) exits: Vec<String>,
     /// Seconds to wait for the first breakpoint hit.
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..=3600))]
     pub(crate) timeout: u64,
 }
 
@@ -195,7 +195,7 @@ pub(crate) enum Commands {
     #[command(name = "continue")]
     Continue {
         /// Seconds to wait for the next stop.
-        #[arg(long, default_value_t = 20)]
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: u64,
     },
     /// Step one line: over | into | out.
@@ -204,7 +204,7 @@ pub(crate) enum Commands {
         #[arg(value_parser = ["over", "into", "out"], default_value = "over")]
         mode: String,
         /// Seconds to wait for the step to land.
-        #[arg(long, default_value_t = 20)]
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: u64,
     },
     /// Reload the page and wait for the next stop (browser tabs only).
@@ -212,7 +212,7 @@ pub(crate) enum Commands {
     /// still needs a human click or agent-browser.
     Reload {
         /// Seconds to wait for the next stop after reload.
-        #[arg(long, default_value_t = 20)]
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: u64,
     },
     /// Re-fetch location + threads + frames without resuming.
@@ -251,4 +251,30 @@ pub(crate) enum Commands {
     Close,
     /// Check toolchains for current and future adapters.
     Doctor,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeouts_are_bounded_for_all_command_shapes() {
+        for command in [
+            vec!["continue"],
+            vec!["step"],
+            vec!["reload"],
+            vec!["java", "attach"],
+            vec!["py", "attach"],
+            vec!["node", "attach"],
+            vec!["browser", "attach"],
+        ] {
+            for timeout in ["0", "3601", "18446744073709551615"] {
+                let mut args = vec!["agent-debugger"];
+                args.extend(command.clone());
+                args.extend(["--timeout", timeout]);
+                assert!(Cli::try_parse_from(args).is_err());
+            }
+        }
+        assert!(Cli::try_parse_from(["agent-debugger", "continue", "--timeout", "3600"]).is_ok());
+    }
 }

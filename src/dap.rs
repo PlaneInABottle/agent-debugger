@@ -7,6 +7,26 @@
 
 use serde_json::Value;
 
+pub fn validate_frame_size(buf: &[u8], max_bytes: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        buf.len() <= max_bytes,
+        "bridge response exceeds {max_bytes} bytes"
+    );
+    if let Some(end) = find_header_end(buf) {
+        anyhow::ensure!(end <= 8192, "bridge frame header exceeds 8192 bytes");
+        let header = std::str::from_utf8(&buf[..end])?;
+        let len = parse_content_length(header)
+            .ok_or_else(|| anyhow::anyhow!("invalid Content-Length"))?;
+        anyhow::ensure!(
+            len <= max_bytes.saturating_sub(end),
+            "bridge response exceeds {max_bytes} bytes"
+        );
+    } else {
+        anyhow::ensure!(buf.len() < 8192, "bridge frame header exceeds 8192 bytes");
+    }
+    Ok(())
+}
+
 /// Encode a JSON body into a DAP-framed byte buffer.
 pub fn encode_message(body: &Value) -> Vec<u8> {
     let json = serde_json::to_vec(body).expect("value must serialize");
@@ -53,6 +73,18 @@ fn parse_content_length(header: &str) -> Option<usize> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn frame_limit_checks_complete_and_declared_lengths() {
+        let frame = encode_message(&json!({"value": "payload"}));
+        assert!(validate_frame_size(&frame, frame.len()).is_ok());
+        assert!(validate_frame_size(&frame, frame.len() - 1).is_err());
+        assert!(
+            validate_frame_size(b"Content-Length: 67108865\r\n\r\n", 64 * 1024 * 1024).is_err()
+        );
+        assert!(validate_frame_size(&vec![b'x'; 8192], 64 * 1024 * 1024).is_err());
+        assert!(validate_frame_size(b"Content-Length: nope\r\n\r\n", 1024).is_err());
+    }
 
     #[test]
     fn roundtrip_single_message() {

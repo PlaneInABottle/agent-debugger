@@ -27,11 +27,9 @@ pub fn request(port: u16, body: &Value, timeout: Duration) -> anyhow::Result<Val
     let mut buf = Vec::with_capacity(65536);
     let mut tmp = [0u8; 65536];
     loop {
+        dap::validate_frame_size(&buf, MAX_FRAME_BYTES)?;
         if let Some((value, _)) = dap::try_decode_message(&buf) {
             return Ok(value);
-        }
-        if buf.len() > MAX_FRAME_BYTES {
-            anyhow::bail!("bridge response exceeds {MAX_FRAME_BYTES} bytes (corrupt session?)");
         }
         match sock.read(&mut tmp) {
             Ok(0) => {
