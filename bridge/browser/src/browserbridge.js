@@ -237,10 +237,30 @@ class Session {
     return { id: t.id || '?', title: t.title || '?', url: t.url || '?' };
   }
 
-  dispatch(req) {
+  /** Re-resolve our tab against the live target list. Tabs navigate and
+   * close under us (and whole browsers die); reporting the cached pick
+   * would lie. Mirrors the node/python contract: dead target surfaces as
+   * an error, live target refreshes its title/url. */
+  async verifyTab() {
+    let targets;
+    try {
+      targets = await listTargets(this.cfg.host, this.cfg.port);
+    } catch (e) {
+      throw new BridgeErr(`browser gone (${this.cfg.host}:${this.cfg.port} unreachable) — close this session`);
+    }
+    const still = (targets || []).find(
+      (t) => t.id === (this.tab && this.tab.id) && t.webSocketDebuggerUrl);
+    if (!still) {
+      throw new BridgeErr('tab closed (or navigated beyond reach) — close this session');
+    }
+    this.tab = still;
+  }
+
+  async dispatch(req) {
     const cmd = req.cmd;
     if (cmd === 'close') throw new CloseSession();
     if (cmd === 'threads') {
+      await this.verifyTab();
       return {
         ok: true,
         running: true,
