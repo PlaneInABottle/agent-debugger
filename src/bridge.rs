@@ -168,6 +168,22 @@ fn venv_python() -> PathBuf {
     python_dir().join("venv").join("bin").join("python")
 }
 
+/// Program + args used to install debugpy into the isolated venv.
+/// Always the venv interpreter itself (`<venv>/bin/python -m pip ...`);
+/// a `<venv>/bin/pip` path would resolve through the interpreter file
+/// (`<venv>/bin/python/bin/pip`, ENOTDIR on fresh HOME).
+fn debugpy_install_command() -> (PathBuf, Vec<String>) {
+    (
+        venv_python(),
+        vec![
+            "-m".to_string(),
+            "pip".to_string(),
+            "install".to_string(),
+            "debugpy".to_string(),
+        ],
+    )
+}
+
 fn has_debugpy(interp: &str) -> bool {
     std::process::Command::new(interp)
         .args(["-c", "import debugpy"])
@@ -202,12 +218,9 @@ pub fn ensure_py() -> anyhow::Result<String> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let pip = run_with_timeout(
-        venv.join("bin").join("pip"),
-        &["install".to_string(), "debugpy".to_string()],
-        std::time::Duration::from_secs(180),
-    )
-    .map_err(|e| anyhow::anyhow!("pip failed to start: {e}"))?;
+    let (pip_program, pip_args) = debugpy_install_command();
+    let pip = run_with_timeout(pip_program, &pip_args, std::time::Duration::from_secs(180))
+        .map_err(|e| anyhow::anyhow!("pip failed to start: {e}"))?;
     if !pip.status.success() || !has_debugpy(&venv_str) {
         anyhow::bail!(
             "could not install debugpy (network needed once). Try manually:\n  {} -m pip install debugpy",
@@ -407,4 +420,25 @@ pub fn find_chrome() -> Option<(String, String)> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debugpy_install_uses_venv_interpreter_with_m_pip() {
+        let (program, args) = debugpy_install_command();
+        // Program is exactly the venv interpreter, never `<...>/bin/python/bin/pip`.
+        assert_eq!(program, venv_python());
+        assert_eq!(program.file_name().and_then(|s| s.to_str()), Some("python"));
+        assert_eq!(
+            program
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str()),
+            Some("bin")
+        );
+        assert_eq!(args, vec!["-m", "pip", "install", "debugpy"]);
+    }
 }
