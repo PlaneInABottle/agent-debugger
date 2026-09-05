@@ -433,6 +433,8 @@ class Session {
     this.stopInfo = null;
     this.outputTail = '';
     this.logCount = 0;
+    this.sessionPort = 0; // our TCP port (set in main, for republishing)
+    this.lastStop = null; // {file,line,method} of the latest stop
   }
 
   // -- attach lifecycle
@@ -461,6 +463,7 @@ class Session {
       if (!this.closing) {
         this.exited = true;
         this.paused = null;
+        this.publishState(false);
       }
     });
     this.cdp.onEvent = (msg) => {
@@ -626,6 +629,7 @@ class Session {
       // callFrameIds. Liveness stays verifyTab's job.
       this.paused = null;
       this.defaultContextId = null;
+      this.publishState(false);
       return;
     }
     if (msg.method === 'Runtime.executionContextDestroyed') {
@@ -688,6 +692,7 @@ class Session {
       this.stopInfo = this.excInfo(p.data);
       await this.trackChanges(frames);
       this.paused = { frames, stopInfo: this.stopInfo };
+      this.publishState(true);
       return;
     }
     if (realHits.length > 0 || this.awaitingStep) {
@@ -695,6 +700,7 @@ class Session {
       this.stopInfo = null;
       await this.trackChanges(frames);
       this.paused = { frames, stopInfo: null };
+      this.publishState(true);
       return;
     }
     if (logHits.length > 0) {
@@ -824,8 +830,33 @@ class Session {
     }
   }
 
-  markExited() {
-    this.exited = true;
+  /** Trimmed stop locator for session.json (no snippet — source fetches
+   *  stay in locationJson()). Mirrors its file/line/method. */
+  lastStopJson() {
+    const frames = (this.paused && this.paused.frames) || [];
+    if (frames.length === 0) return null;
+    const f = frames[0];
+    return {
+      file: this.relFile(this.frameUrl(f)),
+      line: (f.location && f.location.lineNumber + 1) || -1,
+      method: f.functionName || '(anonymous)',
+    };
+  }
+
+  /** Rewrite session.json so `status` shows live truth (parked stop +
+   *  time) with zero prior memory. lastStop survives resume/exit — it
+   *  answers 'where was I last', not 'where am I now'. */
+  publishState(stopped) {
+    if (stopped) {
+      try {
+        this.lastStop = this.lastStopJson();
+      } catch (_) { /* keep previous */ }
+    }
+    writeFile(path.join(this.cfg.dir, 'session.json'), JSON.stringify({
+      name: path.basename(this.cfg.dir), kind: this.cfg.kind,
+      port: this.sessionPort, stopped,
+      lastStop: this.lastStop, updatedAt: Math.floor(Date.now() / 1000),
+    }));
   }
 
   // -- snapshot builders (Java/Python/Node shapes)
@@ -1092,6 +1123,7 @@ class Session {
       this.awaitingStep = false;
       throw e;
     }
+    this.publishState(false);
     return this.resumeAndWait(timeout);
   }
 
@@ -1100,6 +1132,7 @@ class Session {
     this.paused = null;
     this.cachedLocals = [];
     await this.cdp.request('Debugger.resume');
+    this.publishState(false);
     return this.resumeAndWait(timeout);
   }
 
@@ -1116,6 +1149,7 @@ class Session {
     if (this.cfg.breaks.length === 0 && this.cfg.logpoints.length === 0 && !this.cfg.wantExc) {
       return { ok: true, reloaded: true };
     }
+    this.publishState(false);
     return this.resumeAndWait(timeout);
   }
 
@@ -1309,6 +1343,7 @@ async function main(argv) {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port;
   const st = new Session(cfg);
+  st.sessionPort = port;
   try {
     await st.handshake();
     // No startup pump (unlike node/java): an attached tab is usually idle
@@ -1319,6 +1354,7 @@ async function main(argv) {
     // code. The agent loop: attach --break (fast) -> reload -> stop.
     writeSessionFile(cfg.dir, {
       name: path.basename(cfg.dir), kind: cfg.kind, port, stopped: false,
+      lastStop: st.lastStop, updatedAt: Math.floor(Date.now() / 1000),
     });
     try {
       await serve(st, server, queue);

@@ -46,6 +46,10 @@ agent-debugger --session cart context  # where it is parked (if stopped)
 - `status` shows `armed: {breaks/logpoints/watches/exits}` + `target`
   per session, persisted at spawn (`stops.json`). No session? Nothing to
   resume — start fresh.
+- `status` also shows live `stopped` + `lastStop{file,line,method}` +
+  `updatedAt` (rewritten by the bridge on every stop/resume/exit).
+  `lastStop` survives resume and exit — it answers "where was I last",
+  `updatedAt` marks the last transition (not every read).
 - `breaks` lists every armed stop with its plant state: `verified`,
   `pending` (class/script not loaded yet — normal for deferred code),
   `slid` (runtime moved it, `detail` names the real line),

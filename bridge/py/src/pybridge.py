@@ -336,6 +336,8 @@ class Session:
         self.log_count = 0
         self.configured = False  # True once launch/attach handshake completes
         self.stop_states = []  # arm-time records served by `breaks`
+        self.session_port = 0  # our TCP port (set in main, for republishing)
+        self.last_stop = None  # {"file","line","method"} of the latest stop
 
     # -- DAP helpers
 
@@ -548,6 +550,23 @@ class Session:
         self.last_func = func
         self.last_changed = json.dumps(changed)
 
+    def publish_state(self, stopped):
+        """Rewrite session.json so `status` shows live truth (parked stop +
+        time) with zero prior memory. lastStop survives resume/exit — it
+        answers 'where was I last', not 'where am I now'."""
+        if stopped and self.frames:
+            try:
+                loc = self.location_json()
+                self.last_stop = {"file": loc.get("file", "?"),
+                                  "line": loc.get("line", -1),
+                                  "method": loc.get("method", "?")}
+            except Exception:
+                pass
+        write_file(os.path.join(self.cfg.dir, "session.json"), json.dumps(
+            {"name": os.path.basename(self.cfg.dir), "kind": self.cfg.kind,
+             "port": self.session_port, "stopped": stopped,
+             "lastStop": self.last_stop, "updatedAt": int(time.time())}))
+
     # -- lifecycle
 
     def free_port(self):
@@ -748,10 +767,12 @@ class Session:
                 else:
                     self.stop_info = None
                 self.track_changes()
+                self.publish_state(True)
                 return "stopped"
             return None
         if ev in ("exited", "terminated"):
             self.exited = True
+            self.publish_state(False)
             raise BridgeErr("target exited")
         if ev == "output" and isinstance(body, dict):
             text = body.get("output", "")
@@ -863,6 +884,7 @@ class Session:
     def _resume_and_wait(self, timeout):
         """Resume after step/continue and wait for the next stop."""
         self.suspended = False
+        self.publish_state(False)
         self.pump(timeout)
         return {"ok": True, "stopped": True, "changed": json.loads(self.last_changed),
                 "stopInfo": json.loads(self.stop_info or "null"),
@@ -1075,6 +1097,7 @@ def main(argv):
         server.listen(5)
         st = Session(cfg)
         st._nonce = nonce
+        st.session_port = server.getsockname()[1]
         if cfg.kind == "launch":
             st.start_adapter()
         try:
@@ -1087,7 +1110,8 @@ def main(argv):
             write_file(os.path.join(cfg.dir, "session.json"), json.dumps(
                 {"name": os.path.basename(cfg.dir), "kind": cfg.kind,
                  "port": server.getsockname()[1],
-                 "stopped": bool(cfg.breaks or cfg.methods or cfg.want_exc)}))
+                 "stopped": bool(cfg.breaks or cfg.methods or cfg.want_exc),
+                 "lastStop": st.last_stop, "updatedAt": int(time.time())}))
             serve(st, server, nonce)
         except (Usage, BridgeErr) as e:
             write_file(os.path.join(cfg.dir, "error.json"),

@@ -118,9 +118,9 @@ fn stops_armed(stops: &Value) -> Value {
     })
 }
 
-/// Language owning a session (sidecar file; missing = "java" for old sessions).
-fn session_lang(name: &str) -> String {
-    std::fs::read_to_string(session_dir(name).join("lang.json"))
+/// Language owning a session dir (sidecar file; missing = "java").
+fn session_lang_in(dir: &std::path::Path) -> String {
+    std::fs::read_to_string(dir.join("lang.json"))
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .and_then(|v| {
@@ -376,50 +376,62 @@ pub fn close(name: &str) -> anyhow::Result<Value> {
 }
 
 /// CLI status: binary version plus known sessions with liveness probes.
+/// `stopped`/`lastStop`/`updatedAt` come straight from the bridge-maintained
+/// session.json (rewritten on every stop/resume/exit), so a compacted agent
+/// sees where each session is parked without any prior memory.
 pub fn status() -> Value {
     let mut sessions = Vec::new();
     if let Ok(entries) = std::fs::read_dir(sessions_dir()) {
         for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let session_file = entry.path().join("session.json");
-            let raw = std::fs::read_to_string(&session_file).unwrap_or_default();
-            let parsed: Value = serde_json::from_str(&raw).unwrap_or(json!({}));
-            let port = parsed.get("port").and_then(|p| p.as_u64()).unwrap_or(0) as u16;
-            let alive = port != 0
-                && std::net::TcpStream::connect_timeout(
-                    &format!("127.0.0.1:{port}").parse().unwrap(),
-                    Duration::from_millis(300),
-                )
-                .is_ok();
-            // Resume intent: armed counts + target, derived at spawn. Old
-            // sessions predate stops.json — null there is honest ("unknown"),
-            // never fabricated zeros.
-            let stops_raw = std::fs::read_to_string(entry.path().join("stops.json")).ok();
-            let stops_parsed: Option<Value> =
-                stops_raw.and_then(|raw| serde_json::from_str(&raw).ok());
-            let (armed, target) = match &stops_parsed {
-                Some(v) => (
-                    Some(stops_armed(v)),
-                    v.get("target").cloned().unwrap_or(Value::Null),
-                ),
-                None => (None, Value::Null),
-            };
-            sessions.push(json!({
-                "name": name,
-                "lang": session_lang(&name),
-                "kind": parsed.get("kind"),
-                "port": port,
-                "alive": alive,
-                "stopped": parsed.get("stopped"),
-                "armed": armed,
-                "target": target,
-            }));
+            sessions.push(session_entry(&entry.path()));
         }
     }
     sessions.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     json!({
         "version": env!("CARGO_PKG_VERSION"),
         "sessions": sessions,
+    })
+}
+
+/// One session's status row from its dir. Takes an explicit dir (not a name)
+/// so unit tests exercise it without touching the real sessions dir.
+fn session_entry(dir: &std::path::Path) -> Value {
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let raw = std::fs::read_to_string(dir.join("session.json")).unwrap_or_default();
+    let parsed: Value = serde_json::from_str(&raw).unwrap_or(json!({}));
+    let port = parsed.get("port").and_then(|p| p.as_u64()).unwrap_or(0) as u16;
+    let alive = port != 0
+        && std::net::TcpStream::connect_timeout(
+            &format!("127.0.0.1:{port}").parse().unwrap(),
+            Duration::from_millis(300),
+        )
+        .is_ok();
+    // Resume intent: armed counts + target, derived at spawn. Old
+    // sessions predate stops.json — null there is honest ("unknown"),
+    // never fabricated zeros.
+    let stops_raw = std::fs::read_to_string(dir.join("stops.json")).ok();
+    let stops_parsed: Option<Value> = stops_raw.and_then(|raw| serde_json::from_str(&raw).ok());
+    let (armed, target) = match &stops_parsed {
+        Some(v) => (
+            Some(stops_armed(v)),
+            v.get("target").cloned().unwrap_or(Value::Null),
+        ),
+        None => (None, Value::Null),
+    };
+    json!({
+        "name": name,
+        "lang": session_lang_in(dir),
+        "kind": parsed.get("kind"),
+        "port": port,
+        "alive": alive,
+        "stopped": parsed.get("stopped"),
+        "lastStop": parsed.get("lastStop").cloned().unwrap_or(Value::Null),
+        "updatedAt": parsed.get("updatedAt").cloned().unwrap_or(Value::Null),
+        "armed": armed,
+        "target": target,
     })
 }
 
@@ -499,5 +511,49 @@ mod tests {
             armed,
             json!({"breaks": 2, "logpoints": 0, "watches": 1, "exits": 0})
         );
+    }
+
+    #[test]
+    fn session_entry_surfaces_resume_fields() {
+        let dir = tmpdir("entry");
+        std::fs::write(
+            dir.join("session.json"),
+            r#"{"name":"x","kind":"launch","port":1,"stopped":true,
+                "lastStop":{"file":"a.py","line":7,"method":"f"},
+                "updatedAt":123}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("lang.json"), r#"{"lang":"py"}"#).unwrap();
+        std::fs::write(
+            dir.join("stops.json"),
+            r#"{"breaks":["a.py:7"],"logpoints":[],"watches":[],"exits":[],
+                "target":{"program":"a.py"}}"#,
+        )
+        .unwrap();
+        let v = session_entry(&dir);
+        assert_eq!(v["lang"], json!("py"));
+        assert_eq!(v["stopped"], json!(true));
+        assert_eq!(v["lastStop"]["line"], json!(7));
+        assert_eq!(v["updatedAt"], json!(123));
+        assert_eq!(v["armed"]["breaks"], json!(1));
+        assert_eq!(v["target"]["program"], json!("a.py"));
+        assert_eq!(v["alive"], json!(false)); // port 1: nothing listens
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_entry_legacy_is_honest_nulls() {
+        let dir = tmpdir("entry-legacy");
+        std::fs::write(
+            dir.join("session.json"),
+            r#"{"name":"old","kind":"attach","port":0,"stopped":false}"#,
+        )
+        .unwrap();
+        let v = session_entry(&dir);
+        assert_eq!(v["lang"], json!("java")); // missing sidecar default
+        assert_eq!(v["lastStop"], Value::Null);
+        assert_eq!(v["armed"], Value::Null);
+        assert_eq!(v["alive"], json!(false)); // port 0: no probe
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

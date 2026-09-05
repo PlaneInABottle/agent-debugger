@@ -831,6 +831,7 @@ public class JdiBridge {
         Path dir; // session dir (logs.jsonl lives here)
         int logCount;
         String ownerNonce; // session ownership token (see amOwner)
+        String lastStopJson; // pre-rendered {"file","line","method"}, null until first stop
         final Object queueLock = new Object(); // guards waiterActive
         boolean waiterActive; // a continue/step owns the event queue right now
     }
@@ -881,11 +882,7 @@ public class JdiBridge {
             }
             // else: unstopped session (pure log collection / thread dumps).
             // Commands needing a stop fail gracefully until one arrives.
-            writeFile(dir.resolve("session.json"),
-                    "{\"name\":" + quote(dir.getFileName().toString())
-                    + ",\"kind\":" + quote(cfg.sessionKind)
-                    + ",\"port\":" + server.getLocalPort()
-                    + ",\"stopped\":" + hasStoppingBreaks(cfg) + "}");
+            publishState(st, hasStoppingBreaks(cfg));
             serveLoop(st, dir);
         } catch (UsageException | BridgeException e) {
             writeFile(dir.resolve("error.json"), "{\"error\":" + quote(e.getMessage()) + "}");
@@ -1449,6 +1446,7 @@ public class JdiBridge {
                 continue;
             } catch (Exception e) {
                 st.exited = true;
+                publishState(st, false);
                 throw new BridgeException("lost connection to target VM: " + shortMsg(e));
             }
             if (set == null) continue;
@@ -1526,10 +1524,14 @@ public class JdiBridge {
                     }
                 } else if (event instanceof VMDeathEvent || event instanceof VMDisconnectEvent) {
                     st.exited = true;
+                    publishState(st, false);
                     throw new BridgeException("target VM exited");
                 }
             }
-            if (stop != null) return stop;
+            if (stop != null) {
+                publishState(st, true);
+                return stop;
+            }
             set.resume();
         }
     }
@@ -1732,6 +1734,7 @@ public class JdiBridge {
                 requireLive(st);
                 if (st.suspended) st.vm.resume();
                 st.suspended = false;
+                publishState(st, false);
                 String snap = awaitStop(st, timeout);
                 return "{\"ok\":true,\"stopped\":true,\"changed\":" + st.lastChanged + ",\"stopInfo\":" + stopInfoJson(st) + ",\"snapshot\":" + snap + "}";
             }
@@ -1758,6 +1761,7 @@ public class JdiBridge {
                 try {
                     if (st.suspended) st.vm.resume();
                     st.suspended = false;
+                    publishState(st, false);
                     String snap = awaitStop(st, timeout);
                     return "{\"ok\":true,\"stopped\":true,\"changed\":" + st.lastChanged + ",\"stopInfo\":" + stopInfoJson(st) + ",\"snapshot\":" + snap + "}";
                 } finally {
@@ -1770,6 +1774,45 @@ public class JdiBridge {
 
     static String stopInfoJson(SessionState st) {
         return st.stopInfo == null ? "null" : st.stopInfo;
+    }
+
+    /**
+     * Rewrite session.json so `status` shows live truth (parked stop +
+     * time) with zero prior memory. lastStop survives resume/exit — it
+     * answers 'where was I last', not 'where am I now'. updatedAt marks the
+     * last stop/resume/exit transition (not every read command).
+     */
+    static void publishState(SessionState st, boolean stopped) {
+        if (stopped) {
+            String ls = lastStopJson(st);
+            if (ls != null) st.lastStopJson = ls;
+        }
+        long now = System.currentTimeMillis() / 1000;
+        int port = 0;
+        try { port = st.server.getLocalPort(); } catch (Exception ignored) {}
+        String name = "?";
+        try { name = st.dir.getFileName().toString(); } catch (Exception ignored) {}
+        writeFile(st.dir.resolve("session.json"),
+                "{\"name\":" + quote(name)
+                + ",\"kind\":" + quote(st.cfg.sessionKind)
+                + ",\"port\":" + port
+                + ",\"stopped\":" + stopped
+                + ",\"lastStop\":" + (st.lastStopJson == null ? "null" : st.lastStopJson)
+                + ",\"updatedAt\":" + now + "}");
+    }
+
+    /** Trimmed stop locator (no snippet — file reads stay in snapshots). */
+    static String lastStopJson(SessionState st) {
+        if (st.location == null) return null;
+        String cls = "?";
+        String method = "?";
+        int line = -1;
+        try { cls = st.location.declaringType().name(); } catch (Exception ignored) {}
+        try { method = st.location.method().name(); } catch (Exception ignored) {}
+        try { line = st.location.lineNumber(); } catch (Exception ignored) {}
+        return "{\"file\":" + quote(sourcePath(cls))
+                + ",\"line\":" + line
+                + ",\"method\":" + quote(method) + "}";
     }
 
     static void requireStopped(SessionState st) throws BridgeException {
