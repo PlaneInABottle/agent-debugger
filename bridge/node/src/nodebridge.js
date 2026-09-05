@@ -78,6 +78,19 @@ function needInt(flag, raw) {
   return n;
 }
 
+function canon(p) {
+  // V8 reports canonical paths (symlinks resolved: /tmp -> /private/tmp
+  // on macOS), so urlRegex matching must use the real path too. Fall back
+  // to resolve() for not-yet-existing files (pending breakpoints stay
+  // pending, not broken).
+  const abs = path.resolve(p);
+  try {
+    return fs.realpathSync(abs);
+  } catch (_) {
+    return abs;
+  }
+}
+
 function parseBreak(spec, cfg) {
   let cond = null;
   let head = spec;
@@ -102,7 +115,7 @@ function parseBreak(spec, cfg) {
   if (colon <= 0) throw new Usage('--break must look like path:line, exc');
   const lineno = parseInt(head.slice(colon + 1), 10);
   if (Number.isNaN(lineno)) throw new Usage(`bad line in --break: ${spec}`);
-  cfg.breaks.push({ path: path.resolve(head.slice(0, colon)), line: lineno, cond });
+  cfg.breaks.push({ path: canon(head.slice(0, colon)), line: lineno, cond });
 }
 
 function parseLogpoint(spec, cfg) {
@@ -112,7 +125,7 @@ function parseLogpoint(spec, cfg) {
   const lineno = parseInt(spec.slice(first + 1, second), 10);
   if (Number.isNaN(lineno)) throw new Usage(`bad line in --logpoint: ${spec}`);
   cfg.logpoints.push({
-    path: path.resolve(spec.slice(0, first)),
+    path: canon(spec.slice(0, first)),
     line: lineno,
     template: spec.slice(second + 1),
   });
@@ -177,6 +190,7 @@ function parseArgs(argv) {
       }
     }
   }
+  if (!Number.isFinite(cfg.timeout) || cfg.timeout <= 0 || cfg.timeout > 3600) throw new Usage('timeout must be between 0 and 3600 seconds');
   return cfg;
 }
 
@@ -842,7 +856,6 @@ class Session {
           props.push(pr);
         }
       }
-      if (s.type === 'local' && props.length > 0) break;
     }
     const out = [];
     for (const pr of props.slice(0, MAX_VARS)) {
@@ -1066,7 +1079,7 @@ class Session {
   async dispatch(req) {
     const cmd = req.cmd;
     let timeout = Number(req.timeout !== undefined ? req.timeout : this.cfg.timeout);
-    if (!Number.isFinite(timeout) || timeout < 0) timeout = this.cfg.timeout;
+    if (!Number.isFinite(timeout) || timeout <= 0 || timeout > 3600) throw new BridgeErr('timeout must be between 0 and 3600 seconds');
     if (cmd === 'close') throw new CloseSession();
     if (cmd === 'context') return this.cmdContext();
     if (cmd === 'stack') return this.cmdStack();

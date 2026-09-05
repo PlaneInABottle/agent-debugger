@@ -2,30 +2,44 @@
 // Single source: bridge/js/framing.js.
 const { BridgeErr } = require('./cdp_conn.js');
 
-function readFrame(conn) {
+function readFrame(conn, timeoutMs = 5000) {
   return new Promise((resolve, reject) => {
     let buf = Buffer.alloc(0);
+    const fail = (message) => {
+      cleanup();
+      reject(new BridgeErr(message));
+    };
+    const timer = setTimeout(() => fail('frame read timed out'), timeoutMs);
     const onData = (chunk) => {
+      if (buf.length + chunk.length > 1024 * 1024 + 8192) return fail('frame body too large');
       buf = Buffer.concat([buf, chunk]);
       const sep = buf.indexOf('\r\n\r\n');
-      if (sep < 0) return;
+      if (sep < 0) {
+        if (buf.length >= 8192) fail('frame header too large');
+        return;
+      }
+      if (sep + 4 > 8192) return fail('frame header too large');
       let length = -1;
       for (const line of buf.subarray(0, sep).toString('ascii').split('\r\n')) {
         const i = line.indexOf(':');
         if (i > 0 && line.slice(0, i).trim().toLowerCase() === 'content-length') {
-          length = parseInt(line.slice(i + 1).trim(), 10);
+          const raw = line.slice(i + 1).trim();
+          if (!/^\d+$/.test(raw) || length !== -1) return fail('bad Content-Length');
+          length = Number(raw);
         }
       }
-      if (Number.isNaN(length) || length < 0) {
+      if (!Number.isSafeInteger(length) || length < 0 || length > 1024 * 1024) {
         cleanup();
-        reject(new BridgeErr('bad frame: no Content-Length'));
+        reject(new BridgeErr('invalid or oversized Content-Length'));
         return;
       }
       if (buf.length < sep + 4 + length) return;
       const body = buf.subarray(sep + 4, sep + 4 + length);
       cleanup();
       try {
-        resolve(JSON.parse(body.toString('utf-8')));
+        const req = JSON.parse(body.toString('utf-8'));
+        if (!req || typeof req !== 'object' || Array.isArray(req)) throw new Error('expected object');
+        resolve(req);
       } catch (e) {
         reject(new BridgeErr('bad frame: ' + e.message));
       }
@@ -42,6 +56,7 @@ function readFrame(conn) {
       reject(new BridgeErr('truncated frame'));
     };
     const cleanup = () => {
+      clearTimeout(timer);
       conn.removeListener('data', onData);
       conn.removeListener('close', onClose);
       conn.removeListener('error', onError);
@@ -49,6 +64,7 @@ function readFrame(conn) {
     conn.on('data', onData);
     conn.on('close', onClose);
     conn.on('error', onError);
+    if (conn.destroyed || conn.readableEnded) onClose();
   });
 }
 

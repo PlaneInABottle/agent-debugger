@@ -154,6 +154,7 @@ function parseArgs(argv) {
   if (cfg.kind !== 'attach') {
     throw new Usage(`browser is attach-only for now (got --kind ${cfg.kind}); launch lands later`);
   }
+  if (!Number.isFinite(cfg.timeout) || cfg.timeout <= 0 || cfg.timeout > 3600) throw new Usage('timeout must be between 0 and 3600 seconds');
   return cfg;
 }
 
@@ -526,6 +527,9 @@ class Session {
       // interaction may still stop it). Liveness stays verifyTab's.
       if ((msg.params || {}).executionContextId === this.defaultContextId) {
         this.paused = null;
+        this.defaultContextId = null;
+        this.cachedLocals = [];
+        this.publishState(false);
       }
       return;
     }
@@ -858,7 +862,6 @@ class Session {
           props.push(pr);
         }
       }
-      if (s.type === 'local' && props.length > 0) break;
     }
     const out = [];
     for (const pr of props.slice(0, MAX_VARS)) {
@@ -1099,7 +1102,7 @@ class Session {
   async dispatch(req) {
     const cmd = req.cmd;
     let timeout = Number(req.timeout !== undefined ? req.timeout : this.cfg.timeout);
-    if (!Number.isFinite(timeout) || timeout < 0) timeout = this.cfg.timeout;
+    if (!Number.isFinite(timeout) || timeout <= 0 || timeout > 3600) throw new BridgeErr('timeout must be between 0 and 3600 seconds');
     if (cmd === 'close') throw new CloseSession();
     if (cmd === 'context') return await this.cmdContext();
     if (cmd === 'stack') return await this.cmdStack();
