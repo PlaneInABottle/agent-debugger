@@ -9,7 +9,43 @@
 
 use std::path::PathBuf;
 
-const BRIDGE_SOURCE: &str = include_str!("../bridge/java/src/JdiBridge.java");
+/// Java bridge sources, embedded at compile time. The bridge is split into
+/// one file per concern (same default package); all are written to the
+/// adapter dir and compiled together. `JdiBridge` stays the entry point.
+const JAVA_SOURCES: &[(&str, &str)] = &[
+    (
+        "JdiBridge.java",
+        include_str!("../bridge/java/src/JdiBridge.java"),
+    ),
+    (
+        "BridgeModel.java",
+        include_str!("../bridge/java/src/BridgeModel.java"),
+    ),
+    (
+        "BridgeCli.java",
+        include_str!("../bridge/java/src/BridgeCli.java"),
+    ),
+    (
+        "BridgeConn.java",
+        include_str!("../bridge/java/src/BridgeConn.java"),
+    ),
+    (
+        "BridgeSnapshot.java",
+        include_str!("../bridge/java/src/BridgeSnapshot.java"),
+    ),
+    (
+        "BridgeSession.java",
+        include_str!("../bridge/java/src/BridgeSession.java"),
+    ),
+    (
+        "BridgeProto.java",
+        include_str!("../bridge/java/src/BridgeProto.java"),
+    ),
+    (
+        "BridgeEval.java",
+        include_str!("../bridge/java/src/BridgeEval.java"),
+    ),
+];
 pub const BRIDGE_MAIN_CLASS: &str = "JdiBridge";
 
 const PYBRIDGE_SOURCE: &str = include_str!("../bridge/py/src/pybridge.py");
@@ -29,23 +65,35 @@ pub fn adapter_dir() -> PathBuf {
 /// Ensure the bridge is compiled; return the classes dir for `java -cp`.
 pub fn ensure_compiled() -> anyhow::Result<PathBuf> {
     let dir = adapter_dir();
-    let src = dir.join("JdiBridge.java");
     let classes = dir.join("classes");
     let marker = classes.join("JdiBridge.class");
 
-    let stale = match std::fs::read_to_string(&src) {
-        Ok(existing) => existing != BRIDGE_SOURCE || !marker.exists(),
-        Err(_) => true,
-    };
+    // Any changed source (or a missing marker) recompiles the whole set:
+    // same package, so one javac invocation covers all files.
+    let mut stale = !marker.exists();
+    for (name, source) in JAVA_SOURCES {
+        let dest = dir.join(name);
+        let same = std::fs::read_to_string(&dest)
+            .map(|existing| existing == *source)
+            .unwrap_or(false);
+        if !same {
+            stale = true;
+        }
+    }
     if stale {
         std::fs::create_dir_all(&classes)
             .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", classes.to_string_lossy()))?;
-        std::fs::write(&src, BRIDGE_SOURCE)
-            .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", src.to_string_lossy()))?;
+        let mut sources = Vec::with_capacity(JAVA_SOURCES.len());
+        for (name, source) in JAVA_SOURCES {
+            let dest = dir.join(name);
+            std::fs::write(&dest, source)
+                .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", dest.to_string_lossy()))?;
+            sources.push(dest);
+        }
         let out = std::process::Command::new("javac")
             .arg("-d")
             .arg(&classes)
-            .arg(&src)
+            .args(&sources)
             .output()
             .map_err(|e| {
                 anyhow::anyhow!(
