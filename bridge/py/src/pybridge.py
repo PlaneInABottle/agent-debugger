@@ -527,11 +527,12 @@ class Session:
             out.append(entry)
         return out
 
-    def refresh_frames(self, levels=64):
+    def refresh_frames(self, levels=64, timeout=30):
         # Windowed fetch: full stacks on deep recursion cost transport on
         # EVERY stop; frame_entry() widens the window on demand.
         body = self.dap_request("stackTrace", {"threadId": self.thread_id,
-                                               "startFrame": 0, "levels": levels})
+                                               "startFrame": 0, "levels": levels},
+                                timeout=timeout)
         self.frames = body.get("stackFrames", [])
 
     def snapshot(self):
@@ -799,11 +800,58 @@ class Session:
         body = msg.get("body", {})
         if ev == "stopped":
             reason = body.get("reason", "")
+            # Wire trace: which stops the adapter reports (thread/reason).
+            # One stderr line per stopped event — the only way to tell a
+            # real stop from a replayed/late one when debugging the pump.
+            try:
+                sys.stderr.write(
+                    f"dap: stopped reason={reason} "
+                    f"threadId={body.get('threadId')} "
+                    f"line={(body.get('stackTrace') or [{}])[0].get('line', '?') if isinstance(body.get('stackTrace'), list) else '?'}\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
             if reason in ("breakpoint", "step", "exception", "function breakpoint",
                           "data breakpoint", "entry", "goto"):
                 self.thread_id = body.get("threadId")
                 self.suspended = True
-                self.refresh_frames()
+                try:
+                    self.refresh_frames()
+                except BridgeErr:
+                    # Dead thread reports as failed stackTrace rather than
+                    # empty stackFrames — same ghost path as below.
+                    self.frames = []
+                if not self.frames:
+                    # The thread died between the event and our stackTrace
+                    # (e.g. a held HTTP handler whose client vanished:
+                    # BrokenPipe kills the worker). Parking a frameless
+                    # '?' stop poisons the session (later continues target
+                    # a dead thread). Retry briefly for slow suspends
+                    # (bounded: short timeouts, not the 30s default);
+                    # if still empty, skip and keep waiting for a real
+                    # stop instead of reporting a ghost.
+                    for _ in range(3):
+                        try:
+                            time.sleep(0.1)
+                        except Exception:
+                            pass
+                        try:
+                            self.refresh_frames(timeout=5)
+                        except BridgeErr:
+                            pass
+                        if self.frames:
+                            break
+                    if not self.frames:
+                        try:
+                            sys.stderr.write(
+                                f"dap: ghost stop skipped (thread {self.thread_id} "
+                                f"has no frames; reason={reason})\n")
+                            sys.stderr.flush()
+                        except Exception:
+                            pass
+                        self.thread_id = None
+                        self.suspended = False
+                        return None
                 if reason == "exception":
                     self.stop_info = self.exception_info()
                 else:
@@ -1080,6 +1128,48 @@ def am_owner(session_dir, nonce):
         return False
 
 
+def idle_pump(st):
+    """Process one already-arrived DAP message while idle (no waiter).
+
+    Single-threaded: serve() calls this only between commands, so there
+    is no race with pump()/request(). A stopped event parks exactly like
+    a waiter-observed stop (visible status, continuable); a response is
+    stashed for the request waiting for it (request() checks stash
+    first); output feeds logs. Partial frames stay buffered for the
+    next tick. Bounded work: at most one message per idle second.
+    """
+    sock = st.dap.sock
+    try:
+        prev = sock.gettimeout()
+    except Exception:
+        return
+    try:
+        sock.settimeout(0.2)
+        try:
+            msg = st.dap._read_msg()
+        except (socket.timeout, TimeoutError):
+            return
+        except BridgeErr:
+            return
+    finally:
+        try:
+            sock.settimeout(prev)
+        except Exception:
+            pass
+    if not isinstance(msg, dict):
+        return
+    if msg.get("type") == "response":
+        # Nobody waits right now; stash for whoever asks next by seq.
+        st.dap.stash.append(msg)
+        return
+    try:
+        st._handle_pumped(msg)
+    except BridgeErr:
+        # Exited/dead-adapter while idle: state already updated
+        # (exited/published); the next command reports it.
+        pass
+
+
 def serve(st, server, nonce):
     # Idle accept gets a 1s timeout so rm -rf abandonment is noticed even
     # with zero traffic (blocking accept would orphan forever).
@@ -1098,6 +1188,9 @@ def serve(st, server, nonce):
         try:
             conn, _ = server.accept()
         except (socket.timeout, TimeoutError):
+            # Idle second: park already-arrived DAP stops so status sees
+            # them (Java drainer parity), then re-check abandonment.
+            idle_pump(st)
             continue
         except OSError:
             return
