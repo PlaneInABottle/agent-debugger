@@ -242,6 +242,91 @@ def die(msg, code=2):
     sys.exit(code)
 
 
+# ---------------------------------------------------------------- path resolve
+# Breakpoint paths are user-facing and relative to the CLI cwd (the target
+# cwd never changes). Semantics: a path that names an existing file from
+# the cwd wins as-is; otherwise an explicit --src root must locate it.
+# Bare basenames (no directory part) get a bounded recursive search under
+# each explicit --src root — never an implicit whole-repo scan. Anything
+# else is joined onto each --src root (no basename guessing).
+
+def _is_bare_name(raw):
+    return ("/" not in raw and os.sep not in raw
+            and (os.altsep is None or os.altsep not in raw))
+
+
+def _find_basenames(name, src_dirs, limit=6):
+    """Recursive basename matches under explicit roots (canonical, deduped).
+
+    Skips symlinked directories (no -follow loop/hide surprises) and stops
+    once ambiguity is proven (limit reached), so huge trees cost little."""
+    found = []
+    seen = set()
+    for root in src_dirs:
+        try:
+            if not os.path.isdir(root):
+                continue
+        except (TypeError, ValueError):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames[:] = sorted(
+                d for d in dirnames
+                if not os.path.islink(os.path.join(dirpath, d)))
+            if name in filenames:
+                cand = os.path.realpath(os.path.join(dirpath, name))
+                if cand not in seen and os.path.isfile(cand):
+                    seen.add(cand)
+                    found.append(cand)
+                    if len(found) >= limit:
+                        return found
+    return found
+
+
+def resolve_source_path(raw, src_dirs):
+    """Map a user-given path to a canonical file. Raises Usage (fail fast,
+    before the target runs) when nothing — or more than one thing — matches."""
+    srcs = [os.path.realpath(os.path.abspath(s)) for s in (src_dirs or [])]
+    if os.path.isabs(raw):
+        if os.path.isfile(raw):
+            return os.path.realpath(os.path.abspath(raw))
+        raise Usage(f"no such file: {raw} — check the path and try again")
+    cwd_try = os.path.abspath(raw)
+    if os.path.isfile(cwd_try):
+        # Cwd wins over --src: preserves long-standing behavior for full
+        # repo-relative paths like src/tests/.../test_x.py:378.
+        return os.path.realpath(cwd_try)
+    if _is_bare_name(raw):
+        matches = _find_basenames(raw, srcs) if srcs else []
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            if srcs:
+                where = (f"tried {cwd_try}; searched "
+                         f"{', '.join(srcs)} with no match")
+            else:
+                where = f"tried {cwd_try}; no --src roots given to search"
+            raise Usage(
+                f"no such file: {raw} ({where}) — use the full path "
+                f"relative to the current directory or pass --src <root> "
+                f"containing {raw}")
+        extra = "+" if len(matches) >= 6 else ""
+        shown = "\n  ".join(matches[:5])
+        raise Usage(
+            f"ambiguous breakpoint path: {raw} matches "
+            f"{len(matches)}{extra} files:\n  {shown}\nuse the full path "
+            f"relative to the current directory or --src <root> to "
+            f"disambiguate")
+    tried = [cwd_try]
+    for src in srcs:
+        cand = os.path.normpath(os.path.join(src, raw))
+        tried.append(cand)
+        if os.path.isfile(cand):
+            return os.path.realpath(cand)
+    raise Usage(
+        f"no such file: {raw} (tried {', '.join(tried)}) — use the full "
+        f"path relative to the current directory or pass --src <root>")
+
+
 def parse_break(spec, cfg):
     cond = None
     if "|" in spec:
@@ -268,7 +353,7 @@ def parse_break(spec, cfg):
         lineno = int(line)
     except ValueError:
         raise Usage(f"bad line in --break: {spec}")
-    cfg.breaks.append((os.path.abspath(path), lineno, cond))
+    cfg.breaks.append((resolve_source_path(path, cfg.src_dirs), lineno, cond))
 
 
 def parse_logpoint(spec, cfg):
@@ -277,7 +362,7 @@ def parse_logpoint(spec, cfg):
     second = spec.find(":", first + 1) if first >= 0 else -1
     if first <= 0 or second <= 0:
         raise Usage("--logpoint must look like path:line:template")
-    path = os.path.abspath(spec[:first])
+    path = resolve_source_path(spec[:first], cfg.src_dirs)
     try:
         lineno = int(spec[first + 1:second])
     except ValueError:
@@ -289,6 +374,11 @@ def parse_args(argv):
     cfg = Config()
     if not argv or argv[0] != "session":
         raise Usage("usage: pybridge.py session [options]")
+    # Break/logpoint specs resolve against --src roots, but flags may arrive
+    # in any order (--break before --src). Collect raw specs first, resolve
+    # after the full flag set is known — a bad path still fails fast here,
+    # before any target runs.
+    pending_stops = []  # (kind, spec) in flag order
     i = 1
     dashdash = False
     while i < len(argv):
@@ -322,10 +412,10 @@ def parse_args(argv):
             cfg.src_dirs.append(os.path.abspath(argv[i]))
         elif a == "--break":
             i += 1
-            parse_break(argv[i], cfg)
+            pending_stops.append(("break", argv[i]))
         elif a == "--logpoint":
             i += 1
-            parse_logpoint(argv[i], cfg)
+            pending_stops.append(("logpoint", argv[i]))
         elif a == "--watch":
             raise Usage("--watch has no debugpy equivalent yet (Python)")
         elif a == "--exit":
@@ -346,6 +436,11 @@ def parse_args(argv):
         raise Usage("launch needs --program")
     if cfg.kind == "attach" and not cfg.port:
         raise Usage("attach needs --port")
+    for kind, spec in pending_stops:
+        if kind == "break":
+            parse_break(spec, cfg)
+        else:
+            parse_logpoint(spec, cfg)
     if not cfg.python:
         cfg.python = sys.executable
     return cfg
@@ -613,7 +708,7 @@ class Session:
         f0 = self.frames[0]
         src = (f0.get("source") or {})
         try:
-            here = os.path.abspath(src.get("path", ""))
+            here = os.path.realpath(os.path.abspath(src.get("path", "")))
         except (TypeError, ValueError):
             return
         name = f0.get("name", "?")
@@ -622,12 +717,33 @@ class Session:
                 continue
             if key[0] == "break" and len(key) == 3:
                 try:
-                    if os.path.abspath(key[1]) == here and key[2] == f0.get("line"):
+                    if (os.path.realpath(os.path.abspath(key[1])) == here
+                            and key[2] == f0.get("line")):
                         rec["hits"] += 1
                 except (TypeError, ValueError):
                     pass
             elif key[0] == "method" and name == key[1]:
                 rec["hits"] += 1
+
+    def unresolved_summary(self):
+        """One-line diagnosis for stops that never bound (verified:false).
+
+        Only pending line/logpoint records qualify — verified/armed stops
+        simply were not reached, which is not a path problem."""
+        pend = [r for r in self.stop_states
+                if r.get("state") == "pending"
+                and r.get("kind") in ("break", "logpoint")]
+        if not pend:
+            return ""
+        parts = []
+        for r in pend:
+            s = r.get("spec", "?")
+            if r.get("detail"):
+                s += f" ({r['detail']})"
+            parts.append(s)
+        return ("unresolved breakpoints: " + "; ".join(parts)
+                + " — check the path names the executed file and the line "
+                "is executable code (not a blank, comment, or def/class header)")
 
     def publish_state(self, stopped):
         """Rewrite session.json so `status` shows live truth (parked stop +
@@ -878,6 +994,13 @@ class Session:
         if ev in ("exited", "terminated"):
             self.exited = True
             self.publish_state(False)
+            # A launch that never stopped usually means the breakpoints never
+            # bound (wrong path or non-executable line): say which, instead
+            # of leaving only "target exited".
+            if self.cfg.kind == "launch" and self.last_stop is None:
+                extra = self.unresolved_summary()
+                if extra:
+                    raise BridgeErr(f"target exited before any stop; {extra}")
             raise BridgeErr("target exited")
         if ev == "output" and isinstance(body, dict):
             text = body.get("output", "")
@@ -1073,6 +1196,10 @@ class Session:
             if not isinstance(r, str) or not r:
                 raise BridgeErr(f"bad break spec: {r!r}")
         scratch = Config()
+        # Live adds resolve exactly like startup specs: against the live
+        # session's --src roots (flags may predate --src at startup, but by
+        # now the roots are final).
+        scratch.src_dirs = list(self.cfg.src_dirs)
         try:
             for r in raws:
                 head = r.split("|", 1)[0]
@@ -1428,13 +1555,16 @@ def main(argv):
             if cfg.breaks or cfg.methods or cfg.want_exc:
                 try:
                     st.pump(cfg.timeout)
-                except StopTimeout:
+                except StopTimeout as e:
                     # Attach-only fallback: a live target that never hits
                     # stays a running session with breaks armed; the agent
                     # triggers the stop later via continue. Launch timeouts
                     # re-raise into the error.json path below, and target
                     # exit (plain BridgeErr) never falls back.
                     if cfg.kind != "attach":
+                        extra = st.unresolved_summary()
+                        if extra:
+                            raise BridgeErr(f"{e}; {extra}")
                         raise
                     st.publish_state(False)
                     serve(st, server, nonce)

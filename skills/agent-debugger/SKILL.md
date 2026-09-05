@@ -232,6 +232,17 @@ iterations cost zero LLM roundtrips.
   (for example `--timeout 2`) instead of paying the default 20-second wait.
 - Breakpoints are `file:line`; conditions are FULL Python expressions
   (`order.price > 1000`) — no allowlist, debugpy compiles them server-side.
+- Path semantics: resolved from YOUR cli cwd (the target cwd never
+  changes). An existing file wins as given — prefer the full path relative
+  to where you run (e.g. `src/tests/.../test_x.py:378`). Otherwise an
+  explicit `--src <root>` locates it: nested relatives join onto each root,
+  a bare basename (`test_x.py:378`) is searched only beneath explicit
+  `--src` roots and must match exactly one file. Zero/ambiguous matches
+  fail fast before the target runs; a `target exited` with no stop plus an
+  `unresolved breakpoints` note means the line never bound (wrong file or
+  non-executable line — stdlib excluded by justMyCode never binds), not a
+  lost session. `breaks` shows the plant state (`pending` + detail names
+  why). `breaks add` resolves the same way against the live `--src` roots.
 - `eval` runs real Python (comprehensions OK). `method:` = function name,
   bare `exc` = any uncaught exception. `--watch/--exit` do NOT exist for
   Python (no debugpy equivalent) and fail fast — don't try them.

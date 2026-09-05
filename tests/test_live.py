@@ -82,9 +82,9 @@ class LiveTests(unittest.TestCase):
         cls.tmp.cleanup()
 
     @classmethod
-    def cli(cls, name, *args, timeout=30, ok=True, env=None):
+    def cli(cls, name, *args, timeout=30, ok=True, env=None, cwd=None):
         result = subprocess.run([str(BIN), "--session", name, *args], env=env or cls.env,
-                                cwd=ROOT, capture_output=True, text=True, timeout=timeout)
+                                cwd=cwd or ROOT, capture_output=True, text=True, timeout=timeout)
         data = json.loads(result.stdout)
         if ok and (result.returncode or not data.get("ok")):
             raise AssertionError(f"{name} {args}: {data}, stderr={result.stderr}")
@@ -625,6 +625,130 @@ class LiveTests(unittest.TestCase):
         recs = [s["spec"] for s in self.cli(name, "breaks")["stops"] if s["kind"] == "break"]
         for raw in file_breaks:
             self.assertIn(raw, recs)
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+
+    def _ensure_py_path_fixtures(self):
+        """Nested layout mirroring the basename repro: a probe buried under
+        <root>/tests/workflows/nodes plus fast/sleeping targets and a
+        stdlib file (justMyCode-excluded, so breaks there stay pending)."""
+        if hasattr(self, "py_probe"):
+            return
+        nested = self.fixture / "pysrc/tests/workflows/nodes"
+        nested.mkdir(parents=True, exist_ok=True)
+        self.py_probe = nested / "test_probe_unit.py"
+        self.py_probe.write_text(
+            "import time\nfor i in range(100):\n    value = i + 1\n"
+            "    print(value, flush=True)\n    time.sleep(.15)\n")
+        self.py_fast = self.fixture / "py_fast.py"
+        self.py_fast.write_text('print("done", flush=True)\n')
+        self.py_pending_idle = self.fixture / "py_pending_idle.py"
+        self.py_pending_idle.write_text(
+            'import time\nprint("ready", flush=True)\nwhile True:\n'
+            "    time.sleep(0.2)\n")
+        out = subprocess.run([str(VENV_PY), "-c",
+                              "import threading; print(threading.__file__)"],
+                             capture_output=True, text=True, timeout=30)
+        self.py_stdlib = out.stdout.strip()
+        with open(self.py_stdlib) as f:
+            nlines = len(f.read().splitlines())
+        self.py_stdlib_line = min(100, nlines)
+
+    def test_09_py_basename_without_src_fails_fast(self):
+        """User repro: a bare basename that only exists under a nested tree
+        fails before the target runs — naming the raw path, the cwd attempt
+        and the --src guidance (never a bare `target exited`)."""
+        self._ensure_py_path_fixtures()
+        started = time.monotonic()
+        data = self.cli("py-bare-nosrc", "py", "start", str(self.py_probe),
+                        "--break", "test_probe_unit.py:3", "--timeout", "10",
+                        ok=False)
+        elapsed = time.monotonic() - started
+        self.assertFalse(data["ok"])
+        err = data["error"]
+        self.assertIn("no such file", err)
+        self.assertIn("test_probe_unit.py", err)
+        self.assertIn("--src", err)
+        self.assertNotIn("target exited", err)
+        self.assertLess(elapsed, 15)
+        self._assert_absent("py-bare-nosrc")
+
+    def test_10_py_basename_with_src_and_nested_relative_stop(self):
+        """Basename + --src resolves to a real stop (locals/eval live); a
+        full nested path relative to the cwd keeps working (cwd wins)."""
+        self._ensure_py_path_fixtures()
+        name = "py-path-src"
+        self.sessions.add(name)
+        data = self.cli(name, "py", "start", str(self.py_probe),
+                        "--src", str(self.fixture / "pysrc"),
+                        "--break", "test_probe_unit.py:4", "--timeout", "15")
+        self.assertEqual(data["location"]["line"], 4)
+        self.assertEqual(self.cli(name, "eval", "value")["value"], "1")
+        self.assertIn("value",
+                      {v["name"] for v in self.cli(name, "vars")["locals"]})
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+        name = "py-path-rel"
+        self.sessions.add(name)
+        rel = os.path.join("pysrc", "tests", "workflows", "nodes",
+                           "test_probe_unit.py")
+        data = self.cli(name, "py", "start", str(self.py_probe),
+                        "--break", f"{rel}:4", "--timeout", "15",
+                        cwd=str(self.fixture))
+        self.assertEqual(data["location"]["line"], 4)
+        self.assertEqual(self.cli(name, "eval", "value")["value"], "1")
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+
+    def test_11_py_unverified_exit_and_timeout_report_pending(self):
+        """Existing file, never-binding line (stdlib excluded by justMyCode):
+        a fast-exiting target reports the pending spec/detail plus the
+        wrong-path hint; a launch first-stop timeout does the same."""
+        self._ensure_py_path_fixtures()
+        spec = f"{self.py_stdlib}:{self.py_stdlib_line}"
+        data = self.cli("py-unverified-exit", "py", "start", str(self.py_fast),
+                        "--break", spec, "--timeout", "10", ok=False)
+        self.assertFalse(data["ok"])
+        err = data["error"]
+        self.assertIn("target exited", err)
+        self.assertIn("unresolved breakpoints", err)
+        self.assertIn(os.path.basename(self.py_stdlib), err)
+        self.assertIn("excluded", err)  # debugpy's pending detail
+        self.assertIn("executable", err)  # wrong-path hint
+        self._assert_absent("py-unverified-exit")
+        data = self.cli("py-unverified-timeout", "py", "start",
+                        str(self.py_pending_idle),
+                        "--break", spec, "--timeout", "2", ok=False)
+        self.assertFalse(data["ok"])
+        self.assertIn("timeout", data["error"])
+        self.assertIn("unresolved breakpoints", data["error"])
+        self.assertIn(os.path.basename(self.py_stdlib), data["error"])
+        self._assert_absent("py-unverified-timeout")
+
+    def test_12_py_attach_pending_survives(self):
+        """Attach with a never-binding (pending) break stays a live running
+        session; bare `breaks` exposes the pending record."""
+        self._ensure_py_path_fixtures()
+        port = free_port()
+        self._launch_target(
+            [str(VENV_PY), "-Xfrozen_modules=off", "-m", "debugpy",
+             "--listen", f"127.0.0.1:{port}", str(self.py_pending_idle)],
+            "py-pending-idle")
+        self._wait_log("py-pending-idle", "ready")
+        time.sleep(1)
+        name = "py-pending-attach"
+        self.sessions.add(name)
+        data = self.cli(name, "py", "attach", "--port", str(port),
+                        "--break",
+                        f"{self.py_stdlib}:{self.py_stdlib_line}",
+                        "--timeout", "2")
+        self.assertTrue(data["running"])
+        stops = self.cli(name, "breaks")["stops"]
+        self.assertEqual(len(stops), 1)
+        self.assertEqual(stops[0]["state"], "pending")
+        self.assertTrue(stops[0]["spec"].endswith(
+            f"{os.path.basename(self.py_stdlib)}:{self.py_stdlib_line}"))
+        self.assertIn("threads", self.cli(name, "threads"))
         self.assertTrue(self.cli(name, "close")["confirmed"])
         self.sessions.remove(name)
 

@@ -1,6 +1,7 @@
 """Deterministic regressions for DAP ordering and stopped-state handling."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import socket
 import tempfile
@@ -154,7 +155,10 @@ class BridgeTests(unittest.TestCase):
 
     def test_breaks_add_conflict_is_atomic(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = str(Path(tmp) / "a.py")
+            # Canonical seed: the resolver stores realpath, so pre-armed
+            # entries must match that form (matters on symlinked /tmp).
+            path = os.path.realpath(str(Path(tmp) / "a.py"))
+            Path(path).write_text("x = 1\n")
             armed = (path, 5, None)
             st = self.add_session(tmp, breaks=[armed])
             st.stop_states = [{"spec": "a.py:5", "kind": "break", "state": "verified", "hits": 0}]
@@ -168,7 +172,8 @@ class BridgeTests(unittest.TestCase):
 
     def test_breaks_add_duplicate_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = str(Path(tmp) / "a.py")
+            path = os.path.realpath(str(Path(tmp) / "a.py"))
+            Path(path).write_text("x = 1\n")
             st = self.add_session(tmp, breaks=[(path, 5, None)])
             st.stop_states = [{"spec": "a.py:5", "kind": "break", "state": "verified", "hits": 0}]
             st._hitkeys = [("break", path, 5)]
@@ -178,7 +183,8 @@ class BridgeTests(unittest.TestCase):
 
     def test_breaks_add_success_confirms_subset(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = str(Path(tmp) / "a.py")
+            path = os.path.realpath(str(Path(tmp) / "a.py"))
+            Path(path).write_text("x = 1\n")
             st = self.add_session(tmp)
             st.dap_request.return_value = {"breakpoints": [{"verified": True}]}
             raw = f"{path}:5"
@@ -196,8 +202,10 @@ class BridgeTests(unittest.TestCase):
 
     def test_breaks_add_partial_ok_with_warning(self):
         with tempfile.TemporaryDirectory() as tmp:
-            a = str(Path(tmp) / "a.py")
-            b = str(Path(tmp) / "b.py")
+            a = os.path.realpath(str(Path(tmp) / "a.py"))
+            b = os.path.realpath(str(Path(tmp) / "b.py"))
+            Path(a).write_text("x = 1\n")
+            Path(b).write_text("y = 2\n")
             st = self.add_session(tmp)
 
             def fake(command, args=None, timeout=30):
@@ -213,13 +221,179 @@ class BridgeTests(unittest.TestCase):
 
     def test_breaks_add_total_failure_is_error(self):
         with tempfile.TemporaryDirectory() as tmp:
-            a = str(Path(tmp) / "a.py")
+            a = os.path.realpath(str(Path(tmp) / "a.py"))
+            Path(a).write_text("x = 1\n")
             st = self.add_session(tmp)
             st.dap_request.side_effect = bridge.BridgeErr("adapter exploded")
             with self.assertRaises(bridge.BridgeErr):
                 st.cmd_breaks_add({"breaks": [f"{a}:5"]})
             self.assertEqual(st.cfg.breaks, [])
             self.assertEqual(st.stop_states, [])
+
+    def test_resolve_cwd_existing_wins_over_src(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            (root / "deep").mkdir(parents=True)
+            (root / "deep" / "probe.py").write_text("x = 1\n")
+            cwd_file = Path(tmp) / "probe.py"
+            cwd_file.write_text("y = 2\n")
+            old = os.getcwd()
+            os.chdir(tmp)
+            self.addCleanup(os.chdir, old)
+            got = bridge.resolve_source_path("probe.py", [str(root)])
+            self.assertEqual(got, os.path.realpath(str(cwd_file)))
+
+    def test_resolve_missing_basename_no_src_fails_fast(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.getcwd()
+            os.chdir(tmp)
+            self.addCleanup(os.chdir, old)
+            with self.assertRaises(bridge.Usage) as cm:
+                bridge.resolve_source_path("ghost.py", [])
+            msg = str(cm.exception)
+            self.assertIn("ghost.py", msg)
+            self.assertIn(os.path.abspath("ghost.py"), msg)
+            self.assertIn("no --src roots given", msg)
+
+    def test_resolve_basename_unique_under_src(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "root" / "a" / "b" / "only.py"
+            target.parent.mkdir(parents=True)
+            target.write_text("x = 1\n")
+            old = os.getcwd()
+            os.chdir(tmp)
+            self.addCleanup(os.chdir, old)
+            got = bridge.resolve_source_path("only.py", [str(Path(tmp) / "root")])
+            self.assertEqual(got, os.path.realpath(str(target)))
+
+    def test_resolve_basename_ambiguous_under_src(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for sub in ("a", "b"):
+                d = Path(tmp) / "root" / sub
+                d.mkdir(parents=True)
+                (d / "dup.py").write_text("x = 1\n")
+            old = os.getcwd()
+            os.chdir(tmp)
+            self.addCleanup(os.chdir, old)
+            with self.assertRaises(bridge.Usage) as cm:
+                bridge.resolve_source_path("dup.py", [str(Path(tmp) / "root")])
+            msg = str(cm.exception)
+            self.assertIn("ambiguous", msg)
+            self.assertIn("dup.py", msg)
+            self.assertIn(os.path.join("a", "dup.py"), msg)
+            self.assertIn(os.path.join("b", "dup.py"), msg)
+
+    def test_resolve_nested_relative_under_src(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "root" / "tests" / "wf" / "nested.py"
+            target.parent.mkdir(parents=True)
+            target.write_text("x = 1\n")
+            old = os.getcwd()
+            os.chdir(tmp)
+            self.addCleanup(os.chdir, old)
+            got = bridge.resolve_source_path(
+                os.path.join("tests", "wf", "nested.py"), [str(Path(tmp) / "root")])
+            self.assertEqual(got, os.path.realpath(str(target)))
+
+    def test_resolve_absolute_missing_fails_fast(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = str(Path(tmp) / "nope.py")
+            with self.assertRaises(bridge.Usage) as cm:
+                bridge.resolve_source_path(missing, [tmp])
+            self.assertIn(missing, str(cm.exception))
+
+    def test_resolve_symlink_canonical_dedup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real = Path(tmp) / "root" / "a"
+            real.mkdir(parents=True)
+            (real / "same.py").write_text("x = 1\n")
+            # Same file reachable twice: direct + symlinked sibling dir.
+            # The symlinked dir is skipped, the real one resolves alone.
+            try:
+                os.symlink(str(real), str(Path(tmp) / "root" / "blink"))
+            except OSError:
+                self.skipTest("symlinks unavailable")
+            old = os.getcwd()
+            os.chdir(tmp)
+            self.addCleanup(os.chdir, old)
+            got = bridge.resolve_source_path("same.py", [str(Path(tmp) / "root")])
+            self.assertEqual(got, os.path.realpath(str(real / "same.py")))
+
+    def test_logpoint_uses_same_resolver(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "root" / "lp.py"
+            target.parent.mkdir(parents=True)
+            target.write_text("x = 1\n")
+            old = os.getcwd()
+            os.chdir(tmp)
+            self.addCleanup(os.chdir, old)
+            cfg = bridge.Config()
+            cfg.src_dirs = [str(Path(tmp) / "root")]
+            bridge.parse_logpoint("lp.py:3:val={x}", cfg)
+            self.assertEqual(cfg.logpoints,
+                             [(os.path.realpath(str(target)), 3, "val={x}")])
+            with self.assertRaises(bridge.Usage):
+                bridge.parse_logpoint("ghost.py:3:val={x}", cfg)
+
+    def test_parse_args_resolves_break_before_src_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "root" / "deep" / "early.py"
+            target.parent.mkdir(parents=True)
+            target.write_text("x = 1\n")
+            prog = Path(tmp) / "app.py"
+            prog.write_text("print('hi')\n")
+            old = os.getcwd()
+            os.chdir(tmp)
+            self.addCleanup(os.chdir, old)
+            cfg = bridge.parse_args(["session", "--kind", "launch",
+                                     "--dir", str(Path(tmp) / "sess"),
+                                     "--program", str(prog),
+                                     "--break", "early.py:1",
+                                     "--src", str(Path(tmp) / "root")])
+            self.assertEqual(cfg.breaks,
+                             [(os.path.realpath(str(target)), 1, None)])
+
+    def test_breaks_add_uses_live_src_dirs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "root" / "sub" / "live.py"
+            target.parent.mkdir(parents=True)
+            target.write_text("x = 1\n")
+            old = os.getcwd()
+            os.chdir(tmp)
+            self.addCleanup(os.chdir, old)
+            st = self.add_session(tmp)
+            st.cfg.src_dirs = [str(Path(tmp) / "root")]
+            st.dap_request.return_value = {"breakpoints": [{"verified": True}]}
+            resp = st.cmd_breaks_add({"breaks": ["live.py:2"]})
+            self.assertTrue(resp["ok"])
+            self.assertEqual(len(resp["added"]), 1)
+            self.assertEqual(st.cfg.breaks,
+                             [(os.path.realpath(str(target)), 2, None)])
+            # Missing basename fails before any DAP traffic.
+            st.dap_request.reset_mock()
+            with self.assertRaises(bridge.BridgeErr) as cm:
+                st.cmd_breaks_add({"breaks": ["ghost.py:2"]})
+            self.assertIn("ghost.py", str(cm.exception))
+            st.dap_request.assert_not_called()
+
+    def test_unresolved_summary_names_specs_details_hint(self):
+        st = self.session()
+        st.stop_states = [
+            {"spec": "probe.py:3", "kind": "break", "state": "pending",
+             "hits": 0, "detail": "pending"},
+            {"spec": "probe.py:4", "kind": "logpoint", "state": "pending",
+             "hits": None, "detail": "val={x} (pending)"},
+            {"spec": "method:foo", "kind": "method", "state": "armed", "hits": 0},
+        ]
+        summary = st.unresolved_summary()
+        self.assertIn("probe.py:3", summary)
+        self.assertIn("probe.py:4", summary)
+        self.assertIn("val={x}", summary)
+        self.assertIn("executable", summary)
+        self.assertNotIn("method:foo", summary)
+        st.stop_states = [{"spec": "a.py:1", "kind": "break",
+                           "state": "verified", "hits": 0}]
+        self.assertEqual(st.unresolved_summary(), "")
 
     def test_partial_dap_frame_is_preserved(self):
         left, right = socket.socketpair()
