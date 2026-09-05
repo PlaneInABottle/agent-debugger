@@ -34,12 +34,21 @@ function readFrame(conn) {
       cleanup();
       reject(new BridgeErr('truncated frame'));
     };
+    // A socket 'error' with no listener crashes the whole daemon (Node
+    // rethrows it). Observed live: a client that disconnects mid-command
+    // (EPIPE) killed the session server. Swallow here; the read rejects.
+    const onError = () => {
+      cleanup();
+      reject(new BridgeErr('truncated frame'));
+    };
     const cleanup = () => {
       conn.removeListener('data', onData);
       conn.removeListener('close', onClose);
+      conn.removeListener('error', onError);
     };
     conn.on('data', onData);
     conn.on('close', onClose);
+    conn.on('error', onError);
   });
 }
 

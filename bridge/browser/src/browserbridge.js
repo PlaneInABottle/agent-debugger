@@ -1220,6 +1220,10 @@ async function main(argv) {
   const queue = [];
   queue.waiter = null;
   server.on('connection', (conn) => {
+    // Never let a dead client kill the daemon: an unlistened socket
+    // 'error' (EPIPE on disconnect) rethrows and crashes the process.
+    // framing.readFrame also listens, but cover the pre-read window too.
+    conn.on('error', () => {});
     queue.push(conn);
     if (queue.waiter) {
       const w = queue.waiter;
