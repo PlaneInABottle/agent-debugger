@@ -50,6 +50,12 @@ agent-debugger --session cart context  # where it is parked (if stopped)
   `updatedAt` (rewritten by the bridge on every stop/resume/exit).
   `lastStop` survives resume and exit — it answers "where was I last",
   `updatedAt` marks the last transition (not every read).
+- Stops that fire while no continue/step is waiting PARK visibly (all
+  four bridges): `status` flips to `stopped:true` with the fresh
+  `lastStop`, and `context`/`eval`/`step` work from the parked stop.
+  You never need a blind `continue` to discover a stop — but note a
+  parked stop still holds its target (a parked HTTP handler keeps its
+  connection open until you continue).
 - `breaks` lists every armed stop with its plant state: `verified`,
   `pending` (class/script not loaded yet — normal for deferred code),
   `slid` (runtime moved it, `detail` names the real line),
