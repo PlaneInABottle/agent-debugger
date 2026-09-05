@@ -578,6 +578,18 @@ fn cmd_spawn(
         args.extend(program_args.iter().cloned());
     }
 
+    // Spawn-time intent for resume-without-memory: armed stops + target,
+    // derived automatically (the agent writes nothing by hand).
+    let intent = json!({
+        "breaks": stops.breakpoints,
+        "logpoints": stops.logpoints,
+        "watches": stops.watches,
+        "exits": stops.exits,
+        "sources": stops.source_paths,
+        "timeout": stops.timeout,
+        "target": session::target_summary(&args),
+    });
+
     session::spawn(
         session,
         &session::SpawnSpec {
@@ -585,6 +597,7 @@ fn cmd_spawn(
             kind,
             bridge_args: args,
             wait_secs: stops.timeout + 10,
+            stops: intent,
         },
     )
 }

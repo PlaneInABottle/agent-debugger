@@ -2,7 +2,10 @@
 //!
 //! Layout: `~/.agent-debugger/sessions/<name>/` holds `session.json`
 //! (written by the bridge when stopped at the first breakpoint),
-//! `error.json` (fatal setup failure) and `bridge.log`.
+//! `error.json` (fatal setup failure), `lang.json` (adapter language),
+//! `stops.json` (spawn-time intent: armed stops + target summary, written by
+//! the CLI so a compacted agent can resume with zero prior memory),
+//! `owner.json` (abandonment guard nonce) and `bridge.log`.
 
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -58,6 +61,61 @@ pub struct SpawnSpec {
     pub kind: &'static str, // "attach" | "launch"
     pub bridge_args: Vec<String>,
     pub wait_secs: u64,
+    /// Spawn-time intent (armed stops + target summary), persisted to
+    /// `stops.json` so resume needs no prior memory. Built by `cmd_spawn`.
+    pub stops: Value,
+}
+
+/// Summarize WHAT the session targets by scanning bridge args for known
+/// flags. Derived automatically at spawn — the agent never writes this.
+/// Unknown flags are ignored (forward-compat with new target options).
+pub fn target_summary(args: &[String]) -> Value {
+    let mut map = serde_json::Map::new();
+    // Flag -> display key. Values are single tokens (paths, ports, hosts).
+    let keys = [
+        ("--program", "program"),
+        ("--main", "main"),
+        ("--port", "port"),
+        ("--host", "host"),
+        ("--tab", "tab"),
+        ("--cp", "classpath"),
+        ("--python", "python"),
+        ("--node", "node"),
+    ];
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            break; // everything after is program args, not target identity
+        }
+        let mut matched = false;
+        for (flag, key) in keys {
+            if a == flag && i + 1 < args.len() {
+                map.insert(key.to_string(), Value::String(args[i + 1].clone()));
+                matched = true;
+                break;
+            }
+        }
+        i += if matched { 2 } else { 1 };
+    }
+    Value::Object(map)
+}
+
+/// Armed-stop counts from a parsed `stops.json` (intent side of resume).
+fn stops_armed(stops: &Value) -> Value {
+    let count = |key: &str| {
+        stops
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    };
+    json!({
+        "breaks": count("breaks"),
+        "logpoints": count("logpoints"),
+        "watches": count("watches"),
+        "exits": count("exits"),
+    })
 }
 
 /// Language owning a session (sidecar file; missing = "java" for old sessions).
@@ -84,9 +142,17 @@ pub fn spawn(name: &str, spec: &SpawnSpec) -> anyhow::Result<Value> {
     // Clear leftovers from a previous failed attempt.
     let _ = std::fs::remove_file(dir.join("session.json"));
     let _ = std::fs::remove_file(dir.join("error.json"));
+    let _ = std::fs::remove_file(dir.join("stops.json"));
     let _ = std::fs::write(
         dir.join("lang.json"),
         format!("{{\"lang\":\"{}\"}}", spec.lang),
+    );
+    // Spawn-time intent first: even if the bridge dies during setup, the
+    // failed attempt's dir is removed wholesale — but while the session
+    // lives, stops.json is always present for resume.
+    let _ = std::fs::write(
+        dir.join("stops.json"),
+        serde_json::to_string_pretty(&spec.stops).unwrap_or_else(|_| "{}".to_string()),
     );
 
     let log = std::fs::File::create(dir.join("bridge.log"))
@@ -325,6 +391,19 @@ pub fn status() -> Value {
                     Duration::from_millis(300),
                 )
                 .is_ok();
+            // Resume intent: armed counts + target, derived at spawn. Old
+            // sessions predate stops.json — null there is honest ("unknown"),
+            // never fabricated zeros.
+            let stops_raw = std::fs::read_to_string(entry.path().join("stops.json")).ok();
+            let stops_parsed: Option<Value> =
+                stops_raw.and_then(|raw| serde_json::from_str(&raw).ok());
+            let (armed, target) = match &stops_parsed {
+                Some(v) => (
+                    Some(stops_armed(v)),
+                    v.get("target").cloned().unwrap_or(Value::Null),
+                ),
+                None => (None, Value::Null),
+            };
             sessions.push(json!({
                 "name": name,
                 "lang": session_lang(&name),
@@ -332,6 +411,8 @@ pub fn status() -> Value {
                 "port": port,
                 "alive": alive,
                 "stopped": parsed.get("stopped"),
+                "armed": armed,
+                "target": target,
             }));
         }
     }
@@ -371,5 +452,41 @@ mod tests {
         std::fs::write(dir.join("logs.jsonl"), "").unwrap();
         assert!(read_logs_file(&dir, 50).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn target_summary_picks_known_flags() {
+        let v = target_summary(&args(&[
+            "--program", "app.py", "--break", "app.py:3", "--timeout", "20",
+        ]));
+        assert_eq!(v["program"], json!("app.py"));
+        assert!(v.get("break").is_none(), "stop flags are not target identity");
+        assert!(v.get("timeout").is_none());
+    }
+
+    #[test]
+    fn target_summary_stops_at_dashdash() {
+        // Program args after `--` must never leak into target identity,
+        // even when they look like flags.
+        let v = target_summary(&args(&["--port", "9222", "--", "--port", "1234"]));
+        assert_eq!(v["port"], json!("9222"));
+    }
+
+    #[test]
+    fn target_summary_unknown_flags_ignored() {
+        let v = target_summary(&args(&["--tab", "shop", "--frobnicate", "x"]));
+        assert_eq!(v["tab"], json!("shop"));
+        assert!(v.get("frobnicate").is_none());
+    }
+
+    #[test]
+    fn stops_armed_counts_lists() {
+        let v = json!({"breaks": ["a:1", "b:2"], "logpoints": [], "watches": ["C.f"]});
+        let armed = stops_armed(&v);
+        assert_eq!(armed, json!({"breaks": 2, "logpoints": 0, "watches": 1, "exits": 0}));
     }
 }
