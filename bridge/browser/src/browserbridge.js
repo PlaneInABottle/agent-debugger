@@ -421,6 +421,8 @@ class Session {
     this.sources = new Map(); // scriptId -> source lines (capped)
     this.defaultContextId = null;
     this.logpointIds = new Map(); // breakpointId -> template
+    this.breakIdToRec = new Map(); // breakpointId -> {rec, line} for resolve upgrades
+    this.stopStates = []; // arm-time records served by `breaks`
     this.paused = null;     // {frames, stopInfo} of the current stop
     this.awaitingStep = false;
     this.exited = false;
@@ -476,9 +478,20 @@ class Session {
     }
   }
 
+  dispSpec(b, kind) {
+    // Display form for `breaks`: url frag + line (+ cond), template for
+    // logpoints. Mirrors nodebridge/pybridge reconstructed specs.
+    let s = `${b.frag}:${b.line}`;
+    if (kind === 'break' && b.cond) s += `|${b.cond}`;
+    return s;
+  }
+
   async armBreakpoints() {
     // Same collision rule as nodebridge: a real break and a logpoint on the
     // same line — the break wins, the logpoint is reported and skipped.
+    // Every requested stop lands in this.stopStates (served by `breaks`)
+    // — verification used to live only in stderr, invisible after
+    // compaction.
     const byLine = new Map(); // `${frag}:${line}` -> {break, logpoint}
     for (const b of this.cfg.breaks) {
       byLine.set(`${b.frag}:${b.line}`, { ...(byLine.get(`${b.frag}:${b.line}`) || {}), brk: b });
@@ -486,13 +499,19 @@ class Session {
     for (const l of this.cfg.logpoints) {
       const key = `${l.frag}:${l.line}`;
       if (byLine.has(key) && byLine.get(key).brk) {
-        process.stderr.write(`warn: logpoint shadowed by breakpoint: ${l.frag}:${l.line}\n`);
+        const msg = `logpoint shadowed by breakpoint: ${l.frag}:${l.line}`;
+        process.stderr.write(`warn: ${msg}\n`);
+        this.stopStates.push({
+          spec: this.dispSpec(l, 'logpoint'), kind: 'logpoint',
+          state: 'shadowed', detail: msg,
+        });
         continue;
       }
       byLine.set(key, { ...(byLine.get(key) || {}), log: l });
     }
     for (const [, item] of byLine) {
       const spec = item.brk || item.log;
+      const kind = item.brk ? 'break' : 'logpoint';
       const params = {
         urlRegex: fragRegex(spec.frag),
         lineNumber: spec.line - 1,
@@ -500,26 +519,47 @@ class Session {
       if (item.brk && item.brk.cond) params.condition = item.brk.cond;
       const res = await this.cdp.request('Debugger.setBreakpointByUrl', params);
       const bpId = res.breakpointId;
+      const rec = { spec: this.dispSpec(spec, kind), kind };
+      if (kind === 'logpoint') rec.detail = spec.template;
       if (!bpId) {
-        process.stderr.write(`warn: breakpoint rejected: ${spec.frag}:${spec.line}\n`);
+        const msg = `breakpoint rejected: ${spec.frag}:${spec.line}`;
+        process.stderr.write(`warn: ${msg}\n`);
+        rec.state = 'rejected';
+        rec.detail = kind === 'logpoint' ? `${spec.template} (${msg})` : msg;
+        this.stopStates.push(rec);
         continue;
       }
       if (item.log && !item.brk) {
         this.logpointIds.set(bpId, item.log.template);
       }
+      // breakpointResolved upgrades this record when V8 binds it (arm-time
+      // locations:[] is normal — scripts parse after we install).
+      this.breakIdToRec.set(bpId, { rec, line: spec.line });
       const locs = res.locations || [];
       if (locs.length === 0) {
         process.stderr.write(`warn: breakpoint unverified (pending): ${spec.frag}:${spec.line}\n`);
       }
-      for (const loc of locs) {
+      const slidLoc = (locs.map((l) => l.lineNumber + 1).find((n) => n !== spec.line));
+      const slidTo = (slidLoc === undefined) ? null : slidLoc;
+      if (slidTo !== null) {
         // V8 slides breakpoints off non-executable lines to the next
         // statement — say so loudly instead of debugging the wrong line.
-        if (loc.lineNumber + 1 !== spec.line) {
-          process.stderr.write(
-            `warn: breakpoint slid: ${spec.frag}:${spec.line} -> ${loc.lineNumber + 1}\n`);
-          break;
+        process.stderr.write(
+          `warn: breakpoint slid: ${spec.frag}:${spec.line} -> ${slidTo}\n`);
+        rec.state = 'slid';
+        rec.detail = kind === 'logpoint'
+          ? `${spec.template} (slid to line ${slidTo})`
+          : `slid to line ${slidTo}`;
+      } else {
+        rec.state = locs.length > 0 ? 'verified' : 'pending';
+        if (rec.state === 'pending' && kind === 'break') {
+          rec.detail = 'no locations yet (script not parsed or line not executable)';
         }
       }
+      this.stopStates.push(rec);
+    }
+    if (this.cfg.wantExc) {
+      this.stopStates.push({ spec: 'exc', kind: 'exc', state: 'armed' });
     }
   }
 
@@ -552,6 +592,25 @@ class Session {
       if (scriptId) {
         this.scripts.set(scriptId, url || '');
         if (url) this.urls.set(url, scriptId);
+      }
+      return;
+    }
+    if (msg.method === 'Debugger.breakpointResolved') {
+      // V8 bound a pending breakpoint: promote the `breaks` record from
+      // provisional pending to verified (or slid, if it landed elsewhere).
+      const p = msg.params || {};
+      const entry = this.breakIdToRec.get(p.breakpointId);
+      if (entry && entry.rec.state === 'pending') {
+        const at = p.location ? p.location.lineNumber + 1 : null;
+        if (at !== null && at !== entry.line) {
+          entry.rec.state = 'slid';
+          entry.rec.detail = entry.rec.kind === 'logpoint' && entry.rec.detail
+            ? `${entry.rec.detail} (slid to line ${at})`
+            : `slid to line ${at}`;
+        } else {
+          entry.rec.state = 'verified';
+          if (entry.rec.kind === 'break') delete entry.rec.detail;
+        }
       }
       return;
     }
@@ -1099,6 +1158,15 @@ class Session {
     return { ok: true, total: lines.length, truncated: lines.length > tail, lines: lines.slice(-tail) };
   }
 
+  async cmdBreaks() {
+    // Arm-time records: what was requested and whether it planted
+    // (verified/pending/slid/shadowed) — no round-trip needed, no stop
+    // required. verifyTab first: a dead tab's records would lie.
+    await this.verifyTab();
+    if (this.exited) throw new BridgeErr(EXITED_MSG);
+    return { ok: true, stops: this.stopStates };
+  }
+
   async dispatch(req) {
     const cmd = req.cmd;
     let timeout = Number(req.timeout !== undefined ? req.timeout : this.cfg.timeout);
@@ -1112,6 +1180,7 @@ class Session {
     if (cmd === 'continue') return await this.cmdContinue(req, timeout);
     if (cmd === 'reload') return await this.cmdReload(req, timeout);
     if (cmd === 'threads') return await this.cmdThreads();
+    if (cmd === 'breaks') return await this.cmdBreaks();
     if (cmd === 'logs') return this.cmdLogs(req);
     throw new BridgeErr(`unknown cmd: ${cmd}`);
   }

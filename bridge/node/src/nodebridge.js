@@ -370,6 +370,7 @@ class Session {
     this.scripts = new Map(); // scriptId -> url
     this.urls = new Map();    // url -> scriptId
     this.logpointIds = new Map(); // breakpointId -> template
+    this.breakIdToRec = new Map(); // breakpointId -> {rec, line} for resolve upgrades
     this.paused = null;     // {frames, stopInfo} of the current stop
     this.awaitingStep = false;
     this.exited = false;
@@ -380,6 +381,7 @@ class Session {
     this.stopInfo = null;
     this.outputTail = '';
     this.logCount = 0;
+    this.stopStates = []; // arm-time records served by `breaks`
   }
 
   // -- target lifecycle
@@ -505,12 +507,23 @@ class Session {
     }
   }
 
+  dispSpec(b, kind) {
+    // Display form for `breaks`: workspace-relative path + line (+ cond),
+    // template for logpoints. Mirrors pybridge's reconstructed specs.
+    let s = `${this.relFile(b.path)}:${b.line}`;
+    if (kind === 'break' && b.cond) s += `|${b.cond}`;
+    return s;
+  }
+
   async armBreakpoints() {
     // Group per file: CDP setBreakpointByUrl is one line per call, but a
     // logpoint and a line break on the same line would collide — keep the
     // real break (logpoint still fires? no: one breakpoint per line wins).
     // Keep it simple and explicit: real breaks win, logpoint on the same
     // line is reported and skipped.
+    // Every requested stop lands in this.stopStates (served by `breaks`)
+    // — verification used to live only in stderr, invisible after
+    // compaction.
     const byLine = new Map(); // `${path}:${line}` -> {break, logpoint}
     for (const b of this.cfg.breaks) {
       byLine.set(`${b.path}:${b.line}`, { ...(byLine.get(`${b.path}:${b.line}`) || {}), brk: b });
@@ -518,13 +531,19 @@ class Session {
     for (const l of this.cfg.logpoints) {
       const key = `${l.path}:${l.line}`;
       if (byLine.has(key) && byLine.get(key).brk) {
-        process.stderr.write(`warn: logpoint shadowed by breakpoint: ${l.path}:${l.line}\n`);
+        const msg = `logpoint shadowed by breakpoint: ${l.path}:${l.line}`;
+        process.stderr.write(`warn: ${msg}\n`);
+        this.stopStates.push({
+          spec: this.dispSpec(l, 'logpoint'), kind: 'logpoint',
+          state: 'shadowed', detail: msg,
+        });
         continue;
       }
       byLine.set(key, { ...(byLine.get(key) || {}), log: l });
     }
     for (const [, item] of byLine) {
       const spec = item.brk || item.log;
+      const kind = item.brk ? 'break' : 'logpoint';
       const fileUrl = pathToFileURL(spec.path).href;
       const params = {
         urlRegex: `^${escapeRegex(fileUrl)}$`,
@@ -533,27 +552,50 @@ class Session {
       if (item.brk && item.brk.cond) params.condition = item.brk.cond;
       const res = await this.cdp.request('Debugger.setBreakpointByUrl', params);
       const bpId = res.breakpointId;
+      const rec = { spec: this.dispSpec(spec, kind), kind };
+      if (kind === 'logpoint') rec.detail = spec.template;
       if (!bpId) {
-        process.stderr.write(`warn: breakpoint rejected: ${spec.path}:${spec.line}\n`);
+        const msg = `breakpoint rejected: ${spec.path}:${spec.line}`;
+        process.stderr.write(`warn: ${msg}\n`);
+        rec.state = 'rejected';
+        rec.detail = kind === 'logpoint' ? `${spec.template} (${msg})` : msg;
+        this.stopStates.push(rec);
         continue;
       }
       if (item.log && !item.brk) {
         this.logpointIds.set(bpId, item.log.template);
       }
-      if ((res.locations || []).length === 0 && this.urls.has(fileUrl)) {
-        process.stderr.write(`warn: breakpoint unverified (pending): ${spec.path}:${spec.line}\n`);
+      // breakpointResolved upgrades this record when V8 binds it (arm-time
+      // locations:[] is normal — scripts parse after we install).
+      this.breakIdToRec.set(bpId, { rec, line: spec.line });
+      const locs = res.locations || [];
+      if (locs.length === 0 && this.urls.has(fileUrl)) {
+        const msg = `breakpoint unverified (pending): ${spec.path}:${spec.line}`;
+        process.stderr.write(`warn: ${msg}\n`);
       }
-      for (const loc of res.locations || []) {
+      const slidLoc = (locs.map((l) => l.lineNumber + 1).find((n) => n !== spec.line));
+      const slidTo = (slidLoc === undefined) ? null : slidLoc;
+      if (slidTo !== null) {
         // V8 slides breakpoints off non-executable lines (e.g. `}`) to the
         // next statement — possibly another scope where conditions/holes
         // stop resolving. Say so loudly instead of silently debugging the
         // wrong line.
-        if (loc.lineNumber + 1 !== spec.line) {
-          process.stderr.write(
-            `warn: breakpoint slid: ${spec.path}:${spec.line} -> ${loc.lineNumber + 1}\n`);
-          break;
+        process.stderr.write(
+          `warn: breakpoint slid: ${spec.path}:${spec.line} -> ${slidTo}\n`);
+        rec.state = 'slid';
+        rec.detail = kind === 'logpoint'
+          ? `${spec.template} (slid to line ${slidTo})`
+          : `slid to line ${slidTo}`;
+      } else {
+        rec.state = locs.length > 0 ? 'verified' : 'pending';
+        if (rec.state === 'pending' && kind === 'break') {
+          rec.detail = 'no locations yet (script not parsed or line not executable)';
         }
       }
+      this.stopStates.push(rec);
+    }
+    if (this.cfg.wantExc) {
+      this.stopStates.push({ spec: 'exc', kind: 'exc', state: 'armed' });
     }
   }
 
@@ -565,6 +607,25 @@ class Session {
       if (scriptId) {
         this.scripts.set(scriptId, url || '');
         if (url) this.urls.set(url, scriptId);
+      }
+      return;
+    }
+    if (msg.method === 'Debugger.breakpointResolved') {
+      // V8 bound a pending breakpoint: promote the `breaks` record from
+      // provisional pending to verified (or slid, if it landed elsewhere).
+      const p = msg.params || {};
+      const entry = this.breakIdToRec.get(p.breakpointId);
+      if (entry && entry.rec.state === 'pending') {
+        const at = p.location ? p.location.lineNumber + 1 : null;
+        if (at !== null && at !== entry.line) {
+          entry.rec.state = 'slid';
+          entry.rec.detail = entry.rec.kind === 'logpoint' && entry.rec.detail
+            ? `${entry.rec.detail} (slid to line ${at})`
+            : `slid to line ${at}`;
+        } else {
+          entry.rec.state = 'verified';
+          if (entry.rec.kind === 'break') delete entry.rec.detail;
+        }
       }
       return;
     }
@@ -1039,6 +1100,14 @@ class Session {
     };
   }
 
+  cmdBreaks() {
+    // Arm-time records: what was requested and whether it planted
+    // (verified/pending/slid/shadowed) — no round-trip needed, no stop
+    // required.
+    if (this.exited) throw new BridgeErr('target VM has exited — close this session');
+    return { ok: true, stops: this.stopStates };
+  }
+
   cmdLogs(req) {
     const tail = Math.max(1, Math.min(500, parseInt(req.tail || 50, 10) || 50));
     let lines = [];
@@ -1063,6 +1132,7 @@ class Session {
     if (cmd === 'step') return await this.cmdStep(req, timeout);
     if (cmd === 'continue') return await this.cmdContinue(req, timeout);
     if (cmd === 'threads') return this.cmdThreads();
+    if (cmd === 'breaks') return this.cmdBreaks();
     if (cmd === 'logs') return this.cmdLogs(req);
     throw new BridgeErr(`unknown cmd: ${cmd}`);
   }

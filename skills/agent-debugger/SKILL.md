@@ -32,6 +32,31 @@ agent-debugger --session cart close
 One invocation = one round trip. Every stop already contains location +
 snippet + top-frame locals: do NOT follow a stop with blind `vars`/`stack`.
 
+## Resume Without Memory (compaction survival)
+
+Nothing here needs manual bookkeeping — the CLI derives it all. After a
+compact, reorient in three calls:
+
+```bash
+agent-debugger status    # sessions + armed counts + target per session
+agent-debugger --session cart breaks   # live plant state per stop
+agent-debugger --session cart context  # where it is parked (if stopped)
+```
+
+- `status` shows `armed: {breaks/logpoints/watches/exits}` + `target`
+  per session, persisted at spawn (`stops.json`). No session? Nothing to
+  resume — start fresh.
+- `breaks` lists every armed stop with its plant state: `verified`,
+  `pending` (class/script not loaded yet — normal for deferred code),
+  `slid` (runtime moved it, `detail` names the real line),
+  `shadowed` (logpoint killed by a same-line break), `armed` (no receipt
+  available: exc/watch/exit/method), `rejected`. `detail` carries the
+  logpoint template / slide target / pending reason.
+- Name sessions after the task (`--session cart-npe`): the name is the
+  only "why" that survives, and it costs nothing extra.
+- Never `rm -rf` a session dir instead of `close` (bridges self-reap, but
+  `close` is the contract).
+
 ## Decision Tree: Debugger vs Logs
 
 ```

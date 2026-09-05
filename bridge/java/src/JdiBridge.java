@@ -1674,6 +1674,11 @@ public class JdiBridge {
                 }
                 return "{\"ok\":true,\"running\":" + (!wasSuspended) + ",\"threads\":" + dump + "}";
             }
+            case "breaks": {
+                // Arm-time intent with live plant state, no stop required.
+                if (st.exited) throw new BridgeException("target VM has exited — close this session");
+                return breaksJson(st);
+            }
             case "logs": {
                 int tail = 50;
                 if (req.containsKey("tail")) {
@@ -1789,6 +1794,69 @@ public class JdiBridge {
         if (lines != null && lines.contains(line)) return true;
         List<String> methods = cfg.methodBreaks.get(cls);
         return methods != null && methods.contains(method);
+    }
+
+    /**
+     * Arm-time intent with live plant state (served by `breaks`, no stop
+     * required). Line/method breaks report verified iff their class is
+     * loaded right now — deferred ClassPrepare planting flips pending to
+     * verified automatically, so no stored state can go stale. Everything
+     * else reports armed: JDI enables those synchronously with no per-item
+     * receipt to report.
+     */
+    static String breaksJson(SessionState st) throws Exception {
+        Config cfg = st.cfg;
+        StringBuilder sb = new StringBuilder("{\"ok\":true,\"stops\":[");
+        boolean first = true;
+        for (Map.Entry<String, List<Integer>> e : cfg.breakpoints.entrySet()) {
+            boolean loaded = !st.vm.classesByName(e.getKey()).isEmpty();
+            for (int line : e.getValue()) {
+                String spec = e.getKey() + ":" + line;
+                String cond = cfg.condByLoc.get(e.getKey() + ":" + line);
+                if (cond != null) spec += "|" + cond;
+                first = breakRec(sb, first, spec, "break",
+                        loaded ? "verified" : "pending",
+                        loaded ? null : "class not loaded yet (deferred)");
+            }
+        }
+        for (Map.Entry<String, List<String>> e : cfg.methodBreaks.entrySet()) {
+            boolean loaded = !st.vm.classesByName(e.getKey()).isEmpty();
+            for (String m : e.getValue()) {
+                String spec = "method:" + e.getKey() + "." + m;
+                String cond = cfg.condByLoc.get("method:" + e.getKey() + "." + m);
+                if (cond != null) spec += "|" + cond;
+                first = breakRec(sb, first, spec, "method",
+                        loaded ? "verified" : "pending",
+                        loaded ? null : "class not loaded yet (deferred)");
+            }
+        }
+        for (String f : cfg.excFilters) {
+            first = breakRec(sb, first, "exc:" + f, "exc", "armed", null);
+        }
+        for (Logpoint lp : cfg.logpoints) {
+            first = breakRec(sb, first, lp.cls + ":" + lp.line, "logpoint", "armed", lp.template);
+        }
+        for (Watchpoint w : cfg.watchpoints) {
+            String mode = w.onRead && w.onWrite ? "read,write" : (w.onRead ? "read" : "write");
+            first = breakRec(sb, first, w.cls + "." + w.field, "watch", "armed", mode);
+        }
+        for (Map.Entry<String, List<String>> e : cfg.exitMethods.entrySet()) {
+            for (String m : e.getValue()) {
+                first = breakRec(sb, first, e.getKey() + "." + m, "exit", "armed", null);
+            }
+        }
+        return sb.append("]}").toString();
+    }
+
+    static boolean breakRec(StringBuilder sb, boolean first,
+            String spec, String kind, String state, String detail) {
+        if (!first) sb.append(',');
+        sb.append("{\"spec\":").append(quote(spec));
+        sb.append(",\"kind\":").append(quote(kind));
+        sb.append(",\"state\":").append(quote(state));
+        if (detail != null) sb.append(",\"detail\":").append(quote(detail));
+        sb.append('}');
+        return false;
     }
 
     static String toJsonArray(List<String> items) {

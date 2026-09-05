@@ -335,6 +335,7 @@ class Session:
         self.output_tail = ""
         self.log_count = 0
         self.configured = False  # True once launch/attach handshake completes
+        self.stop_states = []  # arm-time records served by `breaks`
 
     # -- DAP helpers
 
@@ -641,28 +642,54 @@ class Session:
     def arm_breakpoints(self):
         # DAP setBreakpoints REPLACES a file's breakpoints per call, so line
         # breaks and logpoints for the same file merge into ONE request.
+        # Every requested stop lands in self.stop_states (served by `breaks`)
+        # — verification used to live only in stderr, invisible after
+        # compaction.
         by_file = {}
         for path, line, cond in self.cfg.breaks:
             bp = {"line": line}
             if cond:
                 bp["condition"] = cond
-            by_file.setdefault(path, []).append((line, bp))
+            by_file.setdefault(path, []).append(
+                {"line": line, "bp": bp, "kind": "break", "cond": cond})
         for path, line, template in self.cfg.logpoints:
-            by_file.setdefault(path, []).append((line, {"line": line, "logMessage": template}))
+            by_file.setdefault(path, []).append(
+                {"line": line, "bp": {"line": line, "logMessage": template},
+                 "kind": "logpoint", "template": template})
         for path, items in by_file.items():
             body = self.dap_request("setBreakpoints",
                                     {"source": {"path": path},
-                                     "breakpoints": [bp for _, bp in items]})
-            for (line, _), got in zip(items, body.get("breakpoints", [])):
-                if not got.get("verified", False):
+                                     "breakpoints": [it["bp"] for it in items]})
+            for item, got in zip(items, body.get("breakpoints", [])):
+                verified = bool(got.get("verified", False))
+                spec = f"{self.rel_file(path)}:{item['line']}"
+                if item["kind"] == "break" and item.get("cond"):
+                    spec += f"|{item['cond']}"
+                rec = {"spec": spec, "kind": item["kind"],
+                       "state": "verified" if verified else "pending"}
+                if item["kind"] == "logpoint":
+                    # Resume needs the template ("what was I collecting?"),
+                    # not just the line. Cheap (one short string).
+                    rec["detail"] = item["template"]
+                if not verified:
+                    msg = got.get("message", "pending")
+                    if item["kind"] == "break":
+                        rec["detail"] = msg
+                    else:
+                        rec["detail"] = f"{item['template']} ({msg})"
                     sys.stderr.write(
-                        f"warn: breakpoint unverified: {path}:{line} "
-                        f"({got.get('message', 'pending')})\n")
+                        f"warn: breakpoint unverified: {path}:{item['line']} "
+                        f"({msg})\n")
+                self.stop_states.append(rec)
         for func in self.cfg.methods:
             self.dap_request("setFunctionBreakpoints",
                              {"breakpoints": [{"name": func}]})
+            self.stop_states.append(
+                {"spec": f"method:{func}", "kind": "method", "state": "armed"})
         if self.cfg.want_exc:
             self.dap_request("setExceptionBreakpoints", {"filters": ["uncaught"]})
+            self.stop_states.append(
+                {"spec": "exc", "kind": "exc", "state": "armed"})
 
     def pump(self, timeout):
         """Wait for the next stopped/exited; returns 'stopped' or raises."""
@@ -875,6 +902,13 @@ class Session:
         return {"ok": True, "running": not self.suspended,
                 "threads": self.threads_dump()}
 
+    def cmd_breaks(self):
+        # Arm-time records: what was requested and whether it planted
+        # (verified/pending) — no round-trip needed, no stop required.
+        if self.exited:
+            raise BridgeErr("target VM has exited — close this session")
+        return {"ok": True, "stops": self.stop_states}
+
     def cmd_logs(self, req):
         tail = max(1, min(500, int(req.get("tail", 50))))
         # Flush recently arrived output first: in logpoints-only sessions
@@ -921,6 +955,8 @@ class Session:
             return self.cmd_continue(req, timeout)
         if cmd == "threads":
             return self.cmd_threads()
+        if cmd == "breaks":
+            return self.cmd_breaks()
         if cmd == "logs":
             return self.cmd_logs(req)
         raise BridgeErr(f"unknown cmd: {cmd}")

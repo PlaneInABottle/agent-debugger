@@ -461,10 +461,18 @@ mod tests {
     #[test]
     fn target_summary_picks_known_flags() {
         let v = target_summary(&args(&[
-            "--program", "app.py", "--break", "app.py:3", "--timeout", "20",
+            "--program",
+            "app.py",
+            "--break",
+            "app.py:3",
+            "--timeout",
+            "20",
         ]));
         assert_eq!(v["program"], json!("app.py"));
-        assert!(v.get("break").is_none(), "stop flags are not target identity");
+        assert!(
+            v.get("break").is_none(),
+            "stop flags are not target identity"
+        );
         assert!(v.get("timeout").is_none());
     }
 
@@ -487,6 +495,9 @@ mod tests {
     fn stops_armed_counts_lists() {
         let v = json!({"breaks": ["a:1", "b:2"], "logpoints": [], "watches": ["C.f"]});
         let armed = stops_armed(&v);
-        assert_eq!(armed, json!({"breaks": 2, "logpoints": 0, "watches": 1, "exits": 0}));
+        assert_eq!(
+            armed,
+            json!({"breaks": 2, "logpoints": 0, "watches": 1, "exits": 0})
+        );
     }
 }

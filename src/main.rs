@@ -244,6 +244,10 @@ enum Commands {
     Stack,
     /// Instant thread dump (all threads + top frames, VM keeps running).
     Threads,
+    /// List armed stops with plant state (verified/pending/slid/shadowed).
+    /// No stop required — answers "which breakpoints do I have?" after
+    /// compaction without reading bridge logs.
+    Breaks,
     /// Show collected logpoint lines.
     Logs {
         /// How many trailing lines to return (max 500).
@@ -423,6 +427,10 @@ fn dispatch(session: &str, cmd: Commands) -> (&'static str, anyhow::Result<Value
         Commands::Threads => (
             "threads",
             session::forward(session, &json!({"cmd": "threads"}), Duration::from_secs(15)),
+        ),
+        Commands::Breaks => (
+            "breaks",
+            session::forward(session, &json!({"cmd": "breaks"}), Duration::from_secs(10)),
         ),
         Commands::Vars { frame } => (
             "vars",
