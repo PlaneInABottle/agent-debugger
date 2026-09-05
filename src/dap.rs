@@ -1,9 +1,9 @@
-//! Minimal DAP (Debug Adapter Protocol) message framing.
+//! Minimal DAP-style message framing for the CLI<->bridge protocol.
 //!
-//! DAP frames each JSON message as:
+//! Each JSON message is framed as:
 //! `Content-Length: <bytes>\r\n\r\n<json body>`
-//! `Content-Length` counts **bytes**, not chars. Phase 0 only implements
-//! framing (no session logic yet).
+//! `Content-Length` counts **bytes**, not chars. (The Python bridge speaks
+//! real DAP to debugpy separately; this module is only our transport.)
 
 use serde_json::Value;
 

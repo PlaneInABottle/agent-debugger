@@ -1,7 +1,7 @@
 //! Output-shrinking rules (browser-snapshot thinking, debugger domain).
 //!
-//! The Java bridge currently enforces these caps itself; this module will
-//! own them crate-side when Python/Node adapters arrive (shared policy).
+//! Token caps shared by the CLI envelope; per-language value rendering
+//! lives in the bridges (each enforces the same limits).
 
 // shared policy for later phases
 #![allow(dead_code)]

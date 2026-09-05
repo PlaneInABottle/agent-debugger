@@ -11,8 +11,9 @@ Node speaks raw CDP, no borrowed parts). You never install or open an
 editor.
 
 Target commands live under a language group (`java ...`, `py ...`,
-`node ...`); session commands (`step eval vars stack context threads logs
-close`) are language-agnostic and read the session's language themselves.
+`node ...`); session commands (`continue step eval vars stack context
+threads breaks logs reload close`) are language-agnostic and read the
+session's language themselves (`reload` is browser-only).
 Output shapes are identical across languages: learn once.
 
 ## Core Workflow
@@ -51,11 +52,11 @@ agent-debugger --session cart context  # where it is parked (if stopped)
   `lastStop` survives resume and exit — it answers "where was I last",
   `updatedAt` marks the last transition (not every read).
 - Stops that fire while no continue/step is waiting PARK visibly (all
-  four bridges): `status` flips to `stopped:true` with the fresh
-  `lastStop`, and `context`/`eval`/`step` work from the parked stop.
-  You never need a blind `continue` to discover a stop — but note a
-  parked stop still holds its target (a parked HTTP handler keeps its
-  connection open until you continue).
+  four bridges, within a second or two): `status` flips to `stopped:true`
+  with the fresh `lastStop`, and `context`/`eval`/`step` work from the
+  parked stop. You never need a blind `continue` to discover a stop —
+  but note a parked stop still holds its target (a parked HTTP handler
+  keeps its connection open until you continue).
 - `breaks` lists every armed stop with its plant state: `verified`,
   `pending` (class/script not loaded yet — normal for deferred code),
   `slid` (runtime moved it, `detail` names the real line),
@@ -97,11 +98,14 @@ diff. The debugger reads the live heap with zero code touch.
 --break method:com.Foo.bar          method entry, no line needed (Java only;
                                     Python: method:funcname; Node: unsupported)
 --break exc:java.lang.NullPointerException
-                                    stops at the throw site (Java class filter;
-                                    Python/Node take bare `exc` only)
+                                     stops at the throw site, uncaught only
+                                     (Java class filter; Python/Node take
+                                     bare `exc` only)
 --break 'com.Foo:54|order == null'  conditional (see Conditions below)
---logpoint 'com.Foo:54:total={total} n={items.size()}'
-                                    never stops, collects into `logs`
+--logpoint 'com.Foo:54:total={total} n={n}'
+                                     never stops, collects into `logs`
+                                     (holes are plain paths — no calls;
+                                     calls live in conditions, below)
 --watch com.Foo.count               write-watch (Java only — Python/Node fail
                                     fast): stops on every write ("who changed
                                     this?")
@@ -111,15 +115,18 @@ diff. The debugger reads the live heap with zero code touch.
 ```
 
 Flag names: plural longs (`--breakpoints --logpoints --watches --exits`)
-with singular aliases (`--break --logpoint --watch --exit`). Unknown flags
-error loudly — trust `--help`, never guess a flag.
+with singular aliases (`--break --logpoint --watch --exit`). Plurals are
+CLI-level only: the bridges themselves take singular (`--break ...`) —
+matters when reading bridge logs or invoking a bridge directly.
+Unknown flags error loudly — trust `--help`, never guess a flag.
 
 Conditions and logpoint `{holes}` run bridge-side: 100 skipped
 iterations cost zero LLM roundtrips.
-- Java: `== != > < >= <=` over paths, null/number/string/bool; `{holes}`
-  allow only read-only calls (`size length isEmpty get`) — a mutating call
-  evaluated on every loop hit would corrupt state, so the bridge rejects
-  anything else at parse time.
+- Java conditions: `== != > < >= <=` over paths, null/number/string/bool;
+  `{holes}` in logpoints are paths only, but CONDITIONS allow read-only
+  calls (`size length isEmpty get`) — a mutating call evaluated on every
+  loop hit would corrupt state, so the bridge rejects anything else at
+  parse time.
 - Python: FULL Python expressions (`order.price > 1000`) — no allowlist,
   debugpy compiles them server-side.
 - Node: FULL JS expressions — but frame-LOCALS only. A condition over a
@@ -249,12 +256,15 @@ iterations cost zero LLM roundtrips.
   `reload` with nothing armed just refreshes (`{reloaded: true}`).
 - `logs` serves page `console.*` (captured via CDP, no pipes); snippets come
   from the tab via `getScriptSource` (no disk access). Snippet/step shapes
-  match the other adapters.
+  match the other adapters. `--src` is accepted but unused for browser
+  (no URL-to-local mapping yet).
 - Tabs don't exit like processes: script end is invisible, so a bare
   continue-to-end burns its timeout (pass a short one). Dead browser / closed
   tab surface as errors on `threads` (never stale `running:true`).
 - Coordination with agent-browser on the same tab: debugger paused =>
-  no clicks; interaction running => no step. Pause state is shared.
+  no clicks (a click/eval waits for page settle that never comes while
+  paused — fire-and-forget with a short timeout, then poll our session
+  state); interaction running => no step. Pause state is shared.
 - Never `rm -rf` a session dir instead of `close` (all four bridges now
   self-reap on abandonment, but `close` is the contract).
 
