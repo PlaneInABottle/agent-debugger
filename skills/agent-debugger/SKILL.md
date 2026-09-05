@@ -79,9 +79,14 @@ agent-debugger --session cart context  # where it is parked (if stopped)
   same-line logpoint on Node/browser) rejects the whole batch atomically.
   Never add while a `continue`/`step`/`reload` is still outstanding — the
   command queues behind it, so park (or stay idle-running) first.
-- Delayed recipe: attach with a never-hit (or no) break returns a running
-  session fast instead of burning `--timeout`; `breaks add` the real lines
-  once you know them, trigger the target, then `continue` to the stop.
+- Delayed recipe: Java/Python/Node `attach --break` first waits up to
+  `--timeout` for an immediate stop. If the line is not reached, it then
+  returns a live running session with the breakpoint still armed (the
+  session and `stops.json` are preserved). For mail/queue/request triggers
+  that will happen later, pass a short timeout to avoid dead waiting, then
+  `breaks add` any newly discovered lines, trigger the target, and
+  `continue` to the stop. Browser attach is different: it arms and returns
+  immediately without this initial wait.
 - Name sessions after the task (`--session cart-npe`): the name is the
   only "why" that survives, and it costs nothing extra.
 - Never `rm -rf` a session dir instead of `close` (bridges self-reap, but
@@ -186,9 +191,12 @@ iterations cost zero LLM roundtrips.
 - `start` launches a fresh process: instant for tests and Node, 10-60s
   for Spring Boot. For big apps prefer `attach` to the running service
   (~0.1s).
-- A wrong breakpoint burns the full `--timeout` (default 20s) — the same
-  trap as a wrong browser wait target. Confirm the line exists in source
-  first; nonexistent lines fail fast, unreached lines do not.
+- A wrong or not-yet-reached breakpoint burns the full `--timeout` (default
+  20s) — the same trap as a wrong browser wait target. On Java/Python/Node
+  attach, only that wait time is lost: the session remains live and the
+  breakpoint remains armed. Confirm the line exists in source first;
+  nonexistent lines fail fast, unreached lines do not. For delayed external
+  triggers, use a short attach timeout.
 - First ever run provisions the adapter once (Java: `javac` compile ~0.5s;
   Python: venv + debugpy; Node: `ws` install) — cached after.
 - Reuse one `--session` per task, `close` it at the verification boundary.
@@ -218,6 +226,10 @@ iterations cost zero LLM roundtrips.
 - `py start app.py -- args` launches via an isolated venv (auto-created,
   debugpy auto-installed once). `py attach --port` connects to a target
   started with `python -m debugpy --listen PORT app.py`.
+- `py attach --break ...` is not instant: it waits up to `--timeout` for the
+  first hit, then returns running with the break still armed if nothing has
+  hit. For a mail/job/request you will trigger later, use a short timeout
+  (for example `--timeout 2`) instead of paying the default 20-second wait.
 - Breakpoints are `file:line`; conditions are FULL Python expressions
   (`order.price > 1000`) — no allowlist, debugpy compiles them server-side.
 - `eval` runs real Python (comprehensions OK). `method:` = function name,
