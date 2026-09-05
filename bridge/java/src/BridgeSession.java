@@ -67,13 +67,15 @@ class BridgeSession {
             if (BridgeCli.hasStoppingBreaks(cfg)) {
                 // First stop, synchronously: CLI polls session.json for readiness.
                 awaitStop(st, cfg.timeoutMs);
-            } else if (!cfg.logpoints.isEmpty()) {
-                // Nobody will ever stop: drain logpoints in the background so
-                // `logs` keeps working while the session idles in serveLoop.
-                Thread drainer = new Thread(() -> drainLoop(st));
-                drainer.setDaemon(true);
-                drainer.start();
             }
+            // Background drainer, always on: logpoints fire between commands,
+            // and stops that land while idle PARK (visible in status/context)
+            // instead of freezing the target silently. Sleeps while a
+            // continue/step owns the queue; ports get the same shape via
+            // live events (node/browser) and socket buffering (python).
+            Thread drainer = new Thread(() -> drainLoop(st));
+            drainer.setDaemon(true);
+            drainer.start();
             // else: unstopped session (pure log collection / thread dumps).
             // Commands needing a stop fail gracefully until one arrives.
             publishState(st, BridgeCli.hasStoppingBreaks(cfg));
@@ -413,7 +415,11 @@ class BridgeSession {
         }
     }
 
-    /** Background event drainer for unstopped sessions (logpoints only). */
+    /** Background event drainer: logpoints fire between commands, and stops
+     * that land while no continue/step owns the queue PARK (st.thread /
+     * st.location / suspended, published) instead of freezing the target
+     * silently. A parked stop has exactly the shape of a waiter-reported
+     * one; the next continue/step proceeds from it normally. */
 
     static void drainLoop(SessionState st) {
         while (!st.exited) {
@@ -437,11 +443,55 @@ class BridgeSession {
                 return;
             }
             if (set == null) continue;
+            boolean parked = false;
             try {
                 for (Event event : set) {
                     if (event instanceof BreakpointEvent) {
                         BreakpointEvent bp = (BreakpointEvent) event;
                         fireLogpoints(st, null, st.dir, st.cfg, bp.thread(), bp.location());
+                        if (!hasStoppingBreak(st.cfg, bp.location())) continue;
+                        String cond = BridgeEval.lookupCond(st.cfg, bp.location());
+                        if (cond != null && !BridgeEval.checkCond(bp.thread(), bp.location(), cond)) continue;
+                        parkStop(st, bp.thread(), bp.location(), null);
+                        countBreakHit(st, bp.location());
+                        parked = true;
+                    } else if (event instanceof com.sun.jdi.event.StepEvent) {
+                        // A step landing with no waiter (resume-to-waiter
+                        // micro-gap): park it visibly instead of resuming
+                        // past it. The waiter times out, but status/context
+                        // show the real stop to continue from.
+                        com.sun.jdi.event.StepEvent se = (com.sun.jdi.event.StepEvent) event;
+                        parkStop(st, se.thread(), se.location(), null);
+                        parked = true;
+                    } else if (event instanceof com.sun.jdi.event.ExceptionEvent) {
+                        com.sun.jdi.event.ExceptionEvent ee = (com.sun.jdi.event.ExceptionEvent) event;
+                        if (!matchesExcFilter(st.cfg, ee)) continue;
+                        fireLogpoints(st, null, st.dir, st.cfg, ee.thread(), ee.location());
+                        String cond = BridgeEval.lookupCond(st.cfg, ee.location());
+                        if (cond != null && !BridgeEval.checkCond(ee.thread(), ee.location(), cond)) continue;
+                        parkStop(st, ee.thread(), ee.location(), BridgeEval.exceptionInfo(ee));
+                        countExcHits(st, ee);
+                        parked = true;
+                    } else if (event instanceof com.sun.jdi.event.ModificationWatchpointEvent) {
+                        com.sun.jdi.event.ModificationWatchpointEvent we =
+                                (com.sun.jdi.event.ModificationWatchpointEvent) event;
+                        parkStop(st, we.thread(), we.location(),
+                                BridgeEval.watchInfo(we.field(), "write", we.valueToBe()));
+                        try { bump(st, "watch|" + we.field().declaringType().name() + "." + we.field().name()); } catch (Exception ignored) {}
+                        parked = true;
+                    } else if (event instanceof com.sun.jdi.event.AccessWatchpointEvent) {
+                        com.sun.jdi.event.AccessWatchpointEvent we =
+                                (com.sun.jdi.event.AccessWatchpointEvent) event;
+                        parkStop(st, we.thread(), we.location(),
+                                BridgeEval.watchInfo(we.field(), "read", we.valueCurrent()));
+                        try { bump(st, "watch|" + we.field().declaringType().name() + "." + we.field().name()); } catch (Exception ignored) {}
+                        parked = true;
+                    } else if (event instanceof com.sun.jdi.event.MethodExitEvent) {
+                        com.sun.jdi.event.MethodExitEvent me = (com.sun.jdi.event.MethodExitEvent) event;
+                        if (!BridgeEval.wantedExit(st.cfg, me)) continue;
+                        parkStop(st, me.thread(), me.location(), BridgeEval.exitInfo(me));
+                        try { bump(st, "exit|" + me.method().declaringType().name() + "." + me.method().name()); } catch (Exception ignored) {}
+                        parked = true;
                     } else if (event instanceof ClassPrepareEvent) {
                         ClassPrepareEvent cp = (ClassPrepareEvent) event;
                         try { cp.request().disable(); } catch (Exception ignored) {}
@@ -456,9 +506,27 @@ class BridgeSession {
                     }
                 }
             } finally {
-                try { set.resume(); } catch (Exception ignored) {}
+                // A parked set stays unresumed: the VM freezes AT the stop
+                // until a continue/step resumes it — same shape as a
+                // waiter-reported stop, which also returns without resume.
+                if (!parked) {
+                    try { set.resume(); } catch (Exception ignored) {}
+                }
             }
+            if (parked) publishState(st, true);
         }
+    }
+
+    /** Record an idle stop so status/context see it (no waiter to report to).
+     * Field order matters: suspended flips last, so a concurrent command
+     * either fails requireStopped (old state) or sees the stop whole —
+     * never a half-parked thread/location pair. */
+    static void parkStop(SessionState st, ThreadReference thread, Location location, String stopInfo) {
+        st.thread = thread;
+        st.location = location;
+        st.stopInfo = stopInfo;
+        trackChanges(st);
+        st.suspended = true;
     }
 
     static boolean amOwner(SessionState st) {
