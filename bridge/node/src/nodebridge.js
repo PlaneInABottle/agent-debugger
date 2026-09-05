@@ -1,0 +1,1220 @@
+/* Node CDP bridge for agent-debugger (N1: CDP core).
+ *
+ * Mirrors pybridge session mode: a per-session daemon speaking OUR session
+ * protocol (Content-Length JSON over TCP on 127.0.0.1) to the Rust CLI, and
+ * raw CDP over WebSocket (via the provisioned `ws` package) to a
+ * `node --inspect` debug target.
+ *
+ *     nodebridge.js session --kind launch --dir DIR --program app.js [--node BIN]
+ *         [--src D]... [--break SPEC]... [--logpoint SPEC]... [--timeout S]
+ *         [-- args...]
+ *     nodebridge.js session --kind attach --dir DIR --host H --port P
+ *         [--src D]... [--break SPEC]... [--timeout S]
+ *
+ * Break forms: path:line[|cond] | exc (any uncaught). method:NAME,
+ * --watch and --exit have no CDP equivalent for Node and fail fast at parse
+ * time. CDP natively supports breakpoint conditions; logpoints are
+ * client-side (pause, evaluate template holes, append to logs.jsonl, resume).
+ *
+ * Known V8 boundary (measured, not worked around — every CDP client shares
+ * it): conditions may only reference variables LOCAL to the stopped frame.
+ * Closure-captured variables in a condition misbehave (spurious stops with
+ * an unresolvable scope, or silent misses). Prefer frame-locals in `|cond`;
+ * use a plain line break + eval for anything captured.
+ *
+ * worker_threads: the MAIN thread only. Worker code runs on separate
+ * inspector targets (CDP Target domain) which this bridge does not follow —
+ * same boundary as subprocesses in the other adapters. Breakpoints on
+ * worker-only lines never hit (plain timeout, not an error).
+ *
+ * Two spike-proven rules shape the handshake: breakpoints go in BEFORE
+ * Runtime.runIfWaitingForDebugger (else they sit pending), and scriptId->url
+ * is tracked from scriptParsed (paused frames carry no url).
+ *
+ * Snapshot shapes intentionally match the Java/Python bridges
+ * (location/threads/frames/locals/changed/stopInfo) so agents see one
+ * uniform surface.
+ */
+
+'use strict';
+const { spawn, spawnSync } = require('child_process');
+const fs = require('fs');
+const http = require('http');
+const net = require('net');
+const os = require('os');
+const path = require('path');
+const { pathToFileURL } = require('url');
+
+class Usage extends Error {}
+class BridgeErr extends Error {}
+class CloseSession extends Error {}
+
+const MAX_STRING = 200;
+const MAX_FIELDS = 20;
+const MAX_VARS = 20;
+const MAX_FRAMES = 10;
+const MAX_LOG_LINES = 2000;
+const MAX_OUTPUT = 4000;
+// Inspector chatter on stderr (never user data, just noise in logs).
+const NOISE_LINES = new Set([
+  'Debugger attached.',
+  'Waiting for the debugger to disconnect...',
+  'For help, see: https://nodejs.org/learn/getting-started/debugging',
+]);
+
+// ---------------------------------------------------------------- framing
+
+function readFrame(conn) {
+  return new Promise((resolve, reject) => {
+    let buf = Buffer.alloc(0);
+    const onData = (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      const sep = buf.indexOf('\r\n\r\n');
+      if (sep < 0) return;
+      let length = -1;
+      for (const line of buf.subarray(0, sep).toString('ascii').split('\r\n')) {
+        const i = line.indexOf(':');
+        if (i > 0 && line.slice(0, i).trim().toLowerCase() === 'content-length') {
+          length = parseInt(line.slice(i + 1).trim(), 10);
+        }
+      }
+      if (Number.isNaN(length) || length < 0) {
+        cleanup();
+        reject(new BridgeErr('bad frame: no Content-Length'));
+        return;
+      }
+      if (buf.length < sep + 4 + length) return;
+      const body = buf.subarray(sep + 4, sep + 4 + length);
+      cleanup();
+      try {
+        resolve(JSON.parse(body.toString('utf-8')));
+      } catch (e) {
+        reject(new BridgeErr('bad frame: ' + e.message));
+      }
+    };
+    const onClose = () => {
+      cleanup();
+      reject(new BridgeErr('truncated frame'));
+    };
+    const cleanup = () => {
+      conn.removeListener('data', onData);
+      conn.removeListener('close', onClose);
+    };
+    conn.on('data', onData);
+    conn.on('close', onClose);
+  });
+}
+
+function writeFrame(conn, obj) {
+  return new Promise((resolve, reject) => {
+    const body = Buffer.from(JSON.stringify(obj), 'utf-8');
+    conn.write(
+      Buffer.concat([Buffer.from(`Content-Length: ${body.length}\r\n\r\n`), body]),
+      (err) => (err ? reject(err) : resolve()),
+    );
+  });
+}
+
+// ---------------------------------------------------------------- args
+
+function needInt(flag, raw) {
+  const n = parseInt(raw, 10);
+  if (Number.isNaN(n)) throw new Usage(`${flag} needs a number (got '${raw}')`);
+  return n;
+}
+
+function parseBreak(spec, cfg) {
+  let cond = null;
+  let head = spec;
+  const bar = spec.indexOf('|');
+  if (bar >= 0) {
+    head = spec.slice(0, bar);
+    cond = spec.slice(bar + 1).trim();
+    if (!cond) throw new Usage("empty condition after '|'");
+  }
+  if (head === 'exc' || head.startsWith('exc:')) {
+    if (head !== 'exc') {
+      throw new Usage(`Node adapter stops on any uncaught exception; ` +
+        `class filter unsupported: ${spec} (use bare 'exc')`);
+    }
+    cfg.wantExc = true;
+    return;
+  }
+  if (head.startsWith('method:')) {
+    throw new Usage(`method: breakpoints unsupported on Node yet: ${spec} (use path:line)`);
+  }
+  const colon = head.lastIndexOf(':');
+  if (colon <= 0) throw new Usage('--break must look like path:line, exc');
+  const lineno = parseInt(head.slice(colon + 1), 10);
+  if (Number.isNaN(lineno)) throw new Usage(`bad line in --break: ${spec}`);
+  cfg.breaks.push({ path: path.resolve(head.slice(0, colon)), line: lineno, cond });
+}
+
+function parseLogpoint(spec, cfg) {
+  const first = spec.indexOf(':');
+  const second = first >= 0 ? spec.indexOf(':', first + 1) : -1;
+  if (first <= 0 || second <= 0) throw new Usage('--logpoint must look like path:line:template');
+  const lineno = parseInt(spec.slice(first + 1, second), 10);
+  if (Number.isNaN(lineno)) throw new Usage(`bad line in --logpoint: ${spec}`);
+  cfg.logpoints.push({
+    path: path.resolve(spec.slice(0, first)),
+    line: lineno,
+    template: spec.slice(second + 1),
+  });
+}
+
+function parseArgs(argv) {
+  // argv === process.argv.slice(2); argv[0] === "session"
+  const cfg = {
+    kind: 'launch', dir: null, program: null, nodeBin: 'node',
+    host: 'localhost', port: 9229, srcs: [], breaks: [], logpoints: [],
+    wantExc: false, timeout: 20, programArgs: [],
+  };
+  const rest = argv;
+  let i = 0;
+  const need = (flag) => {
+    if (i >= rest.length) throw new Usage(`missing value for ${flag}`);
+    return rest[i++];
+  };
+  if (rest[0] !== 'session') throw new Usage('first arg must be "session"');
+  i = 1;
+  while (i < rest.length) {
+    const a = rest[i++];
+    if (a === '--') { cfg.programArgs = rest.slice(i); break; }
+    else if (a === '--kind') cfg.kind = need(a);
+    else if (a === '--dir') cfg.dir = need(a);
+    else if (a === '--program') cfg.program = path.resolve(need(a));
+    else if (a === '--node') cfg.nodeBin = need(a);
+    else if (a === '--host') cfg.host = need(a);
+    else if (a === '--port') cfg.port = needInt(a, need(a));
+    else if (a === '--src') cfg.srcs.push(path.resolve(need(a)));
+    else if (a === '--break') parseBreak(need(a), cfg);
+    else if (a === '--logpoint') parseLogpoint(need(a), cfg);
+    else if (a === '--watch') throw new Usage(`--watch has no CDP equivalent yet (Node): ${rest[i] || ''}`);
+    else if (a === '--exit') throw new Usage(`--exit has no CDP equivalent yet (Node): ${rest[i] || ''}`);
+    else if (a === '--timeout') cfg.timeout = needInt(a, need(a));
+    else throw new Usage(`unknown arg: ${a}`);
+  }
+  if (!cfg.dir) throw new Usage('missing --dir');
+  if (cfg.kind !== 'launch' && cfg.kind !== 'attach') {
+    throw new Usage(`--kind must be launch|attach (got ${cfg.kind})`);
+  }
+  if (cfg.kind === 'launch' && !cfg.program) throw new Usage('launch needs --program');
+  if (cfg.kind === 'launch') {
+    // Fail fast with node's OWN message. Load/parse failures die silently
+    // under an attached inspector (measured: no error text, no exit — just
+    // a destroyed context), so surface them before spawning anything.
+    if (!fs.existsSync(cfg.program) || !fs.statSync(cfg.program).isFile()) {
+      throw new Usage(`no such file: ${cfg.program}`);
+    }
+    // node --check does not apply type-stripping, so it false-positives on
+    // valid TypeScript — skip pre-validation there (runtime failures still
+    // surface via logs/exit, just without the precise syntax message).
+    if (!/\.[mc]?ts$/.test(cfg.program)) {
+      let check;
+      try {
+        check = spawnSync(cfg.nodeBin, ['--check', cfg.program], { encoding: 'utf-8' });
+      } catch (e) {
+        throw new BridgeErr(`cannot run ${cfg.nodeBin} --check: ${(e && e.message) || e}`);
+      }
+      if (check.status !== 0) {
+        throw new Usage(`cannot debug (syntax error?):\n${(check.stderr || '').trim()}`);
+      }
+    }
+  }
+  return cfg;
+}
+
+// ---------------------------------------------------------------- values
+
+function truncStr(s, limit = MAX_STRING) {
+  if (s.length <= limit) return s;
+  return `${s.slice(0, limit)}… (+${s.length - limit} more chars)`;
+}
+
+// ---------------------------------------------------------------- CDP conn
+
+function loadWs() {
+  try {
+    return require('ws');
+  } catch (e) {
+    throw new BridgeErr(`missing 'ws' package (${e.message}) — reinstall via: npm install ws`);
+  }
+}
+
+/** Minimal CDP client: id-matched requests plus an event handler. */
+class CdpConn {
+  constructor(ws) {
+    this.ws = ws;
+    this.seq = 0;
+    this.pending = new Map();
+    this.onEvent = null;
+    this.closed = false;
+    ws.on('message', (data) => {
+      let msg;
+      try {
+        msg = JSON.parse(data.toString());
+      } catch (_) {
+        return;
+      }
+      if (msg.id !== undefined && this.pending.has(msg.id)) {
+        const { resolve } = this.pending.get(msg.id);
+        this.pending.delete(msg.id);
+        resolve(msg);
+      } else if (msg.method && this.onEvent) {
+        this.onEvent(msg);
+      }
+    });
+    ws.on('close', () => {
+      this.closed = true;
+      for (const { reject } of this.pending.values()) {
+        reject(new BridgeErr('CDP connection closed'));
+      }
+      this.pending.clear();
+    });
+    ws.on('error', () => { /* close follows */ });
+  }
+
+  request(method, params = {}, timeoutMs = 30000) {
+    if (this.closed) return Promise.reject(new BridgeErr('CDP connection closed'));
+    const id = ++this.seq;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new BridgeErr(`CDP ${method} timed out after ${Math.round(timeoutMs / 1000)}s`));
+      }, timeoutMs);
+      this.pending.set(id, {
+        resolve: (msg) => {
+          clearTimeout(timer);
+          if (msg.error) {
+            reject(new BridgeErr(`CDP ${method} failed: ${msg.error.message || JSON.stringify(msg.error)}`));
+          } else {
+            resolve(msg.result || {});
+          }
+        },
+        reject: (e) => {
+          clearTimeout(timer);
+          reject(e);
+        },
+      });
+      this.ws.send(JSON.stringify({ id, method, params }), (err) => {
+        if (err) {
+          this.pending.delete(id);
+          clearTimeout(timer);
+          reject(new BridgeErr(`CDP ${method} send failed: ${err.message}`));
+        }
+      });
+    });
+  }
+
+  close() {
+    try {
+      this.ws.close();
+    } catch (_) { /* best effort */ }
+  }
+}
+
+// ---------------------------------------------------------------- session
+
+function writeFile(p, content) {
+  try {
+    fs.writeFileSync(p, content);
+  } catch (_) { /* best effort */ }
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+class Session {
+  constructor(cfg) {
+    this.cfg = cfg;
+    this.child = null;      // launched target process (null on attach)
+    this.cdp = null;
+    this.defaultContextId = null;
+    this.scripts = new Map(); // scriptId -> url
+    this.urls = new Map();    // url -> scriptId
+    this.logpointIds = new Map(); // breakpointId -> template
+    this.paused = null;     // {frames, stopInfo} of the current stop
+    this.awaitingStep = false;
+    this.exited = false;
+    this.closing = false;
+    this.lastTop = null;
+    this.lastFunc = null;
+    this.lastChanged = '[]';
+    this.stopInfo = null;
+    this.outputTail = '';
+    this.logCount = 0;
+  }
+
+  // -- target lifecycle
+
+  async startTarget() {
+    const stderrBuf = [];
+    let wsUrl = null;
+    this.child = spawn(this.cfg.nodeBin,
+      [`--inspect-brk=127.0.0.1:0`, this.cfg.program, ...this.cfg.programArgs],
+      { stdio: ['ignore', 'pipe', 'pipe'] });
+    this.child.stdout.on('data', (d) => this.onTargetOutput(d.toString()));
+    this.child.stderr.on('data', (d) => {
+      // Before the inspector URL appears, stderr is startup noise (parsed
+      // for the ws:// URL). After that it is program output (console.error
+      // etc.) and belongs in the logs like stdout.
+      if (wsUrl) {
+        this.onTargetOutput(d.toString());
+        return;
+      }
+      stderrBuf.push(d.toString());
+      if (stderrBuf.join('').length > 8000) stderrBuf.splice(0, 1);
+    });
+    const dead = new Promise((resolve) => this.child.once('exit', (code) => resolve(code)));
+    const deadline = Date.now() + 20000;
+    for (;;) {
+      const text = stderrBuf.join('');
+      const m = text.match(/Debugger listening on (ws:\/\/\S+)/);
+      if (m) {
+        wsUrl = m[1];
+        // Same-chunk remainder (e.g. an instant "Cannot find module") is
+        // program output too — flush it instead of dropping it with the buf.
+        this.onTargetOutput(text.slice(m.index + m[0].length));
+        return wsUrl;
+      }
+      const code = await Promise.race([dead, sleep(100).then(() => null)]);
+      if (code !== null && code !== undefined) {
+        throw new BridgeErr(`target exited during startup (code ${code}): ${text.trim().slice(-500)}`);
+      }
+      if (Date.now() > deadline) {
+        try {
+          this.child.kill('SIGKILL');
+        } catch (_) { /* best effort */ }
+        throw new BridgeErr(`target did not expose an inspector in 20s: ${text.trim().slice(-300)}`);
+      }
+    }
+  }
+
+  async discoverAttach() {
+    const url = `http://${this.cfg.host}:${this.cfg.port}/json/list`;
+    const body = await new Promise((resolve, reject) => {
+      const req = http.get(url, { timeout: 10000 }, (res) => {
+        let raw = '';
+        res.on('data', (d) => { raw += d; });
+        res.on('end', () => resolve(raw));
+      });
+      req.on('timeout', () => {
+        req.destroy();
+        reject(new Error('timed out'));
+      });
+      req.on('error', reject);
+    }).catch((e) => {
+      const detail = e.message || e.code || 'connection refused';
+      throw new BridgeErr(`attach failed (${this.cfg.host}:${this.cfg.port}): ${detail} — ` +
+        `is the target started with node --inspect=${this.cfg.port} ?`);
+    });
+    let targets;
+    try {
+      targets = JSON.parse(body);
+    } catch (_) {
+      throw new BridgeErr(`attach failed: ${url} did not return target list`);
+    }
+    const node = (targets || []).find((t) => t.type === 'node' && t.webSocketDebuggerUrl)
+      || (targets || []).find((t) => t.webSocketDebuggerUrl);
+    if (!node) throw new BridgeErr(`attach failed: no debuggable target at ${url}`);
+    return node.webSocketDebuggerUrl;
+  }
+
+  async connect(wsUrl) {
+    const WebSocket = loadWs();
+    const ws = new WebSocket(wsUrl, { maxPayload: 256 * 1024 * 1024 });
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('connect timeout')), 20000);
+      ws.once('open', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      ws.once('error', (e) => {
+        clearTimeout(timer);
+        reject(e);
+      });
+    }).catch((e) => {
+      throw new BridgeErr(`CDP connect failed (${wsUrl}): ${e.message}`);
+    });
+    this.cdp = new CdpConn(ws);
+    this.cdp.onEvent = (msg) => {
+      this.handleEvent(msg).catch((e) => {
+        process.stderr.write(`warn: event handler: ${(e && e.message) || e}\n`);
+      });
+    };
+  }
+
+  async handshake() {
+    let wsUrl;
+    if (this.cfg.kind === 'launch') {
+      wsUrl = await this.startTarget();
+    } else {
+      wsUrl = await this.discoverAttach();
+    }
+    await this.connect(wsUrl);
+    await this.cdp.request('Debugger.enable');
+    // Runtime.enable is not for evaluation — it arms the
+    // executionContextDestroyed event, the ONLY signal that a launched
+    // script ended (an attached inspector keeps the process alive after).
+    await this.cdp.request('Runtime.enable');
+    // Breakpoints BEFORE runIfWaitingForDebugger (spike-proven: later
+    // installs sit pending and the entry pause swallows the first stop).
+    await this.armBreakpoints();
+    if (this.cfg.wantExc) {
+      await this.cdp.request('Debugger.setPauseOnExceptions', { state: 'uncaught' });
+    }
+    if (this.cfg.kind === 'launch') {
+      await this.cdp.request('Runtime.runIfWaitingForDebugger');
+    }
+  }
+
+  async armBreakpoints() {
+    // Group per file: CDP setBreakpointByUrl is one line per call, but a
+    // logpoint and a line break on the same line would collide — keep the
+    // real break (logpoint still fires? no: one breakpoint per line wins).
+    // Keep it simple and explicit: real breaks win, logpoint on the same
+    // line is reported and skipped.
+    const byLine = new Map(); // `${path}:${line}` -> {break, logpoint}
+    for (const b of this.cfg.breaks) {
+      byLine.set(`${b.path}:${b.line}`, { ...(byLine.get(`${b.path}:${b.line}`) || {}), brk: b });
+    }
+    for (const l of this.cfg.logpoints) {
+      const key = `${l.path}:${l.line}`;
+      if (byLine.has(key) && byLine.get(key).brk) {
+        process.stderr.write(`warn: logpoint shadowed by breakpoint: ${l.path}:${l.line}\n`);
+        continue;
+      }
+      byLine.set(key, { ...(byLine.get(key) || {}), log: l });
+    }
+    for (const [, item] of byLine) {
+      const spec = item.brk || item.log;
+      const fileUrl = pathToFileURL(spec.path).href;
+      const params = {
+        urlRegex: `^${escapeRegex(fileUrl)}$`,
+        lineNumber: spec.line - 1,
+      };
+      if (item.brk && item.brk.cond) params.condition = item.brk.cond;
+      const res = await this.cdp.request('Debugger.setBreakpointByUrl', params);
+      const bpId = res.breakpointId;
+      if (!bpId) {
+        process.stderr.write(`warn: breakpoint rejected: ${spec.path}:${spec.line}\n`);
+        continue;
+      }
+      if (item.log && !item.brk) {
+        this.logpointIds.set(bpId, item.log.template);
+      }
+      if ((res.locations || []).length === 0 && this.urls.has(fileUrl)) {
+        process.stderr.write(`warn: breakpoint unverified (pending): ${spec.path}:${spec.line}\n`);
+      }
+      for (const loc of res.locations || []) {
+        // V8 slides breakpoints off non-executable lines (e.g. `}`) to the
+        // next statement — possibly another scope where conditions/holes
+        // stop resolving. Say so loudly instead of silently debugging the
+        // wrong line.
+        if (loc.lineNumber + 1 !== spec.line) {
+          process.stderr.write(
+            `warn: breakpoint slid: ${spec.path}:${spec.line} -> ${loc.lineNumber + 1}\n`);
+          break;
+        }
+      }
+    }
+  }
+
+  // -- events (always live: logpoints auto-fire even between commands)
+
+  async handleEvent(msg) {
+    if (msg.method === 'Debugger.scriptParsed') {
+      const { scriptId, url } = msg.params || {};
+      if (scriptId) {
+        this.scripts.set(scriptId, url || '');
+        if (url) this.urls.set(url, scriptId);
+      }
+      return;
+    }
+    if (msg.method === 'Runtime.executionContextCreated') {
+      const ctx = (msg.params && msg.params.context) || {};
+      if (ctx.auxData && ctx.auxData.isDefault) this.defaultContextId = ctx.id;
+      return;
+    }
+    if (msg.method === 'Runtime.executionContextDestroyed') {
+      // Main script ended (process lingers while the inspector is
+      // attached). Surface as exited so stops/threads behave like pybridge.
+      if ((msg.params || {}).executionContextId === this.defaultContextId) {
+        this.exited = true;
+        this.paused = null;
+      }
+      return;
+    }
+    if (msg.method === 'Debugger.paused') {
+      await this.onPaused(msg.params || {});
+      return;
+    }
+    if (msg.method === 'Debugger.resumed') {
+      return;
+    }
+  }
+
+  async onPaused(p) {
+    if (this.closing || this.exited || this.paused) {
+      // Single target: a second pause cannot arrive while one is held (the
+      // target is frozen). If it ever does, hold the first stop; the next
+      // resume flushes the rest.
+      return;
+    }
+    const hits = p.hitBreakpoints || [];
+    const frames = this.userFrames(p.callFrames || []);
+    const logHits = hits.filter((id) => this.logpointIds.has(id));
+    const realHits = hits.filter((id) => !this.logpointIds.has(id));
+    for (const id of logHits) {
+      await this.fireLogpoint(id, frames);
+    }
+    if (p.reason === 'exception') {
+      this.stopInfo = this.excInfo(p.data);
+      await this.trackChanges(frames);
+      this.paused = { frames, stopInfo: this.stopInfo };
+      return;
+    }
+    if (realHits.length > 0 || this.awaitingStep) {
+      this.awaitingStep = false;
+      this.stopInfo = null;
+      await this.trackChanges(frames);
+      this.paused = { frames, stopInfo: null };
+      return;
+    }
+    if (logHits.length > 0) {
+      await this.cdp.request('Debugger.resume').catch(() => {});
+      return;
+    }
+    // Entry pause (--inspect-brk) or stray instrumentation pause: resume.
+    await this.cdp.request('Debugger.resume').catch(() => {});
+  }
+
+  /** Drop node:internal frames (justMyCode spirit). Falls back to the full
+   *  stack when filtering would leave nothing (e.g. stepped into loader). */
+  userFrames(frames) {
+    const kept = frames.filter((f) => {
+      const url = f.url || this.scripts.get(f.location && f.location.scriptId) || '';
+      return !url.startsWith('node:');
+    });
+    return kept.length > 0 ? kept : frames;
+  }
+
+  excInfo(data) {
+    let cls = '?';
+    if (data) {
+      if (data.className) {
+        cls = data.className;
+      } else if (typeof data.description === 'string' && data.description) {
+        cls = data.description.split(':')[0].trim() || '?';
+      }
+    }
+    return JSON.stringify({ exception: { class: String(cls) } });
+  }
+
+  async fireLogpoint(bpId, frames) {
+    const template = this.logpointIds.get(bpId);
+    if (!template) return;
+    await this.evalTemplate(template, frames);
+  }
+
+  async evalTemplate(template, frames) {
+    const frameId = frames.length > 0 ? frames[0].callFrameId : null;
+    let out = template;
+    const holes = [...template.matchAll(/\{([^{}]+)\}/g)];
+    for (const m of holes) {
+      let val = '?';
+      if (frameId) {
+        try {
+          const res = await this.cdp.request('Debugger.evaluateOnCallFrame', {
+            callFrameId: frameId, expression: m[1], returnByValue: true,
+          });
+          if (res.result && res.result.type !== 'undefined') {
+            val = res.result.value !== undefined ? String(res.result.value)
+              : (res.result.description || '?');
+          } else if (res.exceptionDetails) {
+            val = `!${(res.exceptionDetails.text || 'error')}`;
+          }
+        } catch (_) {
+          val = '?';
+        }
+      }
+      out = out.split(m[0]).join(val);
+    }
+    this.appendLog(out);
+  }
+
+  async trackChanges(frames) {
+    const locals = await this.frameLocalsIn(frames, 0);
+    this.cachedLocals = locals;
+    const cur = {};
+    for (const l of locals) {
+      if (l.name === '…') continue;
+      cur[l.name] = l.value;
+    }
+    const func = frames.length > 0 ? (frames[0].functionName || '(anonymous)') : '?';
+    let changed;
+    if (this.lastTop === null || this.lastFunc !== func) {
+      changed = Object.keys(cur).sort();
+    } else {
+      changed = Object.keys(cur).filter((n) => this.lastTop[n] !== cur[n]).sort();
+    }
+    this.lastTop = cur;
+    this.lastFunc = func;
+    this.lastChanged = JSON.stringify(changed);
+  }
+
+  onTargetOutput(text) {
+    if (!text) return;
+    this.outputTail = (this.outputTail + text).slice(-MAX_OUTPUT * 2);
+    for (const line of text.split('\n')) {
+      const t = line.replace(/\r$/, '');
+      if (t.trim() && !NOISE_LINES.has(t.trim())) this.appendLog(t);
+    }
+  }
+
+  appendLog(line) {
+    if (line === null || line === undefined) return;
+    if (this.logCount >= MAX_LOG_LINES) return;
+    // One physical line per entry: multi-line values (e.g. Error stacks
+    // from a logpoint hole) would otherwise shatter logs.jsonl structure.
+    const flat = String(line).replace(/\r?\n/g, '⏎');
+    try {
+      fs.appendFileSync(path.join(this.cfg.dir, 'logs.jsonl'), flat + '\n');
+      this.logCount += 1;
+    } catch (_) { /* best effort */ }
+  }
+
+  // -- pump: wait for the next stop (events arrive on their own)
+
+  async pump(timeout) {
+    const deadline = Date.now() + timeout * 1000;
+    for (;;) {
+      if (this.paused) return 'stopped';
+      if (this.exited) throw new BridgeErr('target exited');
+      if (Date.now() > deadline) {
+        throw new BridgeErr(`timeout: no stop within ${fmtTimeout(timeout)}`);
+      }
+      await sleep(50);
+    }
+  }
+
+  markExited() {
+    this.exited = true;
+  }
+
+  // -- snapshot builders (Java/Python shapes)
+
+  relFile(abspath) {
+    if (!abspath || abspath === '?') return '?';
+    for (const src of this.cfg.srcs) {
+      const rel = path.relative(src, abspath);
+      if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) return rel;
+    }
+    const rel = path.relative(process.cwd(), abspath);
+    if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) return rel;
+    return abspath;
+  }
+
+  snippet(abspath, line) {
+    if (!line || line < 1) return [];
+    let lines;
+    try {
+      if (!fs.statSync(abspath).isFile()) return [];
+      lines = fs.readFileSync(abspath, 'utf-8').split('\n');
+    } catch (_) {
+      return [];
+    }
+    const out = [];
+    for (let n = Math.max(1, line - 5); n <= Math.min(lines.length, line + 5); n++) {
+      out.push({ line: n, current: n === line, text: lines[n - 1] });
+    }
+    return out;
+  }
+
+  frameUrl(frame) {
+    if (frame.url) return frame.url;
+    return this.scripts.get(frame.location && frame.location.scriptId) || '';
+  }
+
+  fileOf(frame) {
+    const url = this.frameUrl(frame);
+    if (!url) return '?';
+    try {
+      if (url.startsWith('file://')) return path.normalize(decodeURI(new URL(url).pathname));
+    } catch (_) { /* fall through */ }
+    return url;
+  }
+
+  locationJson() {
+    const frames = (this.paused && this.paused.frames) || [];
+    if (frames.length === 0) {
+      return { class: '?', method: '?', line: -1, file: '?', snippet: [] };
+    }
+    const f = frames[0];
+    const file = this.fileOf(f);
+    const line = (f.location && f.location.lineNumber + 1) || -1;
+    const base = file === '?' ? '?' : path.basename(file, path.extname(file));
+    return {
+      class: base,
+      method: f.functionName || '(anonymous)',
+      line,
+      file: this.relFile(file),
+      snippet: file === '?' ? [] : this.snippet(file, line),
+    };
+  }
+
+  threadsJson() {
+    return [{ id: 1, name: 'main', current: true }];
+  }
+
+  framesJson(withLocals) {
+    const frames = ((this.paused && this.paused.frames) || []).slice(0, MAX_FRAMES);
+    return frames.map((f, i) => {
+      const entry = {
+        index: i,
+        type: '?',
+        method: f.functionName || '(anonymous)',
+        line: (f.location && f.location.lineNumber + 1) || -1,
+      };
+      if (withLocals && i === 0) entry.locals = this.cachedLocals || [];
+      return entry;
+    });
+  }
+
+  async frameLocals(index = 0) {
+    const frames = (this.paused && this.paused.frames) || [];
+    return this.frameLocalsIn(frames, index);
+  }
+
+  async frameLocalsIn(frames, index = 0) {
+    if (index < 0 || index >= frames.length) {
+      throw new BridgeErr(`no frame ${index} (have ${frames.length})`);
+    }
+    const chain = frames[index].scopeChain || [];
+    // Innermost first: V8 splits let/const into 'block' scopes (e.g. a
+    // for-loop body) apart from the function 'local' scope, and outer
+    // variables live in 'closure' scopes. Merge all four kinds in chain
+    // order, innermost name wins (an arrow stopped at its first line would
+    // otherwise show a lying empty locals list).
+    const seen = new Set();
+    let props = [];
+    for (const s of chain) {
+      if (s.type !== 'local' && s.type !== 'block' && s.type !== 'closure' && s.type !== 'module') continue;
+      for (const pr of await this.scopeProps(s)) {
+        if (!seen.has(pr.name)) {
+          seen.add(pr.name);
+          props.push(pr);
+        }
+      }
+      if (s.type === 'local' && props.length > 0) break;
+    }
+    const out = [];
+    for (const pr of props.slice(0, MAX_VARS)) {
+      // Accessor properties have no value until invoked (invoking runs user
+      // code — never do that for a read-only listing); mark them honestly.
+      const val = pr.value !== undefined ? this.fmtRemote(pr.value)
+        : (pr.get !== undefined ? '(getter — eval to read)' : '?');
+      out.push({
+        name: pr.name,
+        type: pr.value ? (pr.value.subtype || pr.value.type || '?') : '?',
+        value: val,
+      });
+    }
+    if (props.length > MAX_VARS) {
+      out.push({ name: '…', note: `+${props.length - MAX_VARS} more` });
+    }
+    return out;
+  }
+
+  async scopeProps(scope) {
+    const obj = scope.object;
+    if (!obj || !obj.objectId) return [];
+    const res = await this.cdp.request('Runtime.getProperties', {
+      objectId: obj.objectId, ownProperties: true,
+    });
+    return (res.result || []).filter((p) => p.enumerable !== false || p.value !== undefined);
+  }
+
+  fmtRemote(v) {
+    if (!v) return '?';
+    if (v.type === 'string') return truncStr(v.value);
+    if (v.value !== undefined && (v.type === 'number' || v.type === 'boolean' || v.type === 'bigint')) {
+      return truncStr(String(v.value));
+    }
+    if (v.type === 'undefined') return 'undefined';
+    if (v.subtype === 'null' || v.type === 'object' && v.subtype === 'null') return 'null';
+    if (v.type === 'function') return truncStr(v.description || 'function');
+    if (v.type === 'object' || v.type === 'symbol') {
+      return truncStr(v.description || v.type);
+    }
+    return truncStr(v.description || String(v.value));
+  }
+
+  async fmtRemoteDeep(v) {
+    // One-level expansion for objects (mirrors pybridge opaque-repr rule).
+    if (!v || v.type !== 'object' || !v.objectId) return this.fmtRemote(v);
+    if (v.subtype === 'null') return 'null';
+    let res;
+    try {
+      res = await this.cdp.request('Runtime.getProperties', {
+        objectId: v.objectId, ownProperties: true,
+      });
+    } catch (_) {
+      return this.fmtRemote(v);
+    }
+    const kids = (res.result || []).filter((p) => p.value !== undefined).slice(0, MAX_FIELDS);
+    if (kids.length === 0) return this.fmtRemote(v);
+    const inner = kids.map((p) => `${p.name}=${this.fmtRemote(p.value)}`).join(', ');
+    const extra = (res.result || []).length - kids.length;
+    const desc = v.description && v.description !== 'Object' ? v.description : null;
+    const head = desc || 'Object';
+    return extra > 0 ? `${head}{${inner}, … (+${extra} more fields)}` : `${head}{${inner}}`;
+  }
+
+  snapshot() {
+    return {
+      mode: 'session',
+      location: this.locationJson(),
+      threads: this.threadsJson(),
+      frames: this.framesJson(true),
+      output: this.outputTail.slice(-MAX_OUTPUT),
+    };
+  }
+
+  // -- commands
+
+  requireStopped() {
+    if (this.exited) throw new BridgeErr('target VM has exited — close this session');
+    if (!this.paused) throw new BridgeErr('no stopped thread (target is running — continue first)');
+    if (((this.paused && this.paused.frames) || []).length === 0) {
+      throw new BridgeErr('no stopped thread yet in this session');
+    }
+  }
+
+  requireLive() {
+    if (this.exited) throw new BridgeErr('target VM has exited — close this session');
+  }
+
+  cmdContext() {
+    this.requireStopped();
+    return {
+      ok: true,
+      stopInfo: JSON.parse(this.stopInfo || 'null'),
+      location: this.locationJson(),
+      threads: this.threadsJson(),
+      frames: this.framesJson(true),
+    };
+  }
+
+  cmdStack() {
+    this.requireStopped();
+    return { ok: true, frames: this.framesJson(false) };
+  }
+
+  async cmdVars(req) {
+    this.requireStopped();
+    const frame = parseInt(req.frame || 0, 10) || 0;
+    return { ok: true, frame, locals: await this.frameLocals(frame) };
+  }
+
+  async cmdEval(req) {
+    this.requireStopped();
+    const expr = req.expr;
+    if (expr === undefined || expr === null) throw new BridgeErr('eval needs an expr');
+    const frame = parseInt(req.frame || 0, 10) || 0;
+    const frames = (this.paused && this.paused.frames) || [];
+    if (frame < 0 || frame >= frames.length) {
+      throw new BridgeErr(`no frame ${frame} (have ${frames.length})`);
+    }
+    if (typeof expr === 'string' && expr.trim().startsWith('refs(') && expr.trim().endsWith(')')) {
+      throw new BridgeErr('refs() unsupported on Node yet (no gc walk via CDP)');
+    }
+    let res;
+    try {
+      res = await this.cdp.request('Debugger.evaluateOnCallFrame', {
+        callFrameId: frames[frame].callFrameId,
+        expression: expr,
+        returnByValue: false,
+      });
+    } catch (e) {
+      throw new BridgeErr(`cannot evaluate '${expr}': ${(e && e.message) || e}`);
+    }
+    if (res.exceptionDetails) {
+      const t = res.exceptionDetails.text || 'error';
+      const first = (res.exceptionDetails.exception && res.exceptionDetails.exception.description) || t;
+      throw new BridgeErr(`cannot evaluate '${expr}': ${String(first).split('\n')[0]}`);
+    }
+    const value = res.result && res.result.objectId
+      ? await this.fmtRemoteDeep(res.result)
+      : this.fmtRemote(res.result);
+    return { ok: true, expr, value: truncStr(String(value)) };
+  }
+
+  async cmdStep(req, timeout) {
+    this.requireLive();
+    const mode = req.mode || 'over';
+    const method = { over: 'Debugger.stepOver', into: 'Debugger.stepInto', out: 'Debugger.stepOut' }[mode];
+    if (!method) throw new BridgeErr(`bad step mode: ${mode}`);
+    this.paused = null;
+    this.cachedLocals = [];
+    this.awaitingStep = true;
+    try {
+      await this.cdp.request(method);
+    } catch (e) {
+      // Stepping a running target fails at the protocol level — don't leave
+      // the flag set or the next real stop misreports as a step landing.
+      this.awaitingStep = false;
+      throw e;
+    }
+    return this.resumeAndWait(timeout);
+  }
+
+  async cmdContinue(req, timeout) {
+    this.requireLive();
+    this.paused = null;
+    this.cachedLocals = [];
+    await this.cdp.request('Debugger.resume');
+    return this.resumeAndWait(timeout);
+  }
+
+  async resumeAndWait(timeout) {
+    await this.pump(timeout);
+    return {
+      ok: true,
+      stopped: true,
+      changed: JSON.parse(this.lastChanged),
+      stopInfo: JSON.parse(this.stopInfo || 'null'),
+      snapshot: this.snapshot(),
+    };
+  }
+
+  cmdThreads() {
+    if (this.exited) throw new BridgeErr('target VM has exited — close this session');
+    const frames = this.framesJson(false);
+    return {
+      ok: true,
+      running: !this.paused,
+      threads: [{ id: 1, name: 'main', status: this.paused ? 'paused' : 'running', frames }],
+    };
+  }
+
+  cmdLogs(req) {
+    const tail = Math.max(1, Math.min(500, parseInt(req.tail || 50, 10) || 50));
+    let lines = [];
+    try {
+      lines = fs.readFileSync(path.join(this.cfg.dir, 'logs.jsonl'), 'utf-8').split('\n');
+      if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+    } catch (_) {
+      lines = [];
+    }
+    return { ok: true, total: lines.length, truncated: lines.length > tail, lines: lines.slice(-tail) };
+  }
+
+  async dispatch(req) {
+    const cmd = req.cmd;
+    let timeout = Number(req.timeout !== undefined ? req.timeout : this.cfg.timeout);
+    if (!Number.isFinite(timeout) || timeout < 0) timeout = this.cfg.timeout;
+    if (cmd === 'close') throw new CloseSession();
+    if (cmd === 'context') return this.cmdContext();
+    if (cmd === 'stack') return this.cmdStack();
+    if (cmd === 'vars') return await this.cmdVars(req);
+    if (cmd === 'eval') return await this.cmdEval(req);
+    if (cmd === 'step') return await this.cmdStep(req, timeout);
+    if (cmd === 'continue') return await this.cmdContinue(req, timeout);
+    if (cmd === 'threads') return this.cmdThreads();
+    if (cmd === 'logs') return this.cmdLogs(req);
+    throw new BridgeErr(`unknown cmd: ${cmd}`);
+  }
+
+  async cleanup() {
+    this.closing = true;
+    if (this.cdp && !this.cdp.closed) {
+      if (this.cfg.kind === 'launch') {
+        // Launched target dies with the session (mirrors terminateDebuggee).
+        try {
+          if (this.child) this.child.kill('SIGKILL');
+        } catch (_) { /* best effort */ }
+      } else {
+        try {
+          await this.cdp.request('Debugger.disable', {}, 3000);
+        } catch (_) { /* best effort */ }
+      }
+      this.cdp.close();
+    } else if (this.cfg.kind === 'launch' && this.child) {
+      try {
+        this.child.kill('SIGKILL');
+      } catch (_) { /* best effort */ }
+    }
+  }
+}
+
+function fmtTimeout(t) {
+  return String(t);
+}
+
+// ---------------------------------------------------------------- serve
+
+async function serve(st, server, queue) {
+  for (;;) {
+    while (queue.length === 0) {
+      await new Promise((resolve) => {
+        queue.waiter = resolve;
+      });
+    }
+    const conn = queue.shift();
+    try {
+      let req;
+      try {
+        req = await readFrame(conn);
+      } catch (e) {
+        await writeFrame(conn, { ok: false, error: String((e && e.message) || e) });
+        continue;
+      }
+      try {
+        await writeFrame(conn, await st.dispatch(req));
+      } catch (e) {
+        if (e instanceof CloseSession) {
+          try {
+            await writeFrame(conn, { ok: true, closed: true });
+          } catch (_) { /* client already gone */ }
+          await st.cleanup();
+          return;
+        }
+        const msg = e instanceof BridgeErr ? e.message : `internal: ${(e && e.message) || e}`;
+        try {
+          await writeFrame(conn, { ok: false, error: msg });
+        } catch (_) { /* client already gone */ }
+      }
+    } finally {
+      conn.destroy();
+    }
+  }
+}
+
+function writeSessionFile(dir, obj) {
+  writeFile(path.join(dir, 'session.json'), JSON.stringify(obj));
+}
+
+/** Stop accepting; never let the graceful wait hang the exit (a WS close
+ * handshake against a just-SIGKILLed target may never complete). Exit is
+ * unconditional — responses were already flushed. */
+async function closeServer(server) {
+  await Promise.race([
+    new Promise((resolve) => {
+      try {
+        server.close(resolve);
+      } catch (_) {
+        resolve();
+      }
+    }),
+    sleep(2000),
+  ]);
+}
+
+function die(msg, code) {
+  process.stderr.write(`nodebridge: ${msg}${os.EOL}`);
+  process.exit(code);
+}
+
+async function main(argv) {
+  let cfg;
+  try {
+    cfg = parseArgs(argv);
+  } catch (e) {
+    if (e instanceof Usage) die(e.message, 2);
+    die(`internal: ${(e && e.message) || e}`, 1);
+  }
+  try {
+    fs.mkdirSync(cfg.dir, { recursive: true });
+  } catch (e) {
+    die(`cannot create ${cfg.dir}: ${e.message}`, 1);
+  }
+  const server = net.createServer();
+  server.on('error', (e) => die(`session socket: ${e.message}`, 1));
+  // Permanent queue: Node emits 'connection' eagerly, even with no listener
+  // attached — a connection arriving while a command is being served would
+  // be accepted and then DROPPED ON THE FLOOR (zero listeners), hanging the
+  // client forever. (Blocking accept() in Python/Java has no such hole.)
+  // Attach the queue before the handshake so nothing is ever missed.
+  const queue = [];
+  queue.waiter = null;
+  server.on('connection', (conn) => {
+    queue.push(conn);
+    if (queue.waiter) {
+      const w = queue.waiter;
+      queue.waiter = null;
+      w();
+    }
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  const st = new Session(cfg);
+  try {
+    await st.handshake();
+    if (st.child) {
+      // 'close' (not 'exit'): stdio is drained first, so no tail output is
+      // lost to the race between process death and our logs read. Piped
+      // stdio always closes after exit — no hang risk.
+      st.child.once('close', () => {
+        st.markExited();
+        st.paused = null;
+      });
+    }
+    const wantStop = st.cfg.breaks.length > 0 || st.cfg.wantExc;
+    if (wantStop) {
+      try {
+        await st.pump(st.cfg.timeout);
+      } catch (e) {
+        if (e instanceof BridgeErr && e.message === 'target exited' && logLines(cfg.dir).length > 0) {
+          // Fast program: exited before/at the first stop, but left logs.
+          writeSessionFile(cfg.dir, {
+            name: path.basename(cfg.dir), kind: cfg.kind, port, stopped: false,
+          });
+          try {
+            await serve(st, server, queue);
+          } finally {
+            await closeServer(server);
+          }
+          process.exit(0);
+        }
+        throw e;
+      }
+    }
+    writeSessionFile(cfg.dir, {
+      name: path.basename(cfg.dir), kind: cfg.kind, port, stopped: wantStop,
+    });
+    try {
+      await serve(st, server, queue);
+    } finally {
+      await closeServer(server);
+    }
+    process.exit(0);
+  } catch (e) {
+    if (e instanceof Usage || e instanceof BridgeErr) {
+      writeFile(path.join(cfg.dir, 'error.json'), JSON.stringify({ error: e.message }));
+      await st.cleanup().catch(() => {});
+      try {
+        server.close();
+      } catch (_) { /* best effort */ }
+      // Mirror pybridge: exit nonzero; session.rs surfaces error.json.
+      process.exit(e instanceof Usage ? 2 : 1);
+    }
+    throw e;
+  }
+}
+
+function logLines(dir) {
+  try {
+    return fs.readFileSync(path.join(dir, 'logs.jsonl'), 'utf-8').split('\n').filter((l) => l);
+  } catch (_) {
+    return [];
+  }
+}
+
+main(process.argv.slice(2)).catch((e) => die(`internal: ${(e && e.stack) || e}`, 1));

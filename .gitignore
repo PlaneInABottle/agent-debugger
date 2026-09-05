@@ -1,0 +1,6 @@
+/target
+*.class
+.DS_Store
+__pycache__/
+*.pyc
+examples/maven-demo/target/
