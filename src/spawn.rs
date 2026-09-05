@@ -150,7 +150,7 @@ pub(super) fn cmd_spawn(
             lang,
             kind,
             bridge_args: args,
-            wait_secs: stops.timeout + 10,
+            wait_secs: stops.timeout.saturating_add(10),
             stops: intent,
         },
     )

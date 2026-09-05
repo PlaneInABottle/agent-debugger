@@ -23,6 +23,22 @@ pub fn session_dir(name: &str) -> PathBuf {
     sessions_dir().join(name)
 }
 
+/// Session names are single filesystem segments. Without this, an absolute
+/// name would escape the sessions root on join (Rust replaces the base),
+/// and `close` would recursively delete an arbitrary directory.
+fn check_name(name: &str) -> anyhow::Result<()> {
+    // Backslash is rejected outright too: a legal filename char on Unix
+    // but a separator on Windows — session names never need it.
+    if name.contains('\\') {
+        anyhow::bail!("invalid session name '{name}' (single path segment only)");
+    }
+    let mut comps = std::path::Path::new(name).components();
+    match comps.next() {
+        Some(std::path::Component::Normal(_)) if comps.next().is_none() => Ok(()),
+        _ => anyhow::bail!("invalid session name '{name}' (single path segment only)"),
+    }
+}
+
 fn read_session(name: &str) -> anyhow::Result<Value> {
     let file = session_dir(name).join("session.json");
     let raw = std::fs::read_to_string(&file)
@@ -43,6 +59,7 @@ fn session_port(name: &str) -> anyhow::Result<u16> {
 /// Both adapters speak the same session protocol, so forwarding is
 /// language-agnostic (the session's lang only selects the adapter process).
 pub fn forward(name: &str, body: &Value, timeout: Duration) -> anyhow::Result<Value> {
+    check_name(name)?;
     let port = session_port(name)?;
     let resp = client::request(port, body, timeout)?;
     if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -131,29 +148,22 @@ fn session_lang_in(dir: &std::path::Path) -> String {
         .unwrap_or_else(|| "java".to_string())
 }
 
-/// Spawn the bridge daemon and wait for the first stop.
-pub fn spawn(name: &str, spec: &SpawnSpec) -> anyhow::Result<Value> {
-    let dir = session_dir(name);
-    if dir.join("session.json").exists() {
-        anyhow::bail!("session '{name}' already exists (close it first)");
-    }
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.to_string_lossy()))?;
-    // Clear leftovers from a previous failed attempt.
-    let _ = std::fs::remove_file(dir.join("session.json"));
-    let _ = std::fs::remove_file(dir.join("error.json"));
-    let _ = std::fs::remove_file(dir.join("stops.json"));
-    let _ = std::fs::write(
+/// Write sidecars and spawn the bridge process. Called only from `spawn`,
+/// which removes the session dir if this fails.
+fn setup_bridge(dir: &std::path::Path, spec: &SpawnSpec) -> anyhow::Result<std::process::Child> {
+    // Spawn-time intent first: while the session lives, stops.json is
+    // always present for resume. Unlike before, these writes propagate
+    // errors — a session whose intent cannot persist must not start.
+    std::fs::write(
         dir.join("lang.json"),
         format!("{{\"lang\":\"{}\"}}", spec.lang),
-    );
-    // Spawn-time intent first: even if the bridge dies during setup, the
-    // failed attempt's dir is removed wholesale — but while the session
-    // lives, stops.json is always present for resume.
-    let _ = std::fs::write(
+    )
+    .map_err(|e| anyhow::anyhow!("cannot write session lang: {e}"))?;
+    std::fs::write(
         dir.join("stops.json"),
         serde_json::to_string_pretty(&spec.stops).unwrap_or_else(|_| "{}".to_string()),
-    );
+    )
+    .map_err(|e| anyhow::anyhow!("cannot write session intent: {e}"))?;
 
     let log = std::fs::File::create(dir.join("bridge.log"))
         .map_err(|e| anyhow::anyhow!("cannot create bridge log: {e}"))?;
@@ -236,7 +246,7 @@ pub fn spawn(name: &str, spec: &SpawnSpec) -> anyhow::Result<Value> {
     };
     args.extend(spec.bridge_args.clone());
 
-    let mut child = std::process::Command::new(&program)
+    let child = std::process::Command::new(&program)
         .args(&args)
         .stdin(Stdio::null())
         .stdout(log.try_clone().map_err(|e| anyhow::anyhow!("{e}"))?)
@@ -244,12 +254,59 @@ pub fn spawn(name: &str, spec: &SpawnSpec) -> anyhow::Result<Value> {
         .spawn()
         .map_err(|e| anyhow::anyhow!("{program} not found or failed to start: {e}"))?;
     // Detached by design: the short-lived CLI exits, the bridge keeps the
-    // debug session alive (reparented). Never `child.kill()` on success.
+    // debug session alive (reparented). Ownership transfers to the wait
+    // loop below (mem::forget on success, kill on failure paths).
+    Ok(child)
+}
+
+/// Spawn the bridge daemon and wait for the first stop.
+pub fn spawn(name: &str, spec: &SpawnSpec) -> anyhow::Result<Value> {
+    check_name(name)?;
+    let dir = session_dir(name);
+    if dir.join("session.json").exists() {
+        anyhow::bail!("session '{name}' already exists (close it first)");
+    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.to_string_lossy()))?;
+    // Clear leftovers from a previous failed attempt.
+    let _ = std::fs::remove_file(dir.join("session.json"));
+    let _ = std::fs::remove_file(dir.join("error.json"));
+    let _ = std::fs::remove_file(dir.join("stops.json"));
+    // All setup below runs guarded: any failure before the wait loop owns
+    // a live bridge removes the dir wholesale, so a failed start never
+    // blocks a retry and never leaves misleading intent behind.
+    let mut child = match setup_bridge(&dir, spec) {
+        Ok(child) => Some(child),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+    };
+    // Reap helper: the loop below either forgets the child (session owns
+    // it now) or kills it on failure paths. Option-taking keeps every
+    // path sound across loop iterations (no use-after-forget).
+    let reap = |child: &mut Option<std::process::Child>| {
+        if let Some(mut c) = child.take() {
+            let _ = c.kill();
+        }
+    };
+
+    // Detached by design: the short-lived CLI exits, the bridge keeps the
+    // debug session alive (reparented). Never kill on success.
     let deadline = Instant::now() + Duration::from_secs(spec.wait_secs);
     loop {
+        // error.json first: a fast-exiting target can leave BOTH files
+        // behind (session.json from the death publish, error.json from
+        // the throw) — the error is the truth, not the stale readiness.
+        if dir.join("error.json").exists() {
+            let msg = read_bridge_error(&dir);
+            reap(&mut child);
+            let _ = std::fs::remove_dir_all(&dir);
+            anyhow::bail!("{msg}");
+        }
         if dir.join("session.json").exists() {
             // Forget the child (no kill on drop); session owns it now.
-            std::mem::forget(child);
+            std::mem::forget(child.take().expect("bridge child alive until handoff"));
             // Initial data: live context when stopped, else a thread dump.
             let stopped = std::fs::read_to_string(dir.join("session.json"))
                 .ok()
@@ -265,30 +322,34 @@ pub fn spawn(name: &str, spec: &SpawnSpec) -> anyhow::Result<Value> {
                 Ok(data) => return Ok(data),
                 Err(e) => {
                     // Fast program + logpoints-only: the target may exit before
-                    // the first read, but its logs are already on disk.
+                    // the first read, but its logs are already on disk. The
+                    // daemon reaps itself on exit; the session stays for them.
                     if let Some(logs) = read_logs_file(&dir, 50) {
                         return Ok(json!({
                             "warning": format!("{e:#} (target already exited)"),
                             "logs": logs,
                         }));
                     }
+                    // No session was established and nothing is collectible:
+                    // take the daemon down and remove the dir, so the name
+                    // is reusable and no orphan lingers.
+                    reap(&mut child);
+                    let _ = std::fs::remove_dir_all(&dir);
                     return Err(e);
                 }
             }
         }
-        if dir.join("error.json").exists() {
-            let msg = read_bridge_error(&dir);
-            let _ = child.kill();
-            let _ = std::fs::remove_dir_all(&dir);
-            anyhow::bail!("{msg}");
-        }
-        if let Ok(Some(status)) = child.try_wait() {
+        if let Some(status) = child
+            .as_mut()
+            .and_then(|c: &mut std::process::Child| c.try_wait().ok())
+            .flatten()
+        {
             let log_tail = read_log_tail(&dir);
             let _ = std::fs::remove_dir_all(&dir);
             anyhow::bail!("bridge exited during setup (code {status}). {log_tail}");
         }
         if Instant::now() > deadline {
-            let _ = child.kill();
+            reap(&mut child);
             let log_tail = read_log_tail(&dir);
             let _ = std::fs::remove_dir_all(&dir);
             anyhow::bail!("timed out waiting for first breakpoint. {log_tail}");
@@ -343,6 +404,7 @@ fn read_log_tail(dir: &std::path::Path) -> String {
 
 /// Close a session: ask the bridge to disconnect, always remove the dir.
 pub fn close(name: &str) -> anyhow::Result<Value> {
+    check_name(name)?;
     // Whether the bridge ACKed the close. A false here (with the port
     // already dead) means the daemon died on its own; a false with the port
     // alive means it is wedged — the dir is still removed, but the caller
@@ -354,18 +416,25 @@ pub fn close(name: &str) -> anyhow::Result<Value> {
         // A short timeout here used to orphan the daemon (client gave up,
         // queued frame never read, session dir already gone). Normal closes
         // still answer in milliseconds; the bound only covers the worst case.
-        if client::request(port, &json!({"cmd": "close"}), Duration::from_secs(65)).is_ok() {
-            confirmed = true;
+        if let Ok(resp) = client::request(port, &json!({"cmd": "close"}), Duration::from_secs(65)) {
+            // An actual ACK, not just any framed reply: {ok:false} means
+            // the bridge refused (still alive by definition).
+            confirmed = resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
         }
         // Then make sure the daemon actually exited before dropping the dir.
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
+        let mut observed_dead = false;
         while Instant::now() < deadline {
             if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err() {
+                observed_dead = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(200));
         }
+        // A refused close, or a daemon still listening after 15s, is not
+        // a confirmed close — even though the dir is removed below.
+        confirmed = confirmed && observed_dead;
     }
     let dir = session_dir(name);
     if !dir.exists() {
@@ -402,7 +471,13 @@ fn session_entry(dir: &std::path::Path) -> Value {
         .unwrap_or_default();
     let raw = std::fs::read_to_string(dir.join("session.json")).unwrap_or_default();
     let parsed: Value = serde_json::from_str(&raw).unwrap_or(json!({}));
-    let port = parsed.get("port").and_then(|p| p.as_u64()).unwrap_or(0) as u16;
+    // Checked conversion (like session_port): a corrupt huge port must not
+    // truncate into a live-looking probe of an unrelated service.
+    let port = parsed
+        .get("port")
+        .and_then(|p| p.as_u64())
+        .and_then(|p| u16::try_from(p).ok())
+        .unwrap_or(0);
     let alive = port != 0
         && std::net::TcpStream::connect_timeout(
             &format!("127.0.0.1:{port}").parse().unwrap(),
@@ -555,5 +630,37 @@ mod tests {
         assert_eq!(v["armed"], Value::Null);
         assert_eq!(v["alive"], json!(false)); // port 0: no probe
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_entry_rejects_oversize_port() {
+        // A corrupt huge port must not truncate into a live-looking probe
+        // (u16 wrap would turn 65537 into a probe of port 1).
+        let dir = tmpdir("entry-bigport");
+        std::fs::write(
+            dir.join("session.json"),
+            r#"{"name":"x","kind":"attach","port":65537,"stopped":false}"#,
+        )
+        .unwrap();
+        let v = session_entry(&dir);
+        assert_eq!(v["port"], json!(0));
+        assert_eq!(v["alive"], json!(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_name_allows_single_segments() {
+        for ok in ["cart", "cart-npe", "a", "a_b.c-9", "UPPER09"] {
+            assert!(check_name(ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn check_name_rejects_escape() {
+        // Absolute paths, traversal, separators, and empties must never
+        // reach session_dir (close() deletes whatever it resolves to).
+        for bad in ["", ".", "..", "../x", "a/b", "/tmp", "/etc/passwd", "a\\b"] {
+            assert!(check_name(bad).is_err(), "{bad}");
+        }
     }
 }

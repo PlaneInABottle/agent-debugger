@@ -149,7 +149,7 @@ fn dispatch(session: &str, cmd: cli::Commands) -> (&'static str, anyhow::Result<
             session::forward(
                 session,
                 &json!({"cmd": "continue", "timeout": timeout}),
-                Duration::from_secs(timeout + 5),
+                Duration::from_secs(timeout.saturating_add(5)),
             ),
         ),
         cli::Commands::Step { mode, timeout } => (
@@ -157,7 +157,7 @@ fn dispatch(session: &str, cmd: cli::Commands) -> (&'static str, anyhow::Result<
             session::forward(
                 session,
                 &json!({"cmd": "step", "mode": mode, "timeout": timeout}),
-                Duration::from_secs(timeout + 5),
+                Duration::from_secs(timeout.saturating_add(5)),
             ),
         ),
         cli::Commands::Reload { timeout } => (
@@ -165,7 +165,7 @@ fn dispatch(session: &str, cmd: cli::Commands) -> (&'static str, anyhow::Result<
             session::forward(
                 session,
                 &json!({"cmd": "reload", "timeout": timeout}),
-                Duration::from_secs(timeout + 5),
+                Duration::from_secs(timeout.saturating_add(5)),
             ),
         ),
         cli::Commands::Context => (

@@ -48,6 +48,21 @@ const JAVA_SOURCES: &[(&str, &str)] = &[
 ];
 pub const BRIDGE_MAIN_CLASS: &str = "JdiBridge";
 
+/// One compiled class per source file, so a damaged classes dir (marker
+/// present, some outputs deleted) still triggers a recompile. Update when
+/// adding new top-level classes to the Java bridge.
+const JAVA_CLASSES: &[&str] = &[
+    "JdiBridge",
+    "Config",
+    "BridgeCli",
+    "BridgeConn",
+    "BridgeSnapshot",
+    "BridgeSession",
+    "BridgeProto",
+    "BridgeEval",
+    "StreamGobbler",
+];
+
 const PYBRIDGE_SOURCE: &str = include_str!("../bridge/py/src/pybridge.py");
 
 const NODEBRIDGE_SOURCE: &str = include_str!("../bridge/node/src/nodebridge.js");
@@ -95,8 +110,15 @@ pub fn ensure_compiled() -> anyhow::Result<PathBuf> {
     let marker = classes.join("JdiBridge.class");
 
     // Any changed source (or a missing marker) recompiles the whole set:
-    // same package, so one javac invocation covers all files.
+    // same package, so one javac invocation covers all files. Class
+    // outputs are checked individually: the marker alone cannot prove a
+    // damaged classes dir complete.
     let mut stale = !marker.exists();
+    if !stale {
+        stale = JAVA_CLASSES
+            .iter()
+            .any(|c| !classes.join(format!("{c}.class")).exists());
+    }
     for (name, source) in JAVA_SOURCES {
         let dest = dir.join(name);
         let same = std::fs::read_to_string(&dest)

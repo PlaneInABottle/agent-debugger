@@ -7,6 +7,11 @@ use std::time::Duration;
 
 use crate::dap;
 
+/// Transport-level safety bound. Snapshots are kilobytes (token caps live
+/// in the bridges); anything past this is a corrupt or rogue bridge, not
+/// data. Without a cap a bogus Content-Length could OOM this CLI.
+const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
 /// Send one framed request, return the parsed response object.
 pub fn request(port: u16, body: &Value, timeout: Duration) -> anyhow::Result<Value> {
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse()?;
@@ -24,6 +29,9 @@ pub fn request(port: u16, body: &Value, timeout: Duration) -> anyhow::Result<Val
     loop {
         if let Some((value, _)) = dap::try_decode_message(&buf) {
             return Ok(value);
+        }
+        if buf.len() > MAX_FRAME_BYTES {
+            anyhow::bail!("bridge response exceeds {MAX_FRAME_BYTES} bytes (corrupt session?)");
         }
         match sock.read(&mut tmp) {
             Ok(0) => {
