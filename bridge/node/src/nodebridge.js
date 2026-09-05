@@ -327,6 +327,26 @@ class CdpConn {
 
 // ---------------------------------------------------------------- session
 
+
+// Session ownership: written first thing at startup, verified on every
+// serve iteration and pump tick. If the owner deleted our dir (rm -rf
+// instead of close) or respawned a new bridge under the same name, our
+// nonce no longer matches and we quit quietly instead of orphaning.
+// (Legit flows always close — which exits us — before removing the dir,
+// so a mismatch unambiguously means abandonment.)
+const OWNER_NONCE = `${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+function writeOwner(dir) {
+  writeFile(path.join(dir, 'owner.json'), JSON.stringify({ pid: process.pid, nonce: OWNER_NONCE }));
+}
+function amOwner(dir) {
+  try {
+    const raw = fs.readFileSync(path.join(dir, 'owner.json'), 'utf-8');
+    return JSON.parse(raw).nonce === OWNER_NONCE;
+  } catch (_) {
+    return false;
+  }
+}
+
 function writeFile(p, content) {
   try {
     fs.writeFileSync(p, content);
@@ -706,6 +726,10 @@ class Session {
   async pump(timeout) {
     const deadline = Date.now() + timeout * 1000;
     for (;;) {
+      if (!amOwner(this.cfg.dir)) {
+        await this.cleanup().catch(() => {});
+        process.exit(0);
+      }
       if (this.paused) return 'stopped';
       if (this.exited) throw new BridgeErr('target exited');
       if (Date.now() > deadline) {
@@ -1073,10 +1097,24 @@ function fmtTimeout(t) {
 
 async function serve(st, server, queue) {
   for (;;) {
+    if (!amOwner(st.cfg.dir)) {
+      await st.cleanup().catch(() => {});
+      process.exit(0);
+    }
+    // Idle wait gets a 1s deadline so rm -rf abandonment is noticed
+    // even with zero traffic (an unresolved waiter would orphan forever).
     while (queue.length === 0) {
-      await new Promise((resolve) => {
-        queue.waiter = resolve;
-      });
+      await Promise.race([
+        new Promise((resolve) => {
+          queue.waiter = resolve;
+        }),
+        sleep(1000),
+      ]);
+      queue.waiter = null;
+      if (queue.length === 0 && !amOwner(st.cfg.dir)) {
+        await st.cleanup().catch(() => {});
+        process.exit(0);
+      }
     }
     const conn = queue.shift();
     try {
@@ -1148,6 +1186,7 @@ async function main(argv) {
   } catch (e) {
     die(`cannot create ${cfg.dir}: ${e.message}`, 1);
   }
+  writeOwner(cfg.dir);
   const server = net.createServer();
   server.on('error', (e) => die(`session socket: ${e.message}`, 1));
   // Permanent queue: Node emits 'connection' eagerly, even with no listener

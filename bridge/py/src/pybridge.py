@@ -672,6 +672,15 @@ class Session:
             if r:
                 return r
         while True:
+            if not am_owner(self.cfg.dir, self._nonce):
+                # Abandoned mid-wait: take the target down with us (launch)
+                # or detach (attach), then vanish. SystemExit bypasses the
+                # `except Exception` error mappers on purpose.
+                try:
+                    self.cleanup()
+                except Exception:
+                    pass
+                raise SystemExit(0)
             remaining = deadline - time.time()
             if remaining <= 0:
                 raise BridgeErr(
@@ -947,9 +956,45 @@ def write_file(path, content):
         pass
 
 
-def serve(st, server):
+def write_owner(session_dir):
+    """Claim the session dir; see nodebridge owner.json (same contract)."""
+    import random
+    import time
+    nonce = f"{os.getpid()}-{time.time()}-{random.randrange(1_000_000_000)}"
+    write_file(os.path.join(session_dir, "owner.json"),
+               json.dumps({"pid": os.getpid(), "nonce": nonce}))
+    return nonce
+
+
+def am_owner(session_dir, nonce):
+    try:
+        with open(os.path.join(session_dir, "owner.json")) as f:
+            return json.load(f).get("nonce") == nonce
+    except (OSError, ValueError):
+        return False
+
+
+def serve(st, server, nonce):
+    # Idle accept gets a 1s timeout so rm -rf abandonment is noticed even
+    # with zero traffic (blocking accept would orphan forever).
+    try:
+        server.settimeout(1.0)
+    except OSError:
+        pass
     while True:
-        conn, _ = server.accept()
+        # Abandoned (dir rm'd or respawned under our name)? Quit quietly.
+        if not am_owner(st.cfg.dir, nonce):
+            try:
+                st.cleanup()
+            except Exception:
+                pass
+            return
+        try:
+            conn, _ = server.accept()
+        except (socket.timeout, TimeoutError):
+            continue
+        except OSError:
+            return
         try:
             try:
                 req = read_frame(conn)
@@ -982,11 +1027,13 @@ def main(argv):
         die(f"internal: {e}", 1)
     try:
         os.makedirs(cfg.dir, exist_ok=True)
+        nonce = write_owner(cfg.dir)
         server = socket.socket()
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind(("127.0.0.1", 0))
         server.listen(5)
         st = Session(cfg)
+        st._nonce = nonce
         if cfg.kind == "launch":
             st.start_adapter()
         try:
@@ -1000,7 +1047,7 @@ def main(argv):
                 {"name": os.path.basename(cfg.dir), "kind": cfg.kind,
                  "port": server.getsockname()[1],
                  "stopped": bool(cfg.breaks or cfg.methods or cfg.want_exc)}))
-            serve(st, server)
+            serve(st, server, nonce)
         except (Usage, BridgeErr) as e:
             write_file(os.path.join(cfg.dir, "error.json"),
                        json.dumps({"error": str(e)}))

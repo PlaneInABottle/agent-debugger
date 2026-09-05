@@ -830,6 +830,7 @@ public class JdiBridge {
         java.util.Set<String> planted = new java.util.HashSet<>(); // classes already planted
         Path dir; // session dir (logs.jsonl lives here)
         int logCount;
+        String ownerNonce; // session ownership token (see amOwner)
         final Object queueLock = new Object(); // guards waiterActive
         boolean waiterActive; // a continue/step owns the event queue right now
     }
@@ -838,10 +839,22 @@ public class JdiBridge {
         Path dir = Paths.get(cfg.sessionDir);
         Files.createDirectories(dir);
         ServerSocket server = new ServerSocket(0, 5, InetAddress.getByName("127.0.0.1"));
+        // Idle accept gets a 1s timeout so rm -rf abandonment is noticed even
+        // with zero traffic (blocking accept would orphan forever).
+        server.setSoTimeout(1000);
         SessionState st = new SessionState();
         st.cfg = cfg;
         st.server = server;
         st.dir = dir;
+        // Claim the session dir first thing: if the owner deletes it (rm -rf
+        // instead of close) or respawns under our name, our nonce mismatches
+        // and we quit quietly instead of orphaning. Same contract as the
+        // node/python/browser bridges' owner.json.
+        st.ownerNonce = ProcessHandle.current().pid() + "-"
+                + System.currentTimeMillis() + "-" + new java.util.Random().nextInt(1000000000);
+        writeFile(dir.resolve("owner.json"),
+                "{\"pid\":" + ProcessHandle.current().pid()
+                + ",\"nonce\":" + quote(st.ownerNonce) + "}");
         try {
             if (cfg.sessionKind.equals("attach")) {
                 st.vm = attachVm(cfg);
@@ -1422,6 +1435,11 @@ public class JdiBridge {
         VirtualMachine vm = st.vm;
         long deadline = System.currentTimeMillis() + timeoutMs;
         while (true) {
+            // Same abandonment guard as serveLoop (1s event windows bound it).
+            if (!amOwner(st)) {
+                cleanup(st);
+                System.exit(0);
+            }
             long remaining = deadline - System.currentTimeMillis();
             if (remaining <= 0) throw new BridgeException("timeout: no stop within " + (timeoutMs / 1000) + "s");
             EventSet set;
@@ -1563,11 +1581,31 @@ public class JdiBridge {
         }
     }
 
+    static boolean amOwner(SessionState st) {
+        try {
+            String raw = new String(Files.readAllBytes(st.dir.resolve("owner.json")),
+                    StandardCharsets.UTF_8);
+            Map<String, String> m = parseJsonObject(raw);
+            return st.ownerNonce.equals(m.get("nonce"));
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     static void serveLoop(SessionState st, Path dir) throws Exception {
         while (true) {
+            // Abandoned (dir rm'd or respawned under our name)? Clean up and
+            // vanish; legit flows always close (which returns from here)
+            // before removing the dir.
+            if (!amOwner(st)) {
+                cleanup(st);
+                return;
+            }
             Socket sock;
             try {
                 sock = st.server.accept();
+            } catch (java.net.SocketTimeoutException te) {
+                continue; // idle window: re-check abandonment above
             } catch (Exception e) {
                 return; // server closed
             }
