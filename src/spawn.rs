@@ -1,8 +1,8 @@
 //! Spawn argument building: CLI stops + target -> bridge args.
 //! Moved verbatim from main.rs; behavior unchanged.
 
+use crate::cli::Stops;
 use crate::session;
-use crate::Stops;
 use serde_json::{json, Value};
 
 /// Language-specific half of a spawn: how to tell the adapter WHAT to run.
