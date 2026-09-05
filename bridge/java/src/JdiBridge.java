@@ -46,13 +46,14 @@ import java.util.Map;
 
 
 /**
- * Minimal JDI bridge for agent-debugger (Faz 1).
+ * JDI bridge entry point for agent-debugger (session mode: a per-session
+ * daemon over TCP; see BridgeSession).
  *
- * <p>One-shot snapshot-on-breakpoint: attach to (or launch) a JVM, set
- * breakpoints (deferred via ClassPrepareRequest when the class is not loaded
- * yet), resume, wait for the first breakpoint hit, print a compact JSON
- * snapshot to stdout and disconnect. Zero dependencies, only
- * {@code com.sun.jdi} from the JDK.
+ * <p>One public class plus one file per concern, same default package:
+ * model (BridgeModel), CLI parsing (BridgeCli), attach/launch/one-shot
+ * (BridgeConn), snapshot rendering (BridgeSnapshot), session server
+ * (BridgeSession), wire IO (BridgeProto), expression layer (BridgeEval).
+ * Zero dependencies, only {@code com.sun.jdi} from the JDK.
  *
  * <p>Usage:
  *

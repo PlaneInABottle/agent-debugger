@@ -58,13 +58,27 @@ class BridgeConn {
         }
     }
 
+    /** Quote one launching-connector token when it contains whitespace.
+     * OpenJDK groups double-quoted sections but has no working escape for
+     * an inner quote (it corrupts the token AND the following ones), so an
+     * argument containing `"` is passed through raw exactly like before —
+     * spaces still split there, but previously-working quoteless args keep
+     * working. Backslashes pass through untouched (verified byte-identical).
+     * Only the common real case changes: paths/args with spaces, which
+     * used to split silently into several argv entries. */
+    static String quoteArg(String s) {
+        boolean ws = s.indexOf(' ') >= 0 || s.indexOf('\t') >= 0;
+        if (!ws || s.indexOf('"') >= 0) return s;
+        return "\"" + s + "\"";
+    }
+
     static Launched launchVm(Config cfg) throws Exception {
         LaunchingConnector connector = Bootstrap.virtualMachineManager().defaultConnector();
         Map<String, Connector.Argument> args = connector.defaultArguments();
         StringBuilder main = new StringBuilder(cfg.mainClass);
-        for (String pa : cfg.programArgs) main.append(' ').append(pa);
+        for (String pa : cfg.programArgs) main.append(' ').append(quoteArg(pa));
         args.get("main").setValue(main.toString());
-        args.get("options").setValue("-cp " + cfg.classpath);
+        args.get("options").setValue("-cp " + quoteArg(cfg.classpath));
         args.get("suspend").setValue("true");
         VirtualMachine vm;
         try {
