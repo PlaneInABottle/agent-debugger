@@ -106,12 +106,23 @@ function readFrame(conn) {
 }
 
 function writeFrame(conn, obj) {
+  // Never throws synchronously: writing to a dead socket raises sync
+  // (writeAfterFIN) instead of calling back with err. A connect+drop health
+  // check (e.g. our own `status` probe) used to kill the whole daemon here.
   return new Promise((resolve, reject) => {
-    const body = Buffer.from(JSON.stringify(obj), 'utf-8');
-    conn.write(
-      Buffer.concat([Buffer.from(`Content-Length: ${body.length}\r\n\r\n`), body]),
-      (err) => (err ? reject(err) : resolve()),
-    );
+    let msg;
+    try {
+      const body = Buffer.from(JSON.stringify(obj), 'utf-8');
+      msg = Buffer.concat([Buffer.from(`Content-Length: ${body.length}\r\n\r\n`), body]);
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    try {
+      conn.write(msg, (err) => (err ? reject(err) : resolve()));
+    } catch (e) {
+      reject(e);
+    }
   });
 }
 
@@ -1073,7 +1084,9 @@ async function serve(st, server, queue) {
       try {
         req = await readFrame(conn);
       } catch (e) {
-        await writeFrame(conn, { ok: false, error: String((e && e.message) || e) });
+        try {
+          await writeFrame(conn, { ok: false, error: String((e && e.message) || e) });
+        } catch (_) { /* client already gone — nothing to answer */ }
         continue;
       }
       try {

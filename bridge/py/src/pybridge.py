@@ -77,6 +77,16 @@ def write_frame(conn, obj):
     conn.sendall(b"Content-Length: %d\r\n\r\n" % len(body) + body)
 
 
+def try_write_frame(conn, obj):
+    """Best-effort response. A dead client (e.g. a connect+drop health
+    check like our own `status` probe) must never kill the daemon: without
+    this guard the fallback write itself raised out of serve()."""
+    try:
+        write_frame(conn, obj)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------- DAP conn
 
 class DapConn:
@@ -944,27 +954,18 @@ def serve(st, server):
             try:
                 req = read_frame(conn)
             except BridgeErr as e:
-                write_frame(conn, {"ok": False, "error": str(e)})
+                try_write_frame(conn, {"ok": False, "error": str(e)})
                 continue
             try:
                 write_frame(conn, st.dispatch(req))
             except _Close:
-                try:
-                    write_frame(conn, {"ok": True, "closed": True})
-                except Exception:
-                    pass
+                try_write_frame(conn, {"ok": True, "closed": True})
                 st.cleanup()
                 return
             except BridgeErr as e:
-                try:
-                    write_frame(conn, {"ok": False, "error": str(e)})
-                except Exception:
-                    pass
+                try_write_frame(conn, {"ok": False, "error": str(e)})
             except Exception as e:
-                try:
-                    write_frame(conn, {"ok": False, "error": f"internal: {e}"})
-                except Exception:
-                    pass
+                try_write_frame(conn, {"ok": False, "error": f"internal: {e}"})
         finally:
             try:
                 conn.close()
