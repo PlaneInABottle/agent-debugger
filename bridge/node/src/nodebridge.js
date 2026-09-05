@@ -255,7 +255,7 @@ function loadWs() {
 
 /** Minimal CDP client: id-matched requests plus an event handler. */
 class CdpConn {
-  constructor(ws) {
+  constructor(ws, onClose) {
     this.ws = ws;
     this.seq = 0;
     this.pending = new Map();
@@ -282,6 +282,11 @@ class CdpConn {
         reject(new BridgeErr('CDP connection closed'));
       }
       this.pending.clear();
+      if (onClose) {
+        try {
+          onClose();
+        } catch (_) { /* best effort */ }
+      }
     });
     ws.on('error', () => { /* close follows */ });
   }
@@ -477,7 +482,16 @@ class Session {
     }).catch((e) => {
       throw new BridgeErr(`CDP connect failed (${wsUrl}): ${e.message}`);
     });
-    this.cdp = new CdpConn(ws);
+    this.cdp = new CdpConn(ws, () => {
+      // Attach target died (launch deaths surface via child 'close', but
+      // attach has no child): mark exit now so pump fails fast and the
+      // session file stops lying about being parked.
+      if (!this.closing) {
+        this.exited = true;
+        this.paused = null;
+        this.publishState(false);
+      }
+    });
     this.cdp.onEvent = (msg) => {
       this.handleEvent(msg).catch((e) => {
         process.stderr.write(`warn: event handler: ${(e && e.message) || e}\n`);

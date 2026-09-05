@@ -56,9 +56,11 @@ agent-debugger --session cart context  # where it is parked (if stopped)
   `shadowed` (logpoint killed by a same-line break), `armed` (no receipt
   available: exc/watch/exit/method), `rejected`. `detail` carries the
   logpoint template / slide target / pending reason.
-- `breaks` also reports `hits` per stop: how many reported stops it fired.
-  Step landings never count (only real hits do), so a dead breakpoint
-  honestly reads 0. `hits:null` means uncountable, not zero (Python
+- `breaks` also reports `hits`: times the stop fired. Step landings
+  never count (Python/Java exclude them structurally; Node/browser count
+  only adapter-reported hit ids), so a dead breakpoint honestly reads 0.
+  Logpoint fires count wherever visible (Java client-side, Node/browser
+  auto-resumed pauses); `hits:null` means uncountable, not zero (Python
   logpoints fire inside debugpy, invisibly). After compaction, hits tell
   you which of your breakpoints are actually live.
 - Name sessions after the task (`--session cart-npe`): the name is the
