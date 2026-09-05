@@ -81,6 +81,124 @@ function needInt(flag, raw) {
   return n;
 }
 
+function isBareName(raw) {
+  return !raw.includes('/') && !raw.includes(path.sep)
+    && (path.altsep == null || !raw.includes(path.altsep));
+}
+
+/** Recursive basename matches under explicit roots (canonical, deduped).
+ *  Skips symlinked directories (no loop/hide surprises) and stops once
+ *  ambiguity is proven (limit reached), so huge trees cost little. */
+function findBasenames(name, srcDirs, limit = 6) {
+  const found = [];
+  const seen = new Set();
+  for (const root of srcDirs) {
+    let stat;
+    try {
+      stat = fs.statSync(root);
+    } catch (_) {
+      continue;
+    }
+    if (!stat.isDirectory()) continue;
+    const stack = [root];
+    while (stack.length > 0 && found.length < limit) {
+      const dir = stack.pop();
+      let entries;
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch (_) {
+        continue;
+      }
+      const subdirs = [];
+      for (const e of entries) {
+        const full = path.join(dir, e.name);
+        if (e.isSymbolicLink()) continue;
+        if (e.isDirectory()) {
+          subdirs.push(full);
+        } else if (e.isFile() && e.name === name) {
+          let cand;
+          try {
+            cand = fs.realpathSync(full);
+          } catch (_) {
+            cand = path.resolve(full);
+          }
+          if (!seen.has(cand)) {
+            try {
+              if (!fs.statSync(cand).isFile()) continue;
+            } catch (_) {
+              continue;
+            }
+            seen.add(cand);
+            found.push(cand);
+            if (found.length >= limit) break;
+          }
+        }
+      }
+      subdirs.sort();
+      for (let i = subdirs.length - 1; i >= 0; i--) stack.push(subdirs[i]);
+    }
+    if (found.length >= limit) break;
+  }
+  return found;
+}
+
+/** Map a user-given path to a canonical file (Python resolver semantics,
+ *  JS-native implementation). Raises Usage fail-fast before the target
+ *  runs when nothing — or more than one thing — matches:
+ *  an existing file from the cwd wins as-is; otherwise an explicit --src
+ *  root must locate it. Bare basenames get a bounded recursive search
+ *  under explicit roots only; nested relatives join onto each root. */
+function resolveSourcePath(raw, srcDirs) {
+  const srcs = (srcDirs || []).map((s) => {
+    try {
+      return fs.realpathSync(path.resolve(s));
+    } catch (_) {
+      return path.resolve(s);
+    }
+  });
+  if (path.isAbsolute(raw)) {
+    try {
+      if (fs.statSync(raw).isFile()) return fs.realpathSync(path.resolve(raw));
+    } catch (_) { /* fall to Usage below */ }
+    throw new Usage(`no such file: ${raw} — check the path and try again`);
+  }
+  const cwdTry = path.resolve(raw);
+  try {
+    if (fs.statSync(cwdTry).isFile()) {
+      // Cwd wins over --src: preserves behavior for full repo-relative
+      // paths; different spellings of one file still collide below
+      // because every result is canonical (realpath).
+      return fs.realpathSync(cwdTry);
+    }
+  } catch (_) { /* not in cwd — consult --src */ }
+  if (isBareName(raw)) {
+    const matches = srcs.length > 0 ? findBasenames(raw, srcs) : [];
+    if (matches.length === 1) return matches[0];
+    if (matches.length === 0) {
+      const where = srcs.length > 0
+        ? `tried ${cwdTry}; searched ${srcs.join(', ')} with no match`
+        : `tried ${cwdTry}; no --src roots given to search`;
+      throw new Usage(`no such file: ${raw} (${where}) — use the full path ` +
+        `relative to the current directory or pass --src <root> containing ${raw}`);
+    }
+    const extra = matches.length >= 6 ? '+' : '';
+    const shown = matches.slice(0, 5).join('\n  ');
+    throw new Usage(`ambiguous breakpoint path: ${raw} matches ` +
+      `${matches.length}${extra} files:\n  ${shown}\nuse the full path ` +
+      `relative to the current directory or --src <root> to disambiguate`);
+  }
+  const tried = [cwdTry];
+  for (const src of srcs) {
+    const cand = path.normalize(path.join(src, raw));
+    tried.push(cand);
+    try {
+      if (fs.statSync(cand).isFile()) return fs.realpathSync(cand);
+    } catch (_) { /* next root */ }
+  }
+  throw new Usage(`no such file: ${raw} (tried ${tried.join(', ')}) — use the full ` +
+    `path relative to the current directory or pass --src <root>`);
+}
+
 function canon(p) {
   // V8 reports canonical paths (symlinks resolved: /tmp -> /private/tmp
   // on macOS), so urlRegex matching must use the real path too. Fall back
@@ -118,20 +236,66 @@ function parseBreak(spec, cfg) {
   if (colon <= 0) throw new Usage('--break must look like path:line, exc');
   const lineno = parseInt(head.slice(colon + 1), 10);
   if (Number.isNaN(lineno)) throw new Usage(`bad line in --break: ${spec}`);
-  cfg.breaks.push({ path: canon(head.slice(0, colon)), line: lineno, cond });
+  const resolved = resolveSourcePath(head.slice(0, colon), cfg.srcs || []);
+  cfg.breaks.push({ path: resolved, line: lineno, cond });
 }
 
 function parseLogpoint(spec, cfg) {
   const first = spec.indexOf(':');
   const second = first >= 0 ? spec.indexOf(':', first + 1) : -1;
   if (first <= 0 || second <= 0) throw new Usage('--logpoint must look like path:line:template');
+  const resolved = resolveSourcePath(spec.slice(0, first), cfg.srcs || []);
   const lineno = parseInt(spec.slice(first + 1, second), 10);
   if (Number.isNaN(lineno)) throw new Usage(`bad line in --logpoint: ${spec}`);
   cfg.logpoints.push({
-    path: canon(spec.slice(0, first)),
+    path: resolved,
     line: lineno,
     template: spec.slice(second + 1),
   });
+}
+
+/** Fold startup specs before any CDP traffic or target run (mirrors the
+ *  live `breaks add` contract): an exact same path/line/cond repeat is
+ *  idempotent (kept once); the same path/line with a different condition —
+ *  or any same-line logpoint (one V8 breakpoint per line wins) — fails
+ *  fast. Paths are already canonical, so different spellings of one file
+ *  still collide. */
+function dedupeStartupBreaks(cfg) {
+  const kept = [];
+  const seen = new Set();
+  for (const b of cfg.breaks) {
+    const key = `${b.path}:${b.line}|${b.cond || ''}`;
+    if (seen.has(key)) continue; // exact duplicate: idempotent
+    const other = kept.find((o) => o.path === b.path && o.line === b.line);
+    if (other) {
+      throw new Usage(`conflicting condition for ${b.path}:${b.line} ` +
+        `(already requested${other.cond ? ` as '${other.cond}'` : ' plain'}): ` +
+        `${b.path}:${b.line}${b.cond ? `|${b.cond}` : ''}`);
+    }
+    seen.add(key);
+    kept.push(b);
+  }
+  cfg.breaks = kept;
+  const keptLogs = [];
+  const seenLogs = new Set();
+  for (const l of cfg.logpoints) {
+    const key = `${l.path}:${l.line}|${l.template}`;
+    if (seenLogs.has(key)) continue; // exact duplicate: idempotent
+    const brk = cfg.breaks.find((b) => b.path === l.path && b.line === l.line);
+    if (brk) {
+      throw new Usage(`conflicting condition for ${l.path}:${l.line} ` +
+        `(already requested as breakpoint${brk.cond ? ` '${brk.cond}'` : ''}): ` +
+        `logpoint ${l.path}:${l.line}`);
+    }
+    const other = keptLogs.find((o) => o.path === l.path && o.line === l.line);
+    if (other) {
+      throw new Usage(`conflicting condition for ${l.path}:${l.line} ` +
+        `(already requested as logpoint): logpoint ${l.path}:${l.line}`);
+    }
+    seenLogs.add(key);
+    keptLogs.push(l);
+  }
+  cfg.logpoints = keptLogs;
 }
 
 function parseArgs(argv) {
@@ -149,6 +313,11 @@ function parseArgs(argv) {
   };
   if (rest[0] !== 'session') throw new Usage('first arg must be "session"');
   i = 1;
+  // Break/logpoint specs resolve against --src roots, but flags may arrive
+  // in any order (--break before --src). Collect raw specs first, resolve
+  // after the full flag set is known — a bad path still fails fast here,
+  // before any target runs.
+  const pendingStops = []; // [kind, spec] in flag order
   while (i < rest.length) {
     const a = rest[i++];
     if (a === '--') { cfg.programArgs = rest.slice(i); break; }
@@ -159,13 +328,18 @@ function parseArgs(argv) {
     else if (a === '--host') cfg.host = need(a);
     else if (a === '--port') cfg.port = needInt(a, need(a));
     else if (a === '--src') cfg.srcs.push(path.resolve(need(a)));
-    else if (a === '--break') parseBreak(need(a), cfg);
-    else if (a === '--logpoint') parseLogpoint(need(a), cfg);
+    else if (a === '--break') pendingStops.push(['break', need(a)]);
+    else if (a === '--logpoint') pendingStops.push(['logpoint', need(a)]);
     else if (a === '--watch') throw new Usage(`--watch has no CDP equivalent yet (Node): ${rest[i] || ''}`);
     else if (a === '--exit') throw new Usage(`--exit has no CDP equivalent yet (Node): ${rest[i] || ''}`);
     else if (a === '--timeout') cfg.timeout = needInt(a, need(a));
     else throw new Usage(`unknown arg: ${a}`);
   }
+  for (const [kind, spec] of pendingStops) {
+    if (kind === 'break') parseBreak(spec, cfg);
+    else parseLogpoint(spec, cfg);
+  }
+  dedupeStartupBreaks(cfg);
   if (!cfg.dir) throw new Usage('missing --dir');
   if (cfg.kind !== 'launch' && cfg.kind !== 'attach') {
     throw new Usage(`--kind must be launch|attach (got ${cfg.kind})`);
@@ -178,15 +352,33 @@ function parseArgs(argv) {
     if (!fs.existsSync(cfg.program) || !fs.statSync(cfg.program).isFile()) {
       throw new Usage(`no such file: ${cfg.program}`);
     }
-    // node --check does not apply type-stripping, so it false-positives on
-    // valid TypeScript — skip pre-validation there (runtime failures still
-    // surface via logs/exit, just without the precise syntax message).
-    if (!/\.[mc]?ts$/.test(cfg.program)) {
+    // The binary itself must run (clean BridgeErr, not a silent spawn
+    // failure or a misleading syntax message): --check proves it for plain
+    // JS, --version for TS where --check false-positives on type-stripping.
+    if (/\.[mc]?ts$/.test(cfg.program)) {
+      // node --check does not apply type-stripping, so it false-positives
+      // on valid TypeScript — skip pre-validation there (runtime failures
+      // still surface via logs/exit, just without the precise message).
+      // Still prove the --node binary runs so a bad --node fails cleanly.
+      let probe;
+      try {
+        probe = spawnSync(cfg.nodeBin, ['--version'], { encoding: 'utf-8' });
+      } catch (e) {
+        throw new BridgeErr(`cannot run ${cfg.nodeBin}: ${(e && e.message) || e}`);
+      }
+      if (probe.error || probe.status !== 0) {
+        throw new BridgeErr(`cannot run ${cfg.nodeBin}: ` +
+          `${(probe.error && probe.error.message) || (probe.stderr || '').trim() || `exit ${probe.status}`}`);
+      }
+    } else {
       let check;
       try {
         check = spawnSync(cfg.nodeBin, ['--check', cfg.program], { encoding: 'utf-8' });
       } catch (e) {
         throw new BridgeErr(`cannot run ${cfg.nodeBin} --check: ${(e && e.message) || e}`);
+      }
+      if (check.error) {
+        throw new BridgeErr(`cannot run ${cfg.nodeBin}: ${check.error.message}`);
       }
       if (check.status !== 0) {
         throw new Usage(`cannot debug (syntax error?):\n${(check.stderr || '').trim()}`);
@@ -239,9 +431,48 @@ function amOwner(dir) {
 }
 
 function writeFile(p, content) {
+  // Atomic same-dir publish: unique temp (create-new) + rename, so a
+  // concurrent `status` read never sees a torn session.json. Best effort
+  // (callers treat state files as advisory), but a temp is never left
+  // behind. Plain log appends stay append-only — only full rewrites (state
+  // files, log-ring trims) come through here.
   try {
-    fs.writeFileSync(p, content);
+    const dir = path.dirname(p);
+    for (let i = 0; i < 8; i++) {
+      const tmp = path.join(dir,
+        `.tmp-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e9)}`);
+      try {
+        fs.writeFileSync(tmp, content, { flag: 'wx' });
+      } catch (e) {
+        if (e && e.code === 'EEXIST') continue;
+        return;
+      }
+      try {
+        fs.renameSync(tmp, p);
+      } catch (_) {
+        try {
+          fs.unlinkSync(tmp);
+        } catch (_) { /* already gone */ }
+      }
+      return;
+    }
   } catch (_) { /* best effort */ }
+}
+
+// Sanitized unexpected-crash payload: class + message + short stack tail,
+// ~2KB cap. Never env/secrets — only the failure itself. Known Usage /
+// BridgeErr messages bypass this (exact text on the error.json path).
+const MAX_ERROR_CHARS = 2048;
+function sanitizeUnexpected(e) {
+  const kind = (e && e.constructor && e.constructor.name) || 'Error';
+  let body = `${kind}: ${(e && e.message) || e}`;
+  try {
+    const frames = String((e && e.stack) || '').split('\n').slice(1, 7);
+    if (frames.length > 0) body += '\n' + frames.join('\n');
+  } catch (_) { /* message alone still helps */ }
+  body = body.trim();
+  if (body.length > MAX_ERROR_CHARS) body = body.slice(0, MAX_ERROR_CHARS - 1) + '…';
+  return `internal: ${body}`;
 }
 
 function sleep(ms) {
@@ -272,6 +503,7 @@ class Session {
     this.stopInfo = null;
     this.outputTail = '';
     this.logCount = 0;
+    this.logDropped = 0; // lifetime lines evicted by the log ring
     this.stopStates = []; // arm-time records served by `breaks`
     this.sessionPort = 0; // our TCP port (set in main, for republishing)
     this.lastStop = null; // {file,line,method} of the latest stop
@@ -282,9 +514,17 @@ class Session {
   async startTarget() {
     const stderrBuf = [];
     let wsUrl = null;
+    this.spawnError = null;
     this.child = spawn(this.cfg.nodeBin,
       [`--inspect-brk=127.0.0.1:0`, this.cfg.program, ...this.cfg.programArgs],
       { stdio: ['ignore', 'pipe', 'pipe'] });
+    // Error/close listeners attach IMMEDIATELY after spawn: a bad --node
+    // binary emits 'error' (ENOENT) with no 'exit', which without a listener
+    // rethrows and crashes the daemon — and would otherwise hang the
+    // handshake loop until its 20s deadline with a misleading message.
+    this.child.once('error', (e) => {
+      this.spawnError = e;
+    });
     this.child.stdout.on('data', (d) => this.onTargetOutput(d.toString()));
     this.child.stderr.on('data', (d) => {
       // Before the inspector URL appears, stderr is startup noise (parsed
@@ -297,9 +537,19 @@ class Session {
       stderrBuf.push(d.toString());
       if (stderrBuf.join('').length > 8000) stderrBuf.splice(0, 1);
     });
-    const dead = new Promise((resolve) => this.child.once('exit', (code) => resolve(code)));
+    const dead = new Promise((resolve) => {
+      // A failed spawn emits 'error' (+ 'close') but never 'exit': listen
+      // to all three so a bad --node surfaces now, not at the deadline.
+      this.child.once('exit', (code) => resolve(code));
+      this.child.once('close', (code) => resolve(code));
+      this.child.once('error', () => resolve('spawn-error'));
+    });
     const deadline = Date.now() + 20000;
     for (;;) {
+      if (this.spawnError) {
+        throw new BridgeErr(`cannot run ${this.cfg.nodeBin}: ` +
+          `${(this.spawnError && this.spawnError.message) || this.spawnError}`);
+      }
       const text = stderrBuf.join('');
       const m = text.match(/Debugger listening on (ws:\/\/\S+)/);
       if (m) {
@@ -310,6 +560,10 @@ class Session {
         return wsUrl;
       }
       const code = await Promise.race([dead, sleep(100).then(() => null)]);
+      if (this.spawnError) {
+        throw new BridgeErr(`cannot run ${this.cfg.nodeBin}: ` +
+          `${(this.spawnError && this.spawnError.message) || this.spawnError}`);
+      }
       if (code !== null && code !== undefined) {
         throw new BridgeErr(`target exited during startup (code ${code}): ${text.trim().slice(-500)}`);
       }
@@ -418,6 +672,11 @@ class Session {
   }
 
   async armBreakpoints() {
+    // Belt-and-braces: parseArgs already folded startup specs, but the
+    // fail-fast must hold before ANY CDP setBreakpointByUrl traffic even if
+    // the config was built another way. Identical repeats collapse here;
+    // differing cond/logpoint collisions throw before the first request.
+    dedupeStartupBreaks(this.cfg);
     // Group per file: CDP setBreakpointByUrl is one line per call, but a
     // logpoint and a line break on the same line would collide — keep the
     // real break (logpoint still fires? no: one breakpoint per line wins).
@@ -573,7 +832,9 @@ class Session {
     if (this.closing || this.exited || this.paused) {
       // Single target: a second pause cannot arrive while one is held (the
       // target is frozen). If it ever does, hold the first stop; the next
-      // resume flushes the rest.
+      // resume flushes the rest. The park below is set SYNCHRONOUSLY (before
+      // the first await), so even a fire-and-forget duplicate landing in the
+      // same tick sees it and never clobbers the current stop.
       return;
     }
     const hits = p.hitBreakpoints || [];
@@ -581,25 +842,49 @@ class Session {
     const logHits = hits.filter((id) => this.logpointIds.has(id));
     const realHits = hits.filter((id) => !this.logpointIds.has(id));
     this.countHits(p);
-    for (const id of logHits) {
-      await this.fireLogpoint(id, frames);
-    }
     if (p.reason === 'exception') {
       this.stopInfo = this.excInfo(p.data);
-      await this.trackChanges(frames);
+      // Park first, synchronously — trackChanges awaits must never strand
+      // a CDP pause with a running state when they throw.
       this.paused = { frames, stopInfo: this.stopInfo };
+      this.publishState(true);
+      try {
+        for (const id of logHits) {
+          await this.fireLogpoint(id, frames);
+        }
+        await this.trackChanges(frames);
+      } catch (_) {
+        // Still parked and published; change detail just goes quiet.
+        if (!this.cachedLocals) this.cachedLocals = [];
+        this.lastChanged = '[]';
+      }
       this.publishState(true);
       return;
     }
     if (realHits.length > 0 || this.awaitingStep) {
       this.awaitingStep = false;
       this.stopInfo = null;
-      await this.trackChanges(frames);
+      // Park first, synchronously — see above.
       this.paused = { frames, stopInfo: null };
+      this.publishState(true);
+      try {
+        for (const id of logHits) {
+          await this.fireLogpoint(id, frames);
+        }
+        await this.trackChanges(frames);
+      } catch (_) {
+        if (!this.cachedLocals) this.cachedLocals = [];
+        this.lastChanged = '[]';
+      }
       this.publishState(true);
       return;
     }
     if (logHits.length > 0) {
+      for (const id of logHits) {
+        try {
+          await this.fireLogpoint(id, frames);
+        } catch (_) { /* template holes already degrade to '?' */ }
+      }
       await this.cdp.request('Debugger.resume').catch(() => {});
       return;
     }
@@ -692,13 +977,43 @@ class Session {
 
   appendLog(line) {
     if (line === null || line === undefined) return;
-    if (this.logCount >= MAX_LOG_LINES) return;
     // One physical line per entry: multi-line values (e.g. Error stacks
     // from a logpoint hole) would otherwise shatter logs.jsonl structure.
     const flat = String(line).replace(/\r?\n/g, '⏎');
+    this._appendLogParts([flat]);
+  }
+
+  /** Ring-kept logs: logs.jsonl holds the latest MAX_LOG_LINES physical
+   *  lines; older lines are evicted (counted in logDropped, surfaced by
+   *  `logs`) instead of silently dropping NEW lines — the old cap froze
+   *  `logs --tail` on stale output once full. */
+  _appendLogParts(parts) {
+    if (parts.length === 0) return;
+    const file = path.join(this.cfg.dir, 'logs.jsonl');
     try {
-      fs.appendFileSync(path.join(this.cfg.dir, 'logs.jsonl'), flat + '\n');
-      this.logCount += 1;
+      if (this.logCount + parts.length <= MAX_LOG_LINES) {
+        fs.appendFileSync(file, parts.join('\n') + '\n');
+        this.logCount += parts.length;
+        return;
+      }
+      // Ring trim: keep the latest MAX lines. Bounded rewrite of a
+      // ≤2000-line file (published atomically, so concurrent `logs`
+      // readers never see a torn file); plain appends stay append-only.
+      let kept = [];
+      try {
+        kept = fs.readFileSync(file, 'utf-8').split('\n');
+        if (kept.length > 0 && kept[kept.length - 1] === '') kept.pop();
+      } catch (_) {
+        kept = [];
+      }
+      kept.push(...parts);
+      const evicted = kept.length - MAX_LOG_LINES;
+      if (evicted > 0) {
+        kept = kept.slice(evicted);
+        this.logDropped = (this.logDropped || 0) + evicted;
+      }
+      writeFile(file, kept.length > 0 ? kept.join('\n') + '\n' : '');
+      this.logCount = kept.length;
     } catch (_) { /* best effort */ }
   }
 
@@ -846,13 +1161,14 @@ class Session {
     const chain = frames[index].scopeChain || [];
     // Innermost first: V8 splits let/const into 'block' scopes (e.g. a
     // for-loop body) apart from the function 'local' scope, and outer
-    // variables live in 'closure' scopes. Merge all four kinds in chain
-    // order, innermost name wins (an arrow stopped at its first line would
-    // otherwise show a lying empty locals list).
+    // variables live in 'closure' scopes; try/catch bindings live in
+    // 'catch' scopes and script-level lets in 'script' scopes. Merge all
+    // six kinds in chain order, innermost name wins (an arrow stopped at
+    // its first line would otherwise show a lying empty locals list).
     const seen = new Set();
     let props = [];
     for (const s of chain) {
-      if (s.type !== 'local' && s.type !== 'block' && s.type !== 'closure' && s.type !== 'module') continue;
+      if (s.type !== 'local' && s.type !== 'block' && s.type !== 'closure' && s.type !== 'module' && s.type !== 'catch' && s.type !== 'script') continue;
       for (const pr of await this.scopeProps(s)) {
         if (!seen.has(pr.name)) {
           seen.add(pr.name);
@@ -1010,28 +1326,50 @@ class Session {
     const mode = req.mode || 'over';
     const method = { over: 'Debugger.stepOver', into: 'Debugger.stepInto', out: 'Debugger.stepOut' }[mode];
     if (!method) throw new BridgeErr(`bad step mode: ${mode}`);
+    // Publish running BEFORE the step request: session.json must show live
+    // truth even if the request hangs, and an immediate later pause (landed
+    // via events) must never be overwritten by our bookkeeping below.
+    const saved = this.paused;
     this.paused = null;
     this.cachedLocals = [];
     this.awaitingStep = true;
+    this.publishState(false);
     try {
       await this.cdp.request(method);
     } catch (e) {
-      // Stepping a running target fails at the protocol level — don't leave
-      // the flag set or the next real stop misreports as a step landing.
+      // Stepping a running target fails at the protocol level — restore the
+      // park (unless a fresh pause already won) so the session file stops
+      // lying about running, and clear the flag so the next real stop does
+      // not misreport as a step landing.
       this.awaitingStep = false;
+      if (!this.paused) {
+        this.paused = saved;
+        this.publishState(true);
+      }
       throw e;
     }
-    this.publishState(false);
     return this.resumeAndWait(timeout);
   }
 
   async cmdContinue(req, timeout) {
     this.requireLive();
     if (this.paused) {
+      // Publish running BEFORE the resume request (same ordering as step).
+      const saved = this.paused;
       this.paused = null;
       this.cachedLocals = [];
-      await this.cdp.request('Debugger.resume');
       this.publishState(false);
+      try {
+        await this.cdp.request('Debugger.resume');
+      } catch (e) {
+        // Synchronous request failure: restore the park unless a fresh
+        // pause already won the race.
+        if (!this.paused) {
+          this.paused = saved;
+          this.publishState(true);
+        }
+        throw e;
+      }
     }
     // Running already: nothing to resume (a bare resume errors on some
     // targets) — just wait for the next stop.
@@ -1039,7 +1377,16 @@ class Session {
   }
 
   async resumeAndWait(timeout) {
-    await this.pump(timeout);
+    try {
+      await this.pump(timeout);
+    } catch (e) {
+      // Pump timeout (or target exit) must clear the step flag — otherwise
+      // the NEXT real stop misreports as a step landing and breakpoint hits
+      // misclassify. Never touch a newly landed pause: if onPaused parked
+      // concurrently it already consumed the flag and published.
+      if (!this.paused) this.awaitingStep = false;
+      throw e;
+    }
     return {
       ok: true,
       stopped: true,
@@ -1086,7 +1433,7 @@ class Session {
     for (const r of raws) {
       if (typeof r !== 'string' || !r) throw new BridgeErr(`bad break spec: ${JSON.stringify(r)}`);
     }
-    const scratch = { breaks: [], logpoints: [], wantExc: false };
+    const scratch = { breaks: [], logpoints: [], wantExc: false, srcs: this.cfg.srcs || [] };
     for (const raw of raws) {
       const bar = raw.indexOf('|');
       const head = bar < 0 ? raw : raw.slice(0, bar);
@@ -1194,7 +1541,15 @@ class Session {
     } catch (_) {
       lines = [];
     }
-    return { ok: true, total: lines.length, truncated: lines.length > tail, lines: lines.slice(-tail) };
+    // total = retained lines on disk (<= MAX_LOG_LINES); dropped = lifetime
+    // lines evicted by the ring; truncated = the tail was cut OR any line
+    // was ever evicted (historical drops, not just the cut).
+    const dropped = this.logDropped || 0;
+    return {
+      ok: true, total: lines.length,
+      truncated: lines.length > tail || dropped > 0,
+      dropped, lines: lines.slice(-tail),
+    };
   }
 
   async dispatch(req) {
@@ -1431,7 +1786,16 @@ async function main(argv) {
       // Mirror pybridge: exit nonzero; session.rs surfaces error.json.
       process.exit(e instanceof Usage ? 2 : 1);
     }
-    throw e;
+    // Unexpected setup crash (never a silent exit-1): same cleanup, then a
+    // sanitized error.json the CLI surfaces. The name stays reusable — the
+    // CLI removes failed-setup dirs wholesale.
+    const detail = sanitizeUnexpected(e);
+    writeFile(path.join(cfg.dir, 'error.json'), JSON.stringify({ error: detail }));
+    await st.cleanup().catch(() => {});
+    try {
+      server.close();
+    } catch (_) { /* best effort */ }
+    process.exit(1);
   }
 }
 

@@ -34,6 +34,9 @@ MAX_FRAMES = 10
 MAX_THREADS = 8
 MAX_OUTPUT = 4000
 MAX_LOG_LINES = 2000
+# Unexpected-crash payload cap (sanitized class + message + short traceback
+# tail; never env/secrets — only the exception and our own frames).
+MAX_ERROR_CHARS = 2048
 # debugpy launcher version banners (never user data, just noise in logs).
 BANNER_LINES = {"ptvsd", "debugpy"}
 
@@ -327,7 +330,30 @@ def resolve_source_path(raw, src_dirs):
         f"path relative to the current directory or pass --src <root>")
 
 
+def _physical_line_count(abspath):
+    """Physical line total for range checks (UTF-8 with replacement; a file
+    that cannot be read skips the check rather than failing the session)."""
+    try:
+        with open(abspath, encoding="utf-8", errors="replace") as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return None
+
+
+def _check_line_range(abspath, lineno, raw):
+    """Fail fast on lines no file can hold (line<1 or past EOF). DAP would
+    otherwise 'verify' them by sliding to a nearby executable line, which
+    hides the typo. Names the raw spec, the resolved path, and the total."""
+    total = _physical_line_count(abspath)
+    if total is None:
+        return
+    if lineno < 1 or lineno > total:
+        raise Usage(f"no such line: {raw} — {abspath} has only "
+                    f"{total} lines (line {lineno} out of range)")
+
+
 def parse_break(spec, cfg):
+    raw = spec
     cond = None
     if "|" in spec:
         spec, cond = spec.split("|", 1)
@@ -352,8 +378,10 @@ def parse_break(spec, cfg):
     try:
         lineno = int(line)
     except ValueError:
-        raise Usage(f"bad line in --break: {spec}")
-    cfg.breaks.append((resolve_source_path(path, cfg.src_dirs), lineno, cond))
+        raise Usage(f"bad line in --break: {raw}")
+    resolved = resolve_source_path(path, cfg.src_dirs)
+    _check_line_range(resolved, lineno, raw)
+    cfg.breaks.append((resolved, lineno, cond))
 
 
 def parse_logpoint(spec, cfg):
@@ -367,7 +395,36 @@ def parse_logpoint(spec, cfg):
         lineno = int(spec[first + 1:second])
     except ValueError:
         raise Usage(f"bad line in --logpoint: {spec}")
+    _check_line_range(path, lineno, spec)
     cfg.logpoints.append((path, lineno, spec[second + 1:]))
+
+
+def _dedupe_startup_breaks(cfg):
+    """Fold startup specs before any DAP traffic or target run (mirrors the
+    live `breaks add` contract): an exact same path/line/cond repeat is
+    idempotent (kept once); the same path/line with a different condition
+    fails fast. Paths are already canonical (realpath), so different
+    spellings of one file still collide."""
+    kept = []
+    seen = set()
+    for path, line, cond in cfg.breaks:
+        key = (path, line, cond)
+        if key in seen:
+            continue
+        for other_path, other_line, other_cond in kept:
+            if other_path == path and other_line == line:
+                raise Usage(
+                    f"conflicting condition for {path}:{line} "
+                    f"(already requested"
+                    f"{' as ' + repr(other_cond) if other_cond else ' plain'}): "
+                    f"{path}:{line}"
+                    f"{'|' + cond if cond else ''}")
+        seen.add(key)
+        kept.append((path, line, cond))
+    cfg.breaks = kept
+    seen_methods = set()
+    cfg.methods = [m for m in cfg.methods
+                   if not (m in seen_methods or seen_methods.add(m))]
 
 
 def parse_args(argv):
@@ -441,6 +498,7 @@ def parse_args(argv):
             parse_break(spec, cfg)
         else:
             parse_logpoint(spec, cfg)
+    _dedupe_startup_breaks(cfg)
     if not cfg.python:
         cfg.python = sys.executable
     return cfg
@@ -470,14 +528,27 @@ class Session:
         self.stop_info = None
         self.output_tail = ""
         self.log_count = 0
+        self.log_dropped = 0  # lifetime lines evicted by the log ring
         self.configured = False  # True once launch/attach handshake completes
         self.stop_states = []  # arm-time records served by `breaks`
         # Match keys aligned with stop_states by index: ("break", abspath,
-        # line) | ("method", funcname) | ("exc",) | ("logpoint", abspath,
-        # line). Logpoints are DAP-native (fire invisibly) — never counted.
+        # requested, bound) | ("logpoint", abspath, requested, bound) |
+        # ("method", funcname) | ("exc",). Requested is what the agent asked;
+        # bound is where DAP actually planted it (slides differ). Hit
+        # counting matches bound; the keys never leave the process (`breaks`
+        # serves stop_states only).
         self._hitkeys = []
         self.session_port = 0  # our TCP port (set in main, for republishing)
         self.last_stop = None  # {"file","line","method"} of the latest stop
+        # P5 multithread state machine (single DAP reader, no threads). A
+        # parked stop is stable: co-stops from other threads count hits but
+        # never move the park. After a resume, `stopped` events are suspects
+        # until the adapter's `continued` proves the resume took effect
+        # (pre-`continued` arrivals predate the resume and are stale).
+        self._awaiting_continued = False
+        self._suspects = []    # held pre-`continued` stopped events (bounded)
+        self._co_seen = set()  # threadIds already attributed this park episode
+        self._suspect_warned = False
 
     # -- DAP helpers
 
@@ -691,11 +762,14 @@ class Session:
         self.last_func = func
         self.last_changed = json.dumps(changed)
 
-    def count_hits(self, reason):
+    def count_hits(self, reason, frame=None):
         """Attribute a stop to the records it fired (served as `hits` by
         `breaks`). Step landings are NOT hits — counting them would tell the
         agent dead breakpoints fire. Logpoints are DAP-native (fire
-        invisibly), so their hits stay null: uncountable, not zero."""
+        invisibly), so their hits stay null: uncountable, not zero. Slid
+        stops match their BOUND line (where DAP planted them), never the
+        requested line. `frame` attributes one co-stop frame without touching
+        the park; None means the parked top frame."""
         if reason == "step":
             return
         if reason == "exception":
@@ -703,9 +777,11 @@ class Session:
                 if rec["kind"] == "exc" and isinstance(rec.get("hits"), int):
                     rec["hits"] += 1
             return
-        if not self.frames:
-            return
-        f0 = self.frames[0]
+        if frame is None:
+            if not self.frames:
+                return
+            frame = self.frames[0]
+        f0 = frame
         src = (f0.get("source") or {})
         try:
             here = os.path.realpath(os.path.abspath(src.get("path", "")))
@@ -715,7 +791,15 @@ class Session:
         for rec, key in zip(self.stop_states, self._hitkeys):
             if not isinstance(rec.get("hits"), int):
                 continue
-            if key[0] == "break" and len(key) == 3:
+            if key[0] == "break" and len(key) == 4:
+                try:
+                    if (os.path.realpath(os.path.abspath(key[1])) == here
+                            and key[3] == f0.get("line")):
+                        rec["hits"] += 1
+                except (TypeError, ValueError):
+                    pass
+            elif key[0] == "break" and len(key) == 3:
+                # Tolerance for pre-slide-era keys built by older tests.
                 try:
                     if (os.path.realpath(os.path.abspath(key[1])) == here
                             and key[2] == f0.get("line")):
@@ -726,13 +810,18 @@ class Session:
                 rec["hits"] += 1
 
     def unresolved_summary(self):
-        """One-line diagnosis for stops that never bound (verified:false).
+        """One-line diagnosis for stops that never bound usefully.
 
-        Only pending line/logpoint records qualify — verified/armed stops
-        simply were not reached, which is not a path problem."""
+        Pending line/logpoint records qualify, as do slid stops that never
+        fired (a slide off a comment/blank onto nearby code usually means
+        the requested line is not executable). A slid stop that fired, and
+        an exactly-verified stop that simply was not reached, are not path
+        problems and stay out — the latter keeps its plain timeout."""
         pend = [r for r in self.stop_states
-                if r.get("state") == "pending"
-                and r.get("kind") in ("break", "logpoint")]
+                if r.get("kind") in ("break", "logpoint")
+                and (r.get("state") == "pending"
+                     or (r.get("state") == "slid"
+                         and (r.get("hits") is None or r.get("hits") == 0)))]
         if not pend:
             return ""
         parts = []
@@ -852,6 +941,40 @@ class Session:
         self._drain_response("attach")
         self.configured = True
 
+    def _apply_verification(self, rec, got, requested, is_logpoint):
+        """Fold one setBreakpoints answer into a record. Returns the bound
+        line for _hitkeys. verified:true with a numeric line != requested
+        means DAP slid the stop (comment/blank/decorator answers land on
+        nearby executable code): state=slid with `slid to line X` detail
+        (logpoint templates preserved). verified:false or a missing/short
+        answer stays pending."""
+        if not isinstance(got, dict):
+            got = {}
+        if not bool(got.get("verified", False)):
+            rec["state"] = "pending"
+            msg = got.get("message", "pending")
+            if is_logpoint and "detail" in rec:
+                rec["detail"] = f"{rec['detail']} ({msg})"
+            elif not is_logpoint or "detail" not in rec:
+                rec["detail"] = msg
+            return requested
+        bound = got.get("line")
+        if isinstance(bound, bool) or not isinstance(bound, int):
+            bound = None
+        if bound is not None and bound != requested:
+            rec["state"] = "slid"
+            slide = f"slid to line {bound}"
+            if is_logpoint and rec.get("detail"):
+                if slide not in rec["detail"]:
+                    rec["detail"] = f"{rec['detail']} ({slide})"
+            else:
+                rec["detail"] = slide
+            return bound
+        rec["state"] = "verified"
+        if not is_logpoint and "detail" in rec:
+            del rec["detail"]
+        return requested
+
     def arm_breakpoints(self):
         # DAP setBreakpoints REPLACES a file's breakpoints per call, so line
         # breaks and logpoints for the same file merge into ONE request.
@@ -879,35 +1002,55 @@ class Session:
                 # requested, zip() would silently drop stops. Missing entries
                 # report pending rather than vanishing.
                 got = got_list[idx] if idx < len(got_list) else {}
-                verified = bool(got.get("verified", False))
                 spec = f"{self.rel_file(path)}:{item['line']}"
                 if item["kind"] == "break" and item.get("cond"):
                     spec += f"|{item['cond']}"
                 rec = {"spec": spec, "kind": item["kind"],
-                       "state": "verified" if verified else "pending",
                        "hits": 0 if item["kind"] == "break" else None}
                 if item["kind"] == "logpoint":
                     # Resume needs the template ("what was I collecting?"),
                     # not just the line. Cheap (one short string).
                     rec["detail"] = item["template"]
-                if not verified:
-                    msg = got.get("message", "pending")
-                    if item["kind"] == "break":
-                        rec["detail"] = msg
-                    else:
-                        rec["detail"] = f"{item['template']} ({msg})"
+                bound = self._apply_verification(
+                    rec, got, item["line"], item["kind"] == "logpoint")
+                if rec["state"] == "pending":
+                    msg = rec.get("detail", "pending")
                     sys.stderr.write(
                         f"warn: breakpoint unverified: {path}:{item['line']} "
                         f"({msg})\n")
+                elif rec["state"] == "slid":
+                    sys.stderr.write(
+                        f"warn: breakpoint slid: {path}:{item['line']} "
+                        f"-> {bound}\n")
                 self.stop_states.append(rec)
-                self._hitkeys.append((item["kind"], path, item["line"]))
-        for func in self.cfg.methods:
-            self.dap_request("setFunctionBreakpoints",
-                             {"breakpoints": [{"name": func}]})
-            self.stop_states.append(
-                {"spec": f"method:{func}", "kind": "method", "state": "armed",
-                 "hits": 0})
-            self._hitkeys.append(("method", func))
+                self._hitkeys.append((item["kind"], path, item["line"], bound))
+        if self.cfg.methods:
+            # DAP setFunctionBreakpoints REPLACES the whole function-break
+            # list per call (same replace semantics as setBreakpoints per
+            # file), so all names go in ONE request — one call per method
+            # would drop every predecessor. Each answer entry carries the
+            # adapter's own receipt (verified/pending/message); methods
+            # have no line to slide to, so no slide semantics are invented.
+            body = self.dap_request(
+                "setFunctionBreakpoints",
+                {"breakpoints": [{"name": func}
+                                 for func in self.cfg.methods]})
+            got_list = body.get("breakpoints", [])
+            for idx, func in enumerate(self.cfg.methods):
+                # Defensive (same as line breaks): a short answer leaves
+                # the missing entry pending rather than dropping the stop.
+                got = got_list[idx] if idx < len(got_list) else {}
+                if not isinstance(got, dict):
+                    got = {}
+                rec = {"spec": f"method:{func}", "kind": "method",
+                       "hits": 0}
+                if bool(got.get("verified", False)):
+                    rec["state"] = "verified"
+                else:
+                    rec["state"] = "pending"
+                    rec["detail"] = got.get("message", "pending")
+                self.stop_states.append(rec)
+                self._hitkeys.append(("method", func))
         if self.cfg.want_exc:
             self.dap_request("setExceptionBreakpoints", {"filters": ["uncaught"]})
             self.stop_states.append(
@@ -934,12 +1077,27 @@ class Session:
                 raise SystemExit(0)
             remaining = deadline - time.time()
             if remaining <= 0:
+                if self._awaiting_continued and not self.suspended:
+                    # The resume produced only held suspects: park the first
+                    # still-live one instead of timing out, then close the
+                    # episode either way so later genuine stops park at once.
+                    r = self._probe_suspects() if self._suspects else None
+                    if r:
+                        return r
+                    self._awaiting_continued = False
                 raise StopTimeout(
                     f"timeout: no stop within {timeout:g}s")
             self.dap.sock.settimeout(min(remaining, 1.0))
             try:
                 msg = self.dap._read_msg()
             except (socket.timeout, TimeoutError):
+                if (self._awaiting_continued and self._suspects
+                        and not self.suspended and remaining > 2):
+                    # No `continued` yet (older adapters may never send one):
+                    # bounded probe of the held stops, then keep waiting.
+                    r = self._probe_suspects()
+                    if r:
+                        return r
                 continue  # idle second; re-check deadline
             except BridgeErr as e:
                 if "closed" in str(e).lower():
@@ -949,6 +1107,84 @@ class Session:
             r = self._handle_pumped(msg)
             if r:
                 return r
+
+    @staticmethod
+    def _stopped_tid(msg):
+        try:
+            return (msg.get("body") or {}).get("threadId")
+        except AttributeError:
+            return None
+
+    @staticmethod
+    def _stopped_reason(msg):
+        try:
+            return (msg.get("body") or {}).get("reason", "")
+        except AttributeError:
+            return ""
+
+    def _co_stop_frame(self, thread_id):
+        """Top frame of another stopped thread (levels:1 probe). None when
+        the thread is not inspectably stopped — never raises."""
+        try:
+            body = self.dap_request("stackTrace",
+                                    {"threadId": thread_id,
+                                     "startFrame": 0, "levels": 1},
+                                    timeout=5)
+        except BridgeErr:
+            return None
+        if not isinstance(body, dict):
+            return None
+        frames = body.get("stackFrames", [])
+        return frames[0] if frames else None
+
+    def _note_suspect(self, msg):
+        if len(self._suspects) >= 4:
+            del self._suspects[0]
+        self._suspects.append(msg)
+
+    def _probe_suspects(self):
+        """Park the first held suspect whose thread still probes live.
+        Returns "stopped" on a park, None when every suspect is stale.
+        Bounded: at most the first two suspects are probed, then all are
+        dropped — no unbounded loops, no DAP storms."""
+        if not self._suspect_warned:
+            sys.stderr.write("warn: no continued event yet; probing held stops\n")
+            self._suspect_warned = True
+        live = None
+        for msg in self._suspects[:2]:
+            tid = self._stopped_tid(msg)
+            if tid is not None and self._co_stop_frame(tid) is not None:
+                live = msg
+                break
+        self._suspects = []
+        if live is None:
+            return None
+        self._awaiting_continued = False
+        return self._park_stop(self._stopped_reason(live),
+                               self._stopped_tid(live))
+
+    def _park_stop(self, reason, tid):
+        """Park the session on a genuine stop. The single place that moves
+        the park: thread, frames, stopInfo, change tracking, hit counting."""
+        self.thread_id = tid
+        self.suspended = True
+        self.frames = []
+        self.stop_info = None
+        self._co_seen = {tid}
+        # A failed stack read does not prove the thread died. Preserve
+        # the actual suspension and allow an explicit continue/retry.
+        self.publish_state(True)
+        self.refresh_frames(timeout=5)
+        if not self.frames:
+            raise BridgeErr("target stopped but stack is unavailable; retry context or continue")
+        if reason == "exception":
+            self.stop_info = self.exception_info()
+        else:
+            self.stop_info = None
+        self.track_changes()
+        self.count_hits(reason)
+        self.publish_state(True)
+        return "stopped"
 
     def _handle_pumped(self, msg):
         if not isinstance(msg, dict) or msg.get("type") != "event":
@@ -972,25 +1208,45 @@ class Session:
                 pass
             if reason in ("breakpoint", "step", "exception", "function breakpoint",
                           "data breakpoint", "entry", "goto"):
-                self.thread_id = body.get("threadId")
-                self.suspended = True
-                self.frames = []
-                self.stop_info = None
-                # A failed stack read does not prove the thread died. Preserve
-                # the actual suspension and allow an explicit continue/retry.
-                self.publish_state(True)
-                self.refresh_frames(timeout=5)
-                if not self.frames:
-                    raise BridgeErr("target stopped but stack is unavailable; retry context or continue")
-                if reason == "exception":
-                    self.stop_info = self.exception_info()
-                else:
-                    self.stop_info = None
-                self.track_changes()
-                self.count_hits(reason)
-                self.publish_state(True)
-                return "stopped"
+                tid = body.get("threadId")
+                if self._awaiting_continued and not self.suspended:
+                    # Post-resume suspect: the resume has not taken effect
+                    # yet (no `continued`), so this stop predates it. Hold
+                    # for the barrier; never park a maybe-stale stop.
+                    self._note_suspect(msg)
+                    return None
+                if self.suspended:
+                    # Co-stop while parked: attribute the hit via a targeted
+                    # probe, but never move the park out from under the agent.
+                    if tid not in self._co_seen:
+                        self._co_seen.add(tid)
+                        if reason == "exception":
+                            self.count_hits(reason)
+                        elif tid is not None:
+                            frame = self._co_stop_frame(tid)
+                            if frame is not None:
+                                self.count_hits(reason, frame)
+                    return None
+                return self._park_stop(reason, tid)
             return None
+        if ev == "continued":
+            # Resume barrier: the adapter confirms the resume took effect.
+            # Pre-barrier suspects predate it and are stale. A per-thread
+            # resume (explicit false) clears only its own thread's suspects;
+            # a missing flag means "everything resumed" (true).
+            if not self._awaiting_continued:
+                return None
+            self._awaiting_continued = False
+            if body.get("allThreadsContinued", True):
+                self._suspects = []
+            else:
+                tid = body.get("threadId")
+                self._suspects = [m for m in self._suspects
+                                  if self._stopped_tid(m) != tid]
+            if not self._suspects:
+                return None
+            self._suspect_warned = True  # normal barrier resolution: no warning
+            return self._probe_suspects()
         if ev in ("exited", "terminated"):
             self.exited = True
             self.publish_state(False)
@@ -1025,17 +1281,41 @@ class Session:
             return json.dumps({"exception": {"class": "?"}})
 
     def append_log(self, line):
+        """Ring-kept logs: logs.jsonl holds the latest MAX_LOG_LINES physical
+        lines; older lines are evicted (counted in log_dropped, surfaced by
+        `logs`) instead of silently dropping NEW lines — the old cap froze
+        `logs --tail` on stale output once full."""
         if line is None:
             return
-        if self.log_count >= MAX_LOG_LINES:
+        parts = line.splitlines()
+        if not parts:
             return
+        self._append_log_parts(parts)
+
+    def _append_log_parts(self, parts):
+        path = os.path.join(self.cfg.dir, "logs.jsonl")
         try:
-            with open(os.path.join(self.cfg.dir, "logs.jsonl"), "a") as f:
-                for part in line.splitlines():
-                    if self.log_count >= MAX_LOG_LINES:
-                        break
-                    f.write(part + "\n")
-                    self.log_count += 1
+            if self.log_count + len(parts) <= MAX_LOG_LINES:
+                with open(path, "a") as f:
+                    for part in parts:
+                        f.write(part + "\n")
+                self.log_count += len(parts)
+                return
+            # Ring trim: keep the latest MAX lines. Bounded rewrite of a
+            # ≤2000-line file (published atomically, so concurrent `logs`
+            # readers never see a torn file); plain appends stay append-only.
+            try:
+                with open(path) as f:
+                    kept = f.read().splitlines()
+            except OSError:
+                kept = []
+            kept.extend(parts)
+            evicted = len(kept) - MAX_LOG_LINES
+            if evicted > 0:
+                kept = kept[evicted:]
+                self.log_dropped += evicted
+            write_file(path, "".join(p + "\n" for p in kept))
+            self.log_count = len(kept)
         except OSError:
             pass
 
@@ -1114,6 +1394,24 @@ class Session:
 
     def _resume_and_wait(self, timeout):
         """Resume after step/continue and wait for the next stop."""
+        was_suspended = self.suspended
+        if was_suspended:
+            # Pre-resume stops predate the resume: drop them from the stash
+            # (their hits were already counted on arrival) so the next pump
+            # cannot re-park a running thread. Running-origin stash is never
+            # touched — only a parked resume invalidates queued stops. The
+            # barrier below guards only real resumes: a running `continue`
+            # issues none, so its arrivals stay genuine.
+            stash = getattr(self.dap, "stash", None)
+            if isinstance(stash, list):
+                self.dap.stash = [
+                    m for m in stash
+                    if not (isinstance(m, dict) and m.get("type") == "event"
+                            and m.get("event") == "stopped")]
+        self._suspects = []
+        self._co_seen = set()
+        self._awaiting_continued = was_suspended
+        self._suspect_warned = False
         self.suspended = False
         self.thread_id = None
         self.frames = []
@@ -1270,23 +1568,42 @@ class Session:
             # Positional refresh (request order above): existing breaks, then
             # logpoints, then new. Short answers leave old records untouched.
             bi = [i for i, k in enumerate(self._hitkeys)
-                  if k[0] == "break" and len(k) == 3 and k[1] == path]
+                  if k[0] == "break" and len(k) >= 3 and k[1] == path]
             li = [i for i, k in enumerate(self._hitkeys)
-                  if k[0] == "logpoint" and len(k) == 3 and k[1] == path]
+                  if k[0] == "logpoint" and len(k) >= 3 and k[1] == path]
             for pos, i in enumerate(bi):
                 if pos < len(got_list):
-                    self._refresh_rec(self.stop_states[i], got_list[pos], False)
+                    key = self._hitkeys[i]
+                    requested = key[2] if len(key) >= 3 else None
+                    prev = self.stop_states[i].get("state")
+                    bound = self._refresh_rec(
+                        self.stop_states[i], got_list[pos], False, requested)
+                    self._hitkeys[i] = ("break", key[1], requested, bound)
+                    if (self.stop_states[i].get("state") == "slid"
+                            and prev != "slid"):
+                        sys.stderr.write(
+                            f"warn: breakpoint slid: {key[1]}:{requested} "
+                            f"-> {bound}\n")
             for pos, i in enumerate(li):
                 idx = len(exist_breaks) + pos
                 if idx < len(got_list):
                     # Reset to the template first: repeated refreshes must
                     # not stack "(msg)" suffixes on the detail.
-                    line_of = self._hitkeys[i][2]
+                    key = self._hitkeys[i]
+                    requested = key[2] if len(key) >= 3 else None
                     tmpl = next((t for p, ln, t in self.cfg.logpoints
-                                 if p == path and ln == line_of), None)
+                                 if p == path and ln == requested), None)
                     if tmpl is not None:
                         self.stop_states[i]["detail"] = tmpl
-                    self._refresh_rec(self.stop_states[i], got_list[idx], True)
+                    prev = self.stop_states[i].get("state")
+                    bound = self._refresh_rec(
+                        self.stop_states[i], got_list[idx], True, requested)
+                    self._hitkeys[i] = ("logpoint", key[1], requested, bound)
+                    if (self.stop_states[i].get("state") == "slid"
+                            and prev != "slid"):
+                        sys.stderr.write(
+                            f"warn: breakpoint slid: {key[1]}:{requested} "
+                            f"-> {bound}\n")
             base = len(exist_breaks) + len(exist_logs)
             for k, (r, _, ln, c) in enumerate(items):
                 got = got_list[base + k] if base + k < len(got_list) else {}
@@ -1294,9 +1611,12 @@ class Session:
                 if c:
                     spec += f"|{c}"
                 rec = {"spec": spec, "kind": "break", "hits": 0}
-                self._refresh_rec(rec, got, False)
+                bound = self._refresh_rec(rec, got, False, ln)
+                if rec["state"] == "slid":
+                    sys.stderr.write(
+                        f"warn: breakpoint slid: {path}:{ln} -> {bound}\n")
                 self.stop_states.append(rec)
-                self._hitkeys.append(("break", path, ln))
+                self._hitkeys.append(("break", path, ln, bound))
                 self.cfg.breaks.append((path, ln, c))
                 entry = {"raw": r, "spec": spec, "kind": "break",
                          "state": rec["state"], "hits": 0}
@@ -1313,18 +1633,12 @@ class Session:
                                + ", ".join(self.rel_file(p) for p in failed))
         return resp
 
-    def _refresh_rec(self, rec, got, is_logpoint):
-        """Apply one setBreakpoints answer to a record (shared by arm/add)."""
-        verified = bool(got.get("verified", False))
-        rec["state"] = "verified" if verified else "pending"
-        if not verified:
-            msg = got.get("message", "pending")
-            if is_logpoint and "detail" in rec:
-                rec["detail"] = f"{rec['detail']} ({msg})"
-            elif not is_logpoint or "detail" not in rec:
-                rec["detail"] = msg
-        elif "detail" in rec and not is_logpoint:
-            del rec["detail"]
+    def _refresh_rec(self, rec, got, is_logpoint, requested):
+        """Apply one setBreakpoints answer to a record (shared by arm/add).
+
+        Returns the bound line so callers can store it in _hitkeys."""
+        bound = self._apply_verification(rec, got, requested, is_logpoint)
+        return bound
 
     def cmd_logs(self, req):
         tail = max(1, min(500, int(req.get("tail", 50))))
@@ -1338,8 +1652,13 @@ class Session:
                 lines = f.read().splitlines()
         except OSError:
             lines = []
+        # total = retained lines on disk (<= MAX_LOG_LINES); dropped =
+        # lifetime lines evicted by the ring; truncated = the tail was cut
+        # OR any line was ever evicted (historical drops, not just the cut).
+        dropped = getattr(self, "log_dropped", 0)
         return {"ok": True, "total": len(lines),
-                "truncated": len(lines) > tail, "lines": lines[-tail:]}
+                "truncated": len(lines) > tail or dropped > 0,
+                "dropped": dropped, "lines": lines[-tail:]}
 
     def require_stopped(self):
         if self.exited:
@@ -1424,11 +1743,65 @@ class _Close(Exception):
 
 
 def write_file(path, content):
+    """Atomic same-dir publish: unique temp (create-new) + replace, so a
+    concurrent `status` read never sees a torn session.json. Best effort
+    (callers treat state files as advisory), but a temp is never left behind
+    on failure. Plain log appends stay append-only — only full rewrites
+    (state files, log-ring trims) come through here."""
     try:
-        with open(path, "w") as f:
-            f.write(content)
+        data = content.encode("utf-8") if isinstance(content, str) else content
+        directory = os.path.dirname(os.path.abspath(path))
+        tmp = None
+        for _ in range(8):
+            cand = os.path.join(
+                directory, f".tmp-{os.getpid()}-{time.time_ns()}")
+            try:
+                fd = os.open(cand, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            except FileExistsError:
+                continue
+            except OSError:
+                return
+            tmp = cand
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(data)
+            except OSError:
+                try:
+                    os.unlink(cand)
+                except OSError:
+                    pass
+                return
+            break
+        if tmp is None:
+            return
+        try:
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
     except OSError:
         pass
+
+
+def format_unexpected(e):
+    """Sanitized unexpected-crash payload: exception class + message plus a
+    short traceback tail, capped ~2KB. Never env/secrets — only the
+    exception and our own frames. Known Usage/BridgeErr messages bypass
+    this (they keep their exact text on the error.json path)."""
+    import traceback
+    try:
+        tb = "".join(traceback.format_exception(type(e), e, e.__traceback__)[-6:])
+    except Exception:
+        tb = ""
+    body = f"{type(e).__name__}: {e}"
+    if tb.strip():
+        body += "\n" + tb.strip()
+    body = body.strip()
+    if len(body) > MAX_ERROR_CHARS:
+        body = body[:MAX_ERROR_CHARS - 1] + "…"
+    return f"internal: {body}"
 
 
 def write_owner(session_dir):
@@ -1529,12 +1902,14 @@ def serve(st, server, nonce):
 
 
 def main(argv):
+    cfg_dir = None
     try:
         cfg = parse_args(argv)
     except Usage as e:
         die(str(e), 2)
     except Exception as e:
         die(f"internal: {e}", 1)
+    cfg_dir = cfg.dir
     try:
         os.makedirs(cfg.dir, exist_ok=True)
         nonce = write_owner(cfg.dir)
@@ -1585,6 +1960,17 @@ def main(argv):
             write_file(os.path.join(cfg.dir, "error.json"),
                        json.dumps({"error": str(e)}))
             raise
+        except Exception as e:
+            # Unexpected setup crash (never a silent exit-1): same cleanup,
+            # then a sanitized error.json the CLI surfaces. The name stays
+            # reusable — the CLI removes failed-setup dirs wholesale.
+            try:
+                st.cleanup()
+            except Exception:
+                pass
+            write_file(os.path.join(cfg.dir, "error.json"),
+                       json.dumps({"error": format_unexpected(e)}))
+            raise
         finally:
             try:
                 server.close()
@@ -1593,7 +1979,10 @@ def main(argv):
     except (Usage, BridgeErr) as e:
         die(str(e), 1)
     except Exception as e:
-        die(f"internal: {e}", 1)
+        if cfg_dir is not None:
+            write_file(os.path.join(cfg_dir, "error.json"),
+                       json.dumps({"error": format_unexpected(e)}))
+        die(format_unexpected(e), 1)
 
 
 if __name__ == "__main__":

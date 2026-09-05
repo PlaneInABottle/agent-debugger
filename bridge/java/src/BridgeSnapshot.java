@@ -24,16 +24,47 @@ import java.util.Map;
 // Snapshot rendering: threads, frames, locals, values, snippets. Moved verbatim from JdiBridge.java.
 class BridgeSnapshot {
     static String snapshot(VirtualMachine vm, Config cfg, ThreadReference thread,
-            Location loc, StreamGobbler out) throws Exception {
+            Location loc, StreamGobbler out, StreamGobbler err) throws Exception {
         StringBuilder sb = new StringBuilder(4096);
         sb.append('{');
         JdiBridge.kv(sb, "mode", cfg.mode, true);
         sb.append(",\"location\":").append(locationJson(loc, cfg));
         sb.append(",\"threads\":").append(threadsJson(vm, thread));
         sb.append(",\"frames\":").append(framesJson(thread, true));
-        if (out != null) sb.append(",\"output\":").append(JdiBridge.quote(out.tail()));
+        if (out != null || err != null) sb.append(",\"output\":").append(JdiBridge.quote(combinedOutput(out, err)));
         sb.append('}');
         return sb.toString();
+    }
+
+    /** Bounded combined target output (stdout + stderr); stderr never duplicates stdout. */
+    static String combinedOutput(StreamGobbler out, StreamGobbler err) {
+        String o = "";
+        String e = "";
+        try { if (out != null) o = out.tail(); } catch (Exception ignored) {}
+        try { if (err != null) e = err.tail(); } catch (Exception ignored) {}
+        if (o == null) o = "";
+        if (e == null) e = "";
+        if (e.isEmpty()) {
+            if (o.length() > JdiBridge.MAX_OUTPUT) o = o.substring(o.length() - JdiBridge.MAX_OUTPUT);
+            return o;
+        }
+        String combined = o.isEmpty() ? "[stderr]\n" + e : o + "\n[stderr]\n" + e;
+        if (combined.length() > JdiBridge.MAX_OUTPUT) combined = combined.substring(combined.length() - JdiBridge.MAX_OUTPUT);
+        return combined;
+    }
+
+    /** Bounded stderr-inclusive suffix for setup-failure errors (bad main/cp, early exit). */
+    static String targetOutputSuffix(StreamGobbler out, StreamGobbler err) {
+        String combined;
+        try {
+            combined = combinedOutput(out, err);
+        } catch (Exception ignored) {
+            return "";
+        }
+        if (combined == null || combined.trim().isEmpty()) return "";
+        String tail = combined.trim();
+        if (tail.length() > 500) tail = tail.substring(tail.length() - 500);
+        return " | target output: " + tail;
     }
 
     static String locationJson(Location loc, Config cfg) {

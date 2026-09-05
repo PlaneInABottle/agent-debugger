@@ -51,11 +51,13 @@ class Watchpoint {
 class Launched {
         VirtualMachine vm;
         StreamGobbler out;
+        StreamGobbler err;
     }
 class SessionState {
         Config cfg;
         VirtualMachine vm;
         StreamGobbler out;
+        StreamGobbler err;
         ServerSocket server;
         ThreadReference thread;
         Location location;
@@ -67,7 +69,8 @@ class SessionState {
         String stopInfo; // JSON object describing WHY we stopped (watch/exit/exception)
         java.util.Set<String> planted = new java.util.HashSet<>(); // classes already planted
         Path dir; // session dir (logs.jsonl lives here)
-        int logCount;
+        int logCount; // retained lines on disk (<= MAX_LOG_LINES)
+        int logDropped; // lifetime lines evicted by the log ring
         String ownerNonce; // session ownership token (see amOwner)
         String lastStopJson; // pre-rendered {"file","line","method"}, null until first stop
         Map<String, Integer> hitCounts = new java.util.HashMap<>(); // hit-key -> stops fired (served by `breaks`)

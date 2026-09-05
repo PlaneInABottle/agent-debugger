@@ -12,9 +12,48 @@ import java.util.Map;
 
 // Wire + text IO: TCP framing, minimal JSON parser, file appends, target-output drain. Moved verbatim from JdiBridge.java.
 class BridgeProto {
+    /** Atomic same-dir publish: unique temp (create-new) + atomic move
+     *  (fallback plain replace), so a concurrent `status` read never sees a
+     *  torn session.json. Best effort (callers treat state files as
+     *  advisory), but a temp is never left behind. Plain log appends stay
+     *  append-only — only full rewrites (state files, log-ring trims) come
+     *  through here. */
     static void writeFile(Path p, String content) {
         try {
-            Files.write(p, content.getBytes(StandardCharsets.UTF_8));
+            Path dir = p.toAbsolutePath().getParent();
+            if (dir == null) dir = java.nio.file.Paths.get(".");
+            Path tmp = null;
+            for (int i = 0; i < 8; i++) {
+                Path cand = dir.resolve(".tmp-" + ProcessHandle.current().pid()
+                        + "-" + System.nanoTime() + "-" + i);
+                try {
+                    tmp = java.nio.file.Files.createFile(cand);
+                    break;
+                } catch (java.nio.file.FileAlreadyExistsException dup) {
+                    continue;
+                }
+            }
+            if (tmp == null) return;
+            try {
+                java.nio.file.Files.write(tmp, content.getBytes(StandardCharsets.UTF_8));
+            } catch (Exception e) {
+                try { java.nio.file.Files.deleteIfExists(tmp); } catch (Exception ignored) {}
+                return;
+            }
+            try {
+                java.nio.file.Files.move(tmp, p,
+                        java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            } catch (java.nio.file.AtomicMoveNotSupportedException amn) {
+                try {
+                    java.nio.file.Files.move(tmp, p,
+                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                } catch (Exception e) {
+                    try { java.nio.file.Files.deleteIfExists(tmp); } catch (Exception ignored) {}
+                }
+            } catch (Exception e) {
+                try { java.nio.file.Files.deleteIfExists(tmp); } catch (Exception ignored) {}
+            }
         } catch (Exception ignored) {}
     }
 

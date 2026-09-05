@@ -58,6 +58,7 @@ class BridgeSession {
                 Launched l = BridgeConn.launchVm(cfg);
                 st.vm = l.vm;
                 st.out = l.out;
+                st.err = l.err;
             } else {
                 throw new UsageException("--kind must be attach or launch");
             }
@@ -83,14 +84,26 @@ class BridgeSession {
             publishState(st, st.suspended);
             serveLoop(st, dir);
         } catch (UsageException | BridgeException e) {
-            BridgeProto.writeFile(dir.resolve("error.json"), "{\"error\":" + JdiBridge.quote(e.getMessage()) + "}");
+            cleanupVm(st);
+            BridgeProto.writeFile(dir.resolve("error.json"), "{\"error\":" + JdiBridge.quote(setupErrorText(e, st)) + "}");
             throw e;
         } catch (RuntimeException e) {
             // JDI failures surface as unchecked VMDisconnectedException etc.
             // Map them to the same error file (never a bare "internal:"
             // crash), e.g. a target that vanishes mid-handshake.
             BridgeException be = new BridgeException(JdiBridge.shortMsg(e));
-            BridgeProto.writeFile(dir.resolve("error.json"), "{\"error\":" + JdiBridge.quote(be.getMessage()) + "}");
+            cleanupVm(st);
+            BridgeProto.writeFile(dir.resolve("error.json"), "{\"error\":" + JdiBridge.quote(setupErrorText(be, st)) + "}");
+            throw be;
+        } catch (Throwable t) {
+            // Any other setup crash (checked IO, linkage errors): same
+            // cleanup, then a sanitized error.json the CLI surfaces instead
+            // of a bare stdout "internal:" with no file. The name stays
+            // reusable — the CLI removes failed-setup dirs wholesale.
+            // (M2 setup cleanup above is reused, never duplicated.)
+            BridgeException be = new BridgeException(JdiBridge.sanitizeUnexpected(t));
+            cleanupVm(st);
+            BridgeProto.writeFile(dir.resolve("error.json"), "{\"error\":" + JdiBridge.quote(setupErrorText(be, st)) + "}");
             throw be;
         } finally {
             try { server.close(); } catch (Exception ignored) {}
@@ -142,6 +155,7 @@ class BridgeSession {
         }
         java.util.Set<String> watched = new java.util.HashSet<>();
         for (Logpoint lp : cfg.logpoints) {
+            if (isShadowed(cfg, lp)) continue; // break wins: no JDI request, no double-event
             List<ReferenceType> loaded = vm.classesByName(lp.cls);
             if (!loaded.isEmpty()) {
                 for (ReferenceType rt : loaded) BridgeConn.setLines(vm, rt, java.util.Collections.singletonList(lp.line),
@@ -181,6 +195,7 @@ class BridgeSession {
         }
         for (Logpoint lp : cfg.logpoints) {
             if (lp.cls.equals(rt.name())) {
+                if (isShadowed(cfg, lp)) continue; // break wins on the same line
                 BridgeConn.setLines(vm, rt, java.util.Collections.singletonList(lp.line),
                         EventRequest.SUSPEND_EVENT_THREAD, true);
             }
@@ -343,7 +358,7 @@ class BridgeSession {
                     st.stopInfo = null; // plain stop supersedes any previous reason
                     trackChanges(st);
                     st.suspended = true;
-                    stop = BridgeSnapshot.snapshot(vm, st.cfg, st.thread, st.location, st.out);
+                    stop = BridgeSnapshot.snapshot(vm, st.cfg, st.thread, st.location, st.out, st.err);
                 } else if (event instanceof com.sun.jdi.event.StepEvent) {
                     com.sun.jdi.event.StepEvent se = (com.sun.jdi.event.StepEvent) event;
                     if (stop != null) continue;
@@ -352,7 +367,7 @@ class BridgeSession {
                     st.stopInfo = null;
                     trackChanges(st);
                     st.suspended = true;
-                    stop = BridgeSnapshot.snapshot(vm, st.cfg, st.thread, st.location, st.out);
+                    stop = BridgeSnapshot.snapshot(vm, st.cfg, st.thread, st.location, st.out, st.err);
                 } else if (event instanceof com.sun.jdi.event.ExceptionEvent) {
                     com.sun.jdi.event.ExceptionEvent ee = (com.sun.jdi.event.ExceptionEvent) event;
                     if (!matchesExcFilter(st.cfg, ee)) continue;
@@ -366,7 +381,7 @@ class BridgeSession {
                     st.stopInfo = BridgeEval.exceptionInfo(ee);
                     trackChanges(st);
                     st.suspended = true;
-                    stop = BridgeSnapshot.snapshot(vm, st.cfg, st.thread, st.location, st.out);
+                    stop = BridgeSnapshot.snapshot(vm, st.cfg, st.thread, st.location, st.out, st.err);
                 } else if (event instanceof com.sun.jdi.event.ModificationWatchpointEvent) {
                     com.sun.jdi.event.ModificationWatchpointEvent we =
                             (com.sun.jdi.event.ModificationWatchpointEvent) event;
@@ -377,7 +392,7 @@ class BridgeSession {
                     st.stopInfo = BridgeEval.watchInfo(we.field(), "write", we.valueToBe());
                     trackChanges(st);
                     st.suspended = true;
-                    stop = BridgeSnapshot.snapshot(vm, st.cfg, st.thread, st.location, st.out);
+                    stop = BridgeSnapshot.snapshot(vm, st.cfg, st.thread, st.location, st.out, st.err);
                 } else if (event instanceof com.sun.jdi.event.AccessWatchpointEvent) {
                     com.sun.jdi.event.AccessWatchpointEvent we =
                             (com.sun.jdi.event.AccessWatchpointEvent) event;
@@ -388,7 +403,7 @@ class BridgeSession {
                     st.stopInfo = BridgeEval.watchInfo(we.field(), "read", we.valueCurrent());
                     trackChanges(st);
                     st.suspended = true;
-                    stop = BridgeSnapshot.snapshot(vm, st.cfg, st.thread, st.location, st.out);
+                    stop = BridgeSnapshot.snapshot(vm, st.cfg, st.thread, st.location, st.out, st.err);
                 } else if (event instanceof com.sun.jdi.event.MethodExitEvent) {
                     com.sun.jdi.event.MethodExitEvent me = (com.sun.jdi.event.MethodExitEvent) event;
                     if (!BridgeEval.wantedExit(st.cfg, me)) continue;
@@ -399,7 +414,7 @@ class BridgeSession {
                     st.stopInfo = BridgeEval.exitInfo(me);
                     trackChanges(st);
                     st.suspended = true;
-                    stop = BridgeSnapshot.snapshot(vm, st.cfg, st.thread, st.location, st.out);
+                    stop = BridgeSnapshot.snapshot(vm, st.cfg, st.thread, st.location, st.out, st.err);
                 } else if (event instanceof ClassPrepareEvent) {
                     ClassPrepareEvent cp = (ClassPrepareEvent) event;
                     try { cp.request().disable(); } catch (Exception ignored) {}
@@ -414,7 +429,8 @@ class BridgeSession {
                 } else if (event instanceof VMDeathEvent || event instanceof VMDisconnectEvent) {
                     st.exited = true;
                     publishState(st, false);
-                    throw new BridgeException("target VM exited");
+                    throw new BridgeException("target VM exited"
+                            + BridgeSnapshot.targetOutputSuffix(st.out, st.err));
                 }
             }
             if (stop != null) {
@@ -489,12 +505,36 @@ class BridgeSession {
     }
 
     static void cleanup(SessionState st) {
-        if (st.cfg.sessionKind.equals("launch")) {
-            try { st.vm.exit(0); } catch (Exception ignored) {}
-        } else {
-            try { st.vm.dispose(); } catch (Exception ignored) {}
-        }
+        cleanupVm(st);
         try { st.server.close(); } catch (Exception ignored) {}
+    }
+
+    /** Setup-failure path: kill exactly the VM we started (launch exits the
+     *  target, attach detaches); close semantics stay untouched. */
+    static void cleanupVm(SessionState st) {
+        if (st == null || st.vm == null) return;
+        try {
+            if (st.cfg != null && "launch".equals(st.cfg.sessionKind)) {
+                try { st.vm.exit(0); } catch (Exception ignored) {}
+            } else {
+                try { st.vm.dispose(); } catch (Exception ignored) {}
+            }
+        } finally {
+            st.vm = null;
+        }
+    }
+
+    /** Setup errors carry bounded target output so bad main/cp failures name
+     *  the real cause (e.g. "Could not find or load main class"). */
+    static String setupErrorText(Exception e, SessionState st) {
+        String base = e.getMessage() == null ? e.toString() : e.getMessage();
+        StreamGobbler out = st == null ? null : st.out;
+        StreamGobbler err = st == null ? null : st.err;
+        String suffix = "";
+        try { suffix = BridgeSnapshot.targetOutputSuffix(out, err); } catch (Exception ignored) {}
+        if (suffix == null || suffix.isEmpty()) return base;
+        if (base != null && base.contains("target output:")) return base;
+        return base + suffix;
     }
 
     static String dispatch(SessionState st, String reqJson) throws Exception {
@@ -552,8 +592,11 @@ class BridgeSession {
                     total = all.size();
                     for (int i = Math.max(0, total - tail); i < total; i++) lines.add(all.get(i));
                 } catch (Exception ignored) {}
-                return "{\"ok\":true,\"total\":" + total + ",\"truncated\":" + (total > lines.size())
-                        + ",\"lines\":" + toJsonArray(lines) + "}";
+                // total = retained lines on disk (<= MAX); dropped = lifetime
+                // lines evicted by the ring; truncated = the tail was cut OR
+                // any line was ever evicted (historical drops, not just cut).
+                return "{\"ok\":true,\"total\":" + total + ",\"truncated\":" + (total > lines.size() || st.logDropped > 0)
+                        + ",\"dropped\":" + st.logDropped + ",\"lines\":" + toJsonArray(lines) + "}";
             }
             case "context": {
                 requireStopped(st);
@@ -715,8 +758,17 @@ class BridgeSession {
         }
     }
 
-    /** A stopping (line/method) breakpoint planted at this location? */
+    /** Same-line logpoint shadowed by a real break (break wins, mirroring node/browser). */
+    static boolean isShadowed(Config cfg, Logpoint lp) {
+        List<Integer> lines = cfg.breakpoints.get(lp.cls);
+        return lines != null && lines.contains(lp.line);
+    }
 
+    static String shadowDetail(Logpoint lp) {
+        return "logpoint shadowed by breakpoint: " + lp.cls + ":" + lp.line;
+    }
+
+    /** A stopping (line/method) breakpoint planted at this location? */
     static boolean hasStoppingBreak(Config cfg, Location loc) {
         String cls = "?";
         int line = -1;
@@ -749,7 +801,7 @@ class BridgeSession {
      * (parse, canonical dedup/conflict, read-only line checks) with zero JDI
      * mutation, then every fresh break arms. Exact canonical duplicates are
      * idempotent (added empty); the same line with a different condition
-     * rejects the batch before anything mutates.
+     * — or any same-line logpoint — rejects the batch before anything mutates.
      */
     static String breaksAddJson(SessionState st, List<String> raws) throws Exception {
         if (st.exited) throw new BridgeException("target VM has exited — close this session");
@@ -771,6 +823,11 @@ class BridgeSession {
             }
             if (batchCond.containsKey(loc) && !condEqual(batchCond.get(loc), p.cond)) {
                 throw new BridgeException("conflicting condition for " + loc + " (same batch): " + raw);
+            }
+            for (Logpoint lp : st.cfg.logpoints) {
+                if (lp.cls.equals(p.cls) && lp.line == p.line) {
+                    throw new BridgeException("conflicting logpoint for " + loc + " (already armed as logpoint): " + raw);
+                }
             }
             batchCond.put(loc, p.cond);
             // Read-only line check for loaded classes (no JDI mutation yet).
@@ -852,6 +909,7 @@ class BridgeSession {
         } catch (NumberFormatException e) {
             throw new UsageException("bad line in --break: " + raw);
         }
+        if (line < 1) throw new UsageException("bad line in --break (must be >= 1): " + raw);
         AddedLine p = new AddedLine();
         p.raw = raw;
         p.cls = cls;
@@ -904,8 +962,12 @@ class BridgeSession {
                     hitsOf(st, "exc|" + f));
         }
         for (Logpoint lp : cfg.logpoints) {
-            first = breakRec(sb, first, lp.cls + ":" + lp.line, "logpoint", "armed", lp.template,
-                    hitsOf(st, "logpoint|" + lp.cls + "|" + lp.line));
+            if (isShadowed(cfg, lp)) {
+                first = breakRec(sb, first, lp.cls + ":" + lp.line, "logpoint", "shadowed", shadowDetail(lp), 0);
+            } else {
+                first = breakRec(sb, first, lp.cls + ":" + lp.line, "logpoint", "armed", lp.template,
+                        hitsOf(st, "logpoint|" + lp.cls + "|" + lp.line));
+            }
         }
         for (Watchpoint w : cfg.watchpoints) {
             String mode = w.onRead && w.onWrite ? "read,write" : (w.onRead ? "read" : "write");
@@ -994,14 +1056,38 @@ class BridgeSession {
     }
 
     static void appendSessionLog(SessionState st, Path dir, String line) {
-        if (st.logCount >= BridgeEval.MAX_LOG_LINES) {
-            if (st.logCount == BridgeEval.MAX_LOG_LINES) {
-                BridgeProto.appendFile(dir.resolve("logs.jsonl"), "[log cap reached: " + BridgeEval.MAX_LOG_LINES + " lines]");
-                st.logCount++;
-            }
+        if (line == null) return;
+        // One physical line per entry (like the other bridges): multi-line
+        // values would otherwise shatter logs.jsonl structure and break the
+        // <= MAX physical-lines bound below.
+        String flat = line.replace("\r\n", "\u23ce").replace('\n', '\u23ce').replace('\r', '\u23ce');
+        appendSessionLogParts(st, dir, java.util.Collections.singletonList(flat));
+    }
+
+    /** Ring-kept logs: logs.jsonl holds the latest MAX_LOG_LINES physical
+     *  lines; older lines are evicted (counted in st.logDropped, surfaced by
+     *  `logs`) instead of freezing on stale output. Bounded rewrite of a
+     *  <=2000-line file (published atomically); plain appends stay
+     *  append-only. */
+    static void appendSessionLogParts(SessionState st, Path dir, java.util.List<String> parts) {
+        if (parts.isEmpty()) return;
+        Path file = dir.resolve("logs.jsonl");
+        if (st.logCount + parts.size() <= BridgeEval.MAX_LOG_LINES) {
+            for (String l : parts) BridgeProto.appendFile(file, l);
+            st.logCount += parts.size();
             return;
         }
-        BridgeProto.appendFile(dir.resolve("logs.jsonl"), line);
-        st.logCount++;
+        java.util.List<String> kept = new java.util.ArrayList<>();
+        try {
+            kept.addAll(java.nio.file.Files.readAllLines(file, StandardCharsets.UTF_8));
+        } catch (Exception ignored) {}
+        kept.addAll(parts);
+        int evicted = kept.size() - BridgeEval.MAX_LOG_LINES;
+        java.util.List<String> tail = kept.subList(Math.max(0, evicted), kept.size());
+        if (evicted > 0) st.logDropped += evicted;
+        StringBuilder sb = new StringBuilder();
+        for (String l : tail) sb.append(l).append('\n');
+        BridgeProto.writeFile(file, sb.toString());
+        st.logCount = tail.size();
     }
 }

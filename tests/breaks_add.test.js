@@ -33,6 +33,15 @@ function tmpdir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
+// Resolver fail-fasts on missing files (Python parity), so every node spec
+// below points at a real file.
+function writeJs(dir, name = 'm1_add.js', lines = 12) {
+  const file = path.join(dir, name);
+  fs.writeFileSync(file,
+    Array.from({ length: lines }, (_, i) => `const v${i} = ${i};`).join('\n') + '\n');
+  return file;
+}
+
 function nodeSession(dir, over = {}) {
   const st = new node.Session({
     kind: 'attach', dir, host: 'localhost', port: 9229, srcs: [],
@@ -84,7 +93,7 @@ test('node: success echoes raw verbatim and bounds CDP to 5s', async () => {
       return { breakpointId: 'b1', locations: [{ lineNumber: 2 }] };
     },
   };
-  const raw = `${dir}/m1_add.js:3`;
+  const raw = `${writeJs(dir)}:3`;
   const resp = await st.cmdBreaksAdd({ breaks: [raw] });
   assert.equal(seenTimeout, 5000);
   assert.equal(resp.ok, true);
@@ -98,7 +107,9 @@ test('node: success echoes raw verbatim and bounds CDP to 5s', async () => {
 
 test('node: duplicate is idempotent, diff-cond and logpoint lines conflict', async () => {
   const dir = tmpdir('m2-node-');
-  const file = `${dir}/m1_add.js`;
+  // Canonical: startup paths are realpath'd by the resolver, so cfg-built
+  // paths must be too (/var -> /private/var on macOS).
+  const file = fs.realpathSync(writeJs(dir));
   const st = nodeSession(dir, { logpoints: [{ path: file, line: 9, template: 't={t}' }] });
   let calls = 0;
   st.cdp = {
@@ -122,7 +133,7 @@ test('node: duplicate is idempotent, diff-cond and logpoint lines conflict', asy
 
 test('node: slid and pending states mirror arm-time reporting', async () => {
   const dir = tmpdir('m2-node-');
-  const file = `${dir}/m1_add.js`;
+  const file = writeJs(dir);
   const st = nodeSession(dir);
   st.cdp = {
     request: async (method, params) => {
@@ -139,7 +150,7 @@ test('node: slid and pending states mirror arm-time reporting', async () => {
 
 test('node: CDP failure is partial-ok with warning, total failure errors', async () => {
   const dir = tmpdir('m2-node-');
-  const file = `${dir}/m1_add.js`;
+  const file = writeJs(dir);
   const st = nodeSession(dir);
   let n = 0;
   st.cdp = {

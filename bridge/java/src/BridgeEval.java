@@ -4,6 +4,7 @@ import com.sun.jdi.Field;
 import com.sun.jdi.LocalVariable;
 import com.sun.jdi.Location;
 import com.sun.jdi.ObjectReference;
+import com.sun.jdi.ReferenceType;
 import com.sun.jdi.StackFrame;
 import com.sun.jdi.StringReference;
 import com.sun.jdi.ThreadReference;
@@ -40,16 +41,33 @@ class BridgeEval {
         try {
             List<StackFrame> frames = BridgeSnapshot.safeFrames(thread);
             if (frames.isEmpty()) return false;
+            // Same outside-string scan as validation: exactly one operator
+            // (validated at arm time; anything else is a silent false here).
             String[] ops = {"==", "!=", ">=", "<=", ">", "<"};
             String op = null;
             int at = -1;
-            for (String o : ops) {
-                at = cond.indexOf(o);
-                if (at >= 0) { op = o; break; }
+            int oplen = 0;
+            boolean inStr = false;
+            outer:
+            for (int i = 0; i < cond.length(); i++) {
+                char c = cond.charAt(i);
+                if (c == '"' && (i == 0 || cond.charAt(i - 1) != '\\')) { inStr = !inStr; continue; }
+                if (inStr) continue;
+                for (String o : ops) {
+                    if (cond.startsWith(o, i)) {
+                        if (op != null) return false; // second operator: malformed
+                        op = o;
+                        at = i;
+                        oplen = o.length();
+                        i += o.length() - 1;
+                        continue outer;
+                    }
+                }
             }
             if (op == null) return false;
             String left = cond.substring(0, at).trim();
-            String right = cond.substring(at + op.length()).trim();
+            String right = cond.substring(at + oplen).trim();
+            if (left.isEmpty() || right.isEmpty()) return false;
             Value lv = resolvePath(thread, frames.get(0), left, COND_CALLS);
             return compareValues(lv, op, right);
         } catch (Exception e) {
@@ -129,6 +147,10 @@ class BridgeEval {
         int line = -1;
         try { cls = loc.declaringType().name(); } catch (Exception ignored) {}
         try { line = loc.lineNumber(); } catch (Exception ignored) {}
+        // Shadowed logpoints (same line as a real break) never fire: the
+        // break owns the line, so one pass yields one hit and zero logs.
+        List<Integer> breaks = cfg.breakpoints.get(cls);
+        if (breaks != null && breaks.contains(line)) return new ArrayList<>();
         List<String> out = new ArrayList<>();
         for (Logpoint lp : cfg.logpoints) {
             if (lp.cls.equals(cls) && lp.line == line) out.add(lp.template);
@@ -448,6 +470,19 @@ class BridgeEval {
             Value v = fieldValue(thiz, name);
             if (v != null || hasField(thiz, name)) return v;
         }
+        // Static fallback: after locals/this miss, read a static field off
+        // the frame's declaring type (instance precedence preserved above).
+        try {
+            ReferenceType decl = frame.location().declaringType();
+            Field sf = decl.fieldByName(name);
+            if (sf != null && sf.isStatic()) {
+                try {
+                    return decl.getValue(sf);
+                } catch (Exception ignored) {
+                    // fall through to the unknown-name error below
+                }
+            }
+        } catch (Exception ignored) {}
         StringBuilder known = new StringBuilder();
         try {
             for (LocalVariable v : frame.visibleVariables()) {

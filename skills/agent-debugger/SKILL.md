@@ -55,14 +55,16 @@ agent-debugger --session cart context  # where it is parked (if stopped)
 - Stops that fire while no continue/step is waiting PARK visibly (all
   four bridges, within a second or two): `status` flips to `stopped:true`
   with the fresh `lastStop`, and `context`/`eval`/`step` work from the
-  parked stop. You never need a blind `continue` to discover a stop —
-  but note a parked stop still holds its target (a parked HTTP handler
-  keeps its connection open until you continue).
+   parked stop. You never need a blind `continue` to discover a stop —
+   but note a parked stop still holds its target (a parked HTTP handler
+   keeps its connection open until you continue). A parked stop is stable:
+   other threads hitting breakpoints count `hits` without moving the park.
 - `breaks` lists every armed stop with its plant state: `verified`,
   `pending` (class/script not loaded yet — normal for deferred code),
   `slid` (runtime moved it, `detail` names the real line),
-  `shadowed` (logpoint killed by a same-line break), `armed` (no receipt
-  available: exc/watch/exit/method), `rejected`. `detail` carries the
+   `shadowed` (logpoint killed by a same-line break), `armed` (no receipt
+   available: exc/watch/exit — Python `method:` reports the adapter's own
+   `verified`/`pending` receipt instead), `rejected`. `detail` carries the
   logpoint template / slide target / pending reason.
 - `breaks` also reports `hits`: times the stop fired. Step landings
   never count (Python/Java exclude them structurally; Node/browser count
@@ -75,8 +77,8 @@ agent-debugger --session cart context  # where it is parked (if stopped)
   live session, running or parked (line breaks with `|cond` allowed;
   method:/exc:/logpoint/watch/exit are rejected). Only confirmed additions
   persist to `stops.json`, so `status`/`breaks`/intent reconverge on their
-  own. Duplicates are idempotent; a same-line different-condition (or a
-  same-line logpoint on Node/browser) rejects the whole batch atomically.
+   own. Duplicates are idempotent; a same-line different-condition (or a
+   same-line logpoint on Java/Node/browser) rejects the whole batch atomically.
   Never add while a `continue`/`step`/`reload` is still outstanding — the
   command queues behind it, so park (or stay idle-running) first.
 - Delayed recipe: Java/Python/Node `attach --break` first waits up to
@@ -143,7 +145,10 @@ iterations cost zero LLM roundtrips.
   `{holes}` in logpoints are paths only, but CONDITIONS allow read-only
   calls (`size length isEmpty get`) — a mutating call evaluated on every
   loop hit would corrupt state, so the bridge rejects anything else at
-  parse time.
+  parse time. Malformed conditions (empty sides, multiple operators, bad
+  paths) and `line < 1` fail fast at startup; setup failures (bad main /
+  classpath) quote bounded target stderr, and a failed setup never leaks
+  its target VM (the name stays reusable).
 - Python: FULL Python expressions (`order.price > 1000`) — no allowlist,
   debugpy compiles them server-side.
 - Node: FULL JS expressions — but frame-LOCALS only. A condition over a
@@ -158,7 +163,9 @@ iterations cost zero LLM roundtrips.
 ## Finding Data
 
 - `eval "a.b[2].c"`, `items[0]` (List sugar), `orders.size()`, literals OK.
-  `this` works; statics via `ClassName.field` do not (yet).
+  `this` works; bare static field names resolve off the frame's declaring
+  type (locals and instance fields still win); `ClassName.field` qualified
+  form does not (yet).
 - `eval "refs(order, 2)"` walks the heap upward: who holds this object
   (Java: 50 refs/node, depth ≤ 4. Python: direct holders only, depth 1.
   Node: unsupported — no gc walk via CDP). Heap references only — a purely
@@ -221,6 +228,18 @@ iterations cost zero LLM roundtrips.
 - After editing source, recompile BEFORE the next session, otherwise the
   snippet (fresh file) and line numbers (old bytecode) disagree.
 
+## Logs & Crash Evidence
+
+- `logs` keeps the latest 2000 lines per session (ring): `total` = retained
+  lines on disk (≤2000), `dropped` = lifetime lines evicted, `truncated` =
+  true when the tail was cut OR any line was ever evicted. New output never
+  freezes on stale history — old lines age out.
+- Any setup crash on any bridge writes `error.json` with a sanitized
+  `internal:` cause (exception class + short stack, ~2KB, no env) and the
+  CLI surfaces it; failed starts are removed wholesale so the name stays
+  reusable. `session.json` itself is published atomically — concurrent
+  `status` never reads a torn file.
+
 ## Python Notes (debugpy)
 
 - `py start app.py -- args` launches via an isolated venv (auto-created,
@@ -237,12 +256,13 @@ iterations cost zero LLM roundtrips.
   to where you run (e.g. `src/tests/.../test_x.py:378`). Otherwise an
   explicit `--src <root>` locates it: nested relatives join onto each root,
   a bare basename (`test_x.py:378`) is searched only beneath explicit
-  `--src` roots and must match exactly one file. Zero/ambiguous matches
+  `--src` roots and must match exactly one file. Zero/ambiguous matches,
+  like lines past EOF (`no such line` names the spec and the file's total),
   fail fast before the target runs; a `target exited` with no stop plus an
-  `unresolved breakpoints` note means the line never bound (wrong file or
-  non-executable line — stdlib excluded by justMyCode never binds), not a
-  lost session. `breaks` shows the plant state (`pending` + detail names
-  why). `breaks add` resolves the same way against the live `--src` roots.
+  `unresolved breakpoints` note means the line never bound (wrong file,
+  non-executable line, or an unfired slide — stdlib excluded by justMyCode
+  never binds), not a lost session. `breaks` shows the plant state
+  (`pending`/`slid` + detail names why / the real line). `breaks add` resolves the same way against the live `--src` roots.
 - `eval` runs real Python (comprehensions OK). `method:` = function name,
   bare `exc` = any uncaught exception. `--watch/--exit` do NOT exist for
   Python (no debugpy equivalent) and fail fast — don't try them.
@@ -262,7 +282,15 @@ iterations cost zero LLM roundtrips.
   bare `exc` = any uncaught exception with its class in `stopInfo`.
   `method:`/`--watch`/`--exit` do NOT exist for Node and fail fast.
 - `node:` internal frames are filtered (justMyCode spirit); block scopes
-  (`for (let i...)`) and closures merge into frame locals, innermost wins.
+  (`for (let i...)`), catch bindings, script-level lets, and closures merge
+  into frame locals, innermost wins.
+- Path semantics match Python: an existing file from your cwd wins; otherwise
+  an explicit `--src <root>` locates it (nested relatives join onto each
+  root, a bare basename is searched only beneath explicit roots and must
+  match exactly one file). Zero/ambiguous matches fail fast before the target
+  runs. Startup repeats of the exact same `file:line[|cond]` collapse to one;
+  the same line with a different condition — or any same-line logpoint (one
+  V8 breakpoint per line wins) — fails fast instead of shadowing.
 - An attached inspector keeps the target process alive after its script
   ends: `threads` then reports "target VM has exited" (signal, like the
   other adapters) while `logs` keeps serving — `close` reaps the process.
@@ -291,7 +319,8 @@ iterations cost zero LLM roundtrips.
   `reload` with nothing armed just refreshes (`{reloaded: true}`).
 - `logs` serves page `console.*` (captured via CDP, no pipes); snippets come
   from the tab via `getScriptSource` (no disk access). Snippet/step shapes
-  match the other adapters. `--src` is accepted but unused for browser
+  match the other adapters. Frame locals merge block/catch/script/closure
+  scopes like Node, innermost wins. `--src` is accepted but unused for browser
   (no URL-to-local mapping yet).
 - Tabs don't exit like processes: script end is invisible, so a bare
   continue-to-end burns its timeout (pass a short one). Dead browser / closed

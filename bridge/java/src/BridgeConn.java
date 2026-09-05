@@ -23,7 +23,7 @@ class BridgeConn {
     static void attach(Config cfg) throws Exception {
         VirtualMachine vm = attachVm(cfg);
         try {
-            driveToSnapshot(vm, cfg, null);
+            driveToSnapshot(vm, cfg, null, null);
         } finally {
             try { vm.dispose(); } catch (Exception ignored) {}
         }
@@ -52,7 +52,7 @@ class BridgeConn {
         if (cfg.mainClass == null) throw new UsageException("launch needs --main");
         Launched l = launchVm(cfg);
         try {
-            driveToSnapshot(l.vm, cfg, l.out);
+            driveToSnapshot(l.vm, cfg, l.out, l.err);
         } finally {
             try { l.vm.exit(0); } catch (Exception ignored) {}
         }
@@ -87,6 +87,7 @@ class BridgeConn {
         Launched l = new Launched();
         l.vm = vm;
         l.out = out;
+        l.err = err;
         return l;
     }
 
@@ -99,7 +100,7 @@ class BridgeConn {
 
     // ---- event loop ----
 
-    static void driveToSnapshot(VirtualMachine vm, Config cfg, StreamGobbler out) throws Exception {
+    static void driveToSnapshot(VirtualMachine vm, Config cfg, StreamGobbler out, StreamGobbler err) throws Exception {
         BridgeSession.armBreakpoints(vm, cfg);
         List<String> logs = new ArrayList<>();
         java.util.Set<String> planted = new java.util.HashSet<>();
@@ -130,7 +131,7 @@ class BridgeConn {
                     if (!BridgeSession.hasStoppingBreak(cfg, bp.location())) continue;
                     String cond = BridgeEval.lookupCond(cfg, bp.location());
                     if (cond != null && !BridgeEval.checkCond(bp.thread(), bp.location(), cond)) continue;
-                    System.out.println("{\"snapshot\":" + BridgeSnapshot.snapshot(vm, cfg, bp.thread(), bp.location(), out)
+                    System.out.println("{\"snapshot\":" + BridgeSnapshot.snapshot(vm, cfg, bp.thread(), bp.location(), out, err)
                             + ",\"logs\":" + BridgeSession.toJsonArray(logs) + ",\"stopInfo\":null}");
                     done = true;
                 } else if (event instanceof ClassPrepareEvent) {
@@ -149,32 +150,33 @@ class BridgeConn {
                     String cond = BridgeEval.lookupCond(cfg, ee.location());
                     if (cond != null && !BridgeEval.checkCond(ee.thread(), ee.location(), cond)) continue;
                     stopInfo = BridgeEval.exceptionInfo(ee);
-                    System.out.println("{\"snapshot\":" + BridgeSnapshot.snapshot(vm, cfg, ee.thread(), ee.location(), out)
+                    System.out.println("{\"snapshot\":" + BridgeSnapshot.snapshot(vm, cfg, ee.thread(), ee.location(), out, err)
                             + ",\"logs\":" + BridgeSession.toJsonArray(logs) + ",\"stopInfo\":" + stopInfo + "}");
                     done = true;
                 } else if (event instanceof com.sun.jdi.event.ModificationWatchpointEvent) {
                     com.sun.jdi.event.ModificationWatchpointEvent we =
                             (com.sun.jdi.event.ModificationWatchpointEvent) event;
                     stopInfo = BridgeEval.watchInfo(we.field(), "write", we.valueToBe());
-                    System.out.println("{\"snapshot\":" + BridgeSnapshot.snapshot(vm, cfg, we.thread(), we.location(), out)
+                    System.out.println("{\"snapshot\":" + BridgeSnapshot.snapshot(vm, cfg, we.thread(), we.location(), out, err)
                             + ",\"logs\":" + BridgeSession.toJsonArray(logs) + ",\"stopInfo\":" + stopInfo + "}");
                     done = true;
                 } else if (event instanceof com.sun.jdi.event.AccessWatchpointEvent) {
                     com.sun.jdi.event.AccessWatchpointEvent we =
                             (com.sun.jdi.event.AccessWatchpointEvent) event;
                     stopInfo = BridgeEval.watchInfo(we.field(), "read", we.valueCurrent());
-                    System.out.println("{\"snapshot\":" + BridgeSnapshot.snapshot(vm, cfg, we.thread(), we.location(), out)
+                    System.out.println("{\"snapshot\":" + BridgeSnapshot.snapshot(vm, cfg, we.thread(), we.location(), out, err)
                             + ",\"logs\":" + BridgeSession.toJsonArray(logs) + ",\"stopInfo\":" + stopInfo + "}");
                     done = true;
                 } else if (event instanceof com.sun.jdi.event.MethodExitEvent) {
                     com.sun.jdi.event.MethodExitEvent me = (com.sun.jdi.event.MethodExitEvent) event;
                     if (!BridgeEval.wantedExit(cfg, me)) continue;
                     stopInfo = BridgeEval.exitInfo(me);
-                    System.out.println("{\"snapshot\":" + BridgeSnapshot.snapshot(vm, cfg, me.thread(), me.location(), out)
+                    System.out.println("{\"snapshot\":" + BridgeSnapshot.snapshot(vm, cfg, me.thread(), me.location(), out, err)
                             + ",\"logs\":" + BridgeSession.toJsonArray(logs) + ",\"stopInfo\":" + stopInfo + "}");
                     done = true;
                 } else if (event instanceof VMDeathEvent || event instanceof VMDisconnectEvent) {
-                    throw new BridgeException("target VM exited before any breakpoint hit");
+                    throw new BridgeException("target VM exited before any breakpoint hit"
+                            + BridgeSnapshot.targetOutputSuffix(out, err));
                 }
             }
             // Resume unless we just snapshotted (threads stay suspended for a coherent read above).

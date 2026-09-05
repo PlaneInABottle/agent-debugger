@@ -28,13 +28,15 @@ pub fn request(port: u16, body: &Value, timeout: Duration) -> anyhow::Result<Val
     let mut tmp = [0u8; 65536];
     loop {
         dap::validate_frame_size(&buf, MAX_FRAME_BYTES)?;
-        if let Some((value, _)) = dap::try_decode_message(&buf) {
+        // Corrupt-but-complete JSON errors here at once (no timeout wait);
+        // incomplete frames fall through to read more bytes.
+        if let Some((value, _)) = dap::try_decode_message(&buf)? {
             return Ok(value);
         }
         match sock.read(&mut tmp) {
             Ok(0) => {
                 // EOF: try once more, then fail.
-                if let Some((value, _)) = dap::try_decode_message(&buf) {
+                if let Some((value, _)) = dap::try_decode_message(&buf)? {
                     return Ok(value);
                 }
                 anyhow::bail!("debug session closed the connection mid-response");

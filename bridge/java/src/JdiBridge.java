@@ -97,6 +97,25 @@ public class JdiBridge {
         return e.getClass().getSimpleName() + ": " + m;
     }
 
+    /** Sanitized unexpected-crash text: class + message + a few stack
+     *  frames, capped ~2KB. No env, no heap — only the failure itself.
+     *  Known Usage/BridgeException messages bypass this (exact text). */
+    static String sanitizeUnexpected(Throwable t) {
+        String head = t.getClass().getSimpleName()
+                + (t.getMessage() == null ? "" : ": " + t.getMessage());
+        StringBuilder sb = new StringBuilder("internal: ").append(head);
+        try {
+            StackTraceElement[] frames = t.getStackTrace();
+            for (int i = 0; i < Math.min(6, frames.length); i++) {
+                sb.append("\n    at ").append(frames[i].toString());
+                if (sb.length() > 2048) break;
+            }
+        } catch (Exception ignored) {}
+        String s = sb.toString();
+        if (s.length() > 2048) s = s.substring(0, 2047) + "…";
+        return s;
+    }
+
     static void kv(StringBuilder sb, String key, String val, boolean comma) {
         sb.append(quote(key)).append(':').append(quote(val));
     }

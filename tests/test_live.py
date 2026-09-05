@@ -752,6 +752,575 @@ class LiveTests(unittest.TestCase):
         self.assertTrue(self.cli(name, "close")["confirmed"])
         self.sessions.remove(name)
 
+    def _ensure_py_line_fixtures(self):
+        """Line-slide layout: a comment on line 2 (debugpy slides it onto
+        nearby executable code) plus a second file for wrong-file specs."""
+        if hasattr(self, "py_slide"):
+            return
+        self.py_slide = self.fixture / "py_slide.py"
+        self.py_slide.write_text(
+            "import time\n# just a comment\nvalue = 1\n"
+            "print(value, flush=True)\ntime.sleep(20)\n")
+        self.py_other = self.fixture / "py_other.py"
+        self.py_other.write_text("a = 1\nb = 2\nprint(a + b, flush=True)\n")
+
+    def test_13_py_invalid_line_fail_fast(self):
+        """Existing file, line past EOF (same-file and wrong-file 99999):
+        fails before the target runs — `no such line` naming the spec,
+        never a bare `target exited`."""
+        self._ensure_py_line_fixtures()
+        cases = [("py-bad-same", str(self.py_slide), f"{self.py_slide}:99999"),
+                 ("py-bad-other", str(self.py_slide), f"{self.py_other}:99999"),
+                 ("py-bad-zero", str(self.py_slide), f"{self.py_slide}:0")]
+        for name, program, spec in cases:
+            started = time.monotonic()
+            data = self.cli(name, "py", "start", program,
+                            "--break", spec, "--timeout", "10", ok=False)
+            self.assertFalse(data["ok"])
+            err = data["error"]
+            self.assertIn("no such line", err)
+            self.assertIn(spec.rsplit(":", 1)[1], err)
+            self.assertNotIn("target exited", err)
+            self.assertLess(time.monotonic() - started, 15)
+            self._assert_absent(name)
+
+    def test_14_py_comment_slide_reports_slid_and_hits(self):
+        """In-range comment line: DAP slides onto nearby executable code —
+        `breaks` reports state slid with the real line, the stop lands
+        there, and hits count the bound line."""
+        self._ensure_py_line_fixtures()
+        name = "py-slide"
+        self.sessions.add(name)
+        data = self.cli(name, "py", "start", str(self.py_slide),
+                        "--break", f"{self.py_slide}:2", "--timeout", "15")
+        line = data["location"]["line"]
+        self.assertNotEqual(line, 2)
+        stops = self.cli(name, "breaks")["stops"]
+        self.assertEqual(len(stops), 1)
+        self.assertEqual(stops[0]["state"], "slid")
+        self.assertIn(f"slid to line {line}", stops[0]["detail"])
+        self.assertGreaterEqual(stops[0]["hits"], 1)
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+
+    def test_15_py_valid_unreached_plain_timeout_or_running(self):
+        """Valid exact line, never reached: launch keeps its plain timeout
+        (no invalid-line hint, no unresolved note); attach stays running
+        with the stop armed."""
+        gate = self.fixture / "m1go-line15"
+        try:
+            gate.unlink()
+        except OSError:
+            pass
+        target = self.fixture / "py_gated15.py"
+        target.write_text(
+            "import pathlib\nimport time\n"
+            f"GATE = pathlib.Path({str(gate)!r})\nwhile not GATE.exists():\n"
+            "    time.sleep(0.05)\nvalue = 1\nprint(value, flush=True)\n")
+        data = self.cli("py-gated15", "py", "start", str(target),
+                        "--break", f"{target}:6", "--timeout", "2", ok=False)
+        self.assertFalse(data["ok"])
+        self.assertIn("timeout", data["error"])
+        self.assertNotIn("no such line", data["error"])
+        self.assertNotIn("unresolved breakpoints", data["error"])
+        self._assert_absent("py-gated15")
+        self._ensure_py_path_fixtures()
+        port = free_port()
+        self._launch_target(
+            [str(VENV_PY), "-Xfrozen_modules=off", "-m", "debugpy",
+             "--listen", f"127.0.0.1:{port}", str(self.py_pending_idle)],
+            "py-armed-idle")
+        self._wait_log("py-armed-idle", "ready")
+        time.sleep(1)
+        name = "py-armed-attach"
+        self.sessions.add(name)
+        data = self.cli(name, "py", "attach", "--port", str(port),
+                        "--break", f"{self.py_pending_idle}:2",
+                        "--timeout", "2")
+        self.assertTrue(data["running"])
+        stops = self.cli(name, "breaks")["stops"]
+        self.assertEqual(len(stops), 1)
+        self.assertEqual(stops[0]["hits"], 0)
+        self.assertIn(stops[0]["state"], ("verified", "pending"))
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+
+    def test_16_py_cothread_costop_stable_and_sequential(self):
+        """P5: barrier-synced threads hit one shared line ~simultaneously.
+        Whoever parks first stays parked while the other's hit still counts
+        (no phantom re-park, no stale `stack unavailable`); a gated second
+        round proves post-barrier genuine stops still park."""
+        gate = self.fixture / "m1go-co"
+        try:
+            gate.unlink()
+        except OSError:
+            pass
+        target = self.fixture / "py_cothread.py"
+        src = [
+            "import pathlib\n",
+            "import threading\n",
+            "import time\n",
+            f"GATE = pathlib.Path({str(gate)!r})\n",
+            "B = threading.Barrier(2)\n",
+            'print("ready", flush=True)\n',
+            "def w(name):\n",
+            "    for _ in range(2):\n",
+            "        B.wait()\n",
+            "        tick = 1\n",
+            '        print(name, tick, flush=True)\n',
+            "        while not GATE.exists():\n",
+            "            time.sleep(0.01)\n",
+            "        tick = 2\n",
+            '        print(name, tick, flush=True)\n',
+            "    time.sleep(30)\n",
+            "ta = threading.Thread(target=w, args=(\"a\",))\n",
+            "tb = threading.Thread(target=w, args=(\"b\",))\n",
+            "ta.start()\n",
+            "tb.start()\n",
+            "ta.join()\n",
+            "tb.join()\n",
+            'print("done", flush=True)\n',
+        ]
+        target.write_text("".join(src))
+        line_x = src.index("        tick = 1\n") + 1
+        line_y = src.index("        tick = 2\n") + 1
+
+        def hits(sess):
+            stops = self.cli(sess, "breaks")["stops"]
+            return {s["spec"].rsplit(":", 1)[-1]: s["hits"] for s in stops}
+
+        def parked_tid(sess):
+            ctx = self.cli(sess, "context")
+            cur = [t["id"] for t in ctx["threads"] if t.get("current")]
+            return (cur[0] if cur else None), ctx["location"]
+
+        def await_hits(sess, line, want, budget=20):
+            # Either shape converges: a queued co-stop is consumed by the
+            # serve loop between commands, while a partner frozen pre-line
+            # is released by a resume into a genuine post-barrier park.
+            deadline = time.monotonic() + budget
+            while time.monotonic() < deadline:
+                if hits(sess).get(str(line), 0) >= want:
+                    return
+                self.cli(sess, "continue", "--timeout", "4", ok=False)
+                time.sleep(0.1)
+            self.fail(f"line {line} never reached {want} hits: "
+                      f"{hits(sess)}")
+
+        name = "py-cothread"
+        self.sessions.add(name)
+        data = self.cli(name, "py", "start", str(target),
+                        "--break", f"{target}:{line_x}",
+                        "--break", f"{target}:{line_y}", "--timeout", "15")
+        self.assertEqual(data["location"]["line"], line_x)
+        await_hits(name, line_x, 2)
+        # Stability: extra commands pump the serve loop (the old flip path)
+        # yet the first park must not move, with exactly one hit per thread.
+        tid_first, _ = parked_tid(name)
+        self.assertIsNotNone(tid_first)
+        self.assertIn("threads", self.cli(name, "threads"))
+        tid_still, loc = parked_tid(name)
+        self.assertEqual(tid_still, tid_first)
+        self.assertEqual(loc["line"], line_x)
+        h = hits(name)
+        self.assertEqual(h.get(str(line_x)), 2)
+        # Nothing ahead (both gate-waiting): a plain timeout — never a
+        # phantom re-park or "stack is unavailable".
+        err = self.cli(name, "continue", "--timeout", "3", ok=False)["error"]
+        self.assertIn("timeout", err)
+        self.assertNotIn("unavailable", err)
+        # Sequential genuine stop: the gated round parks after the barrier.
+        gate.touch()
+        self._wait_stopped(name, True)
+        _, loc_b = parked_tid(name)
+        self.assertEqual(loc_b["line"], line_y)
+        self.assertEqual(loc_b["method"], "w")
+        await_hits(name, line_y, 2)
+        h = hits(name)
+        self.assertEqual(h.get(str(line_y)), 2)
+        self.assertEqual(h.get(str(line_x)), 2)
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+
+    def _ensure_m2_java_fixtures(self):
+        """M2 java fixtures: a static-field loop target (COUNT + same-line
+        break/logpoint truth) and a long-running arm-failure target."""
+        if hasattr(self, "m2_same"):
+            return
+        self.m2_same = self.fixture / "M2Same.java"
+        self.m2_same.write_text(
+            "public class M2Same {\n"
+            "  static int COUNT = 42;\n"
+            "  public static void main(String[] args) throws Exception {\n"
+            "    for (int i = 0; i < 30; i++) {\n"
+            "      int value = i + 1;\n"
+            "      System.out.println(value);\n"
+            "      Thread.sleep(100);\n"
+            "    }\n  }\n}\n")
+        self.m2_leak = self.fixture / "M2Leak.java"
+        self.m2_leak.write_text(
+            "public class M2Leak {\n"
+            "  public static void main(String[] args) throws Exception {\n"
+            "    for (int i = 0; i < 6000; i++) {\n"
+            "      int value = i;\n"
+            "      System.out.println(value);\n"
+            "      Thread.sleep(50);\n"
+            "    }\n  }\n}\n")
+        subprocess.run(["javac", "-g", "-d", str(self.fixture),
+                        str(self.m2_same), str(self.m2_leak)],
+                       check=True, timeout=30)
+
+    def _java_procs(self, marker):
+        out = subprocess.run(["ps", "aux"], capture_output=True, text=True,
+                             timeout=10).stdout
+        return [l for l in out.splitlines()
+                if marker in l and "grep" not in l]
+
+    def test_17_m2_java_setup_and_validation(self):
+        """M2: bad main/cp error quotes target stderr; bad method arm
+        leaves no target process and the name is reusable; malformed
+        conds (`x ==`, multi-op) and line 0 fail fast."""
+        self._ensure_m2_java_fixtures()
+        data = self.cli("m2-badmain", "java", "start", "--main", "M2NoSuch",
+                        "--cp", str(self.fixture), "--break", "M2Same:6",
+                        "--timeout", "8", ok=False)
+        self.assertFalse(data["ok"])
+        self.assertIn("target output", data["error"])
+        self.assertIn("M2NoSuch", data["error"])
+        self._assert_absent("m2-badmain")
+        data = self.cli("m2-leak", "java", "start", "--main", "M2Leak",
+                        "--cp", str(self.fixture),
+                        "--break", "method:M2Leak.noSuch", "--timeout", "8",
+                        ok=False)
+        self.assertFalse(data["ok"])
+        self.assertIn("no method", data["error"])
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and self._java_procs("M2Leak"):
+            time.sleep(0.2)
+        self.assertEqual(self._java_procs("M2Leak"), [])
+        self._assert_absent("m2-leak")
+        name = "m2-leak"
+        self.sessions.add(name)
+        data = self.cli(name, "java", "start", "--main", "M2Leak",
+                        "--cp", str(self.fixture), "--break", "M2Leak:5",
+                        "--timeout", "10")
+        self.assertEqual(data["location"]["line"], 5)
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+        for spec, hint in [("M2Same:6|x ==", "condition"),
+                           ("M2Same:6|i > 0 == true", "condition"),
+                           ("M2Same:6|== 5", "condition")]:
+            data = self.cli("m2-badcond", "java", "start", "--main", "M2Same",
+                            "--cp", str(self.fixture), "--break", spec,
+                            "--timeout", "5", ok=False)
+            self.assertFalse(data["ok"])
+            self.assertIn(hint, data["error"])
+            self.assertNotIn("target exited", data["error"])
+            self._assert_absent("m2-badcond")
+        data = self.cli("m2-badline", "java", "start", "--main", "M2Same",
+                        "--cp", str(self.fixture), "--break", "M2Same:0",
+                        "--timeout", "5", ok=False)
+        self.assertFalse(data["ok"])
+        self.assertIn("bad line", data["error"])
+        self._assert_absent("m2-badline")
+
+    def test_18_m2_java_static_and_sameline(self):
+        """M2: static COUNT evals; same-line break+logpoint plants one JDI
+        request (break verified, logpoint shadowed, one hit per pass, zero
+        logs); live `breaks add` on a logpoint line rejects atomically."""
+        self._ensure_m2_java_fixtures()
+        name = "m2-sameline"
+        self.sessions.add(name)
+        data = self.cli(name, "java", "start", "--main", "M2Same",
+                        "--cp", str(self.fixture), "--break", "M2Same:6",
+                        "--logpoint", "M2Same:6:hit={value}", "--timeout", "10")
+        self.assertEqual(data["location"]["line"], 6)
+        stops = {s["kind"]: s for s in self.cli(name, "breaks")["stops"]}
+        self.assertEqual(stops["break"]["state"], "verified")
+        self.assertEqual(stops["break"]["hits"], 1)
+        self.assertEqual(stops["logpoint"]["state"], "shadowed")
+        self.assertIn("shadowed by breakpoint", stops["logpoint"]["detail"])
+        self.assertEqual(stops["logpoint"]["hits"], 0)
+        self.assertEqual(self.cli(name, "eval", "COUNT")["value"], "42")
+        resumed = self.cli(name, "continue", "--timeout", "10")
+        self.assertEqual(resumed["snapshot"]["location"]["line"], 6)
+        stops = {s["kind"]: s for s in self.cli(name, "breaks")["stops"]}
+        self.assertEqual(stops["break"]["hits"], 2)
+        self.assertEqual(stops["logpoint"]["hits"], 0)
+        self.assertEqual(self.cli(name, "logs")["total"], 0)
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+        lone = "m2-logonly"
+        self.sessions.add(lone)
+        self.cli(lone, "java", "start", "--main", "M2Same",
+                 "--cp", str(self.fixture), "--break", "M2Same:5",
+                 "--logpoint", "M2Same:6:hit={value}", "--timeout", "10")
+        stops_file = self.home / ".agent-debugger/sessions" / lone / "stops.json"
+        before = stops_file.read_bytes()
+        data = self.cli(lone, "breaks", "add", "--break", "M2Same:6", ok=False)
+        self.assertFalse(data["ok"])
+        self.assertIn("logpoint", data["error"])
+        self.assertEqual(stops_file.read_bytes(), before)
+        self.assertTrue(self.cli(lone, "close")["confirmed"])
+        self.sessions.remove(lone)
+
+    def _ensure_m3_node_fixtures(self):
+        """M3: nested basename target, catch-scope target, dup basenames."""
+        if hasattr(self, "m3_deep"):
+            return
+        if shutil.which("node") is None:
+            raise unittest.SkipTest("node unavailable")
+        sub = self.fixture / "m3src/sub"
+        sub.mkdir(parents=True, exist_ok=True)
+        self.m3_deep = sub / "deep.js"
+        self.m3_deep.write_text(
+            'const fs = require("fs");\nconsole.log("ready");\n'
+            'async function main() {\n'
+            '  for (let i = 0; i < 20000; i++) {\n    if (i === 3) {\n'
+            '      const marker = i * 2;\n      console.log("hit", marker);\n'
+            '    }\n'
+            '    await new Promise((r) => setTimeout(r, 50));\n  }\n}\nmain();\n')
+        self.m3_catch = self.fixture / "m3_catch.js"
+        self.m3_catch.write_text(
+            'function boom() {\n  try {\n    throw new Error("kaput");\n'
+            '  } catch (e) {\n    const after = 1;\n'
+            '    console.log("caught", e.message, after);\n  }\n}\nboom();\n')
+        self.m3_ts = self.fixture / "m3_app.ts"
+        self.m3_ts.write_text('const x: number = 1;\nconsole.log(x);\n')
+        for side in ("a", "b"):
+            d = self.fixture / "m3src" / side
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "dup.js").write_text('console.log("dup");\n')
+
+    def test_19_m3_node_src_resolution_and_startup_conflicts(self):
+        """M3: bare basename + --src stops; nested cwd-relative works;
+        identical startup repeats idempotent; diff-cond / same-line
+        logpoint / ambiguous / missing all fail fast with no session dir."""
+        self._ensure_m3_node_fixtures()
+        root = self.fixture / "m3src"
+        name = "m3-nodesrc"
+        self.sessions.add(name)
+        data = self.cli(name, "node", "start", str(self.m3_deep),
+                        "--src", str(root), "--break", "deep.js:6",
+                        "--timeout", "15")
+        self.assertEqual(data["location"]["line"], 6)
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+        # Nested path relative to the cwd resolves without --src.
+        name = "m3-noderel"
+        self.sessions.add(name)
+        rel = os.path.join("m3src", "sub", "deep.js")
+        data = self.cli(name, "node", "start", str(self.m3_deep),
+                        "--break", f"{rel}:6", "--timeout", "15",
+                        cwd=str(self.fixture))
+        self.assertEqual(data["location"]["line"], 6)
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+        # Identical startup repeats collapse to one armed stop.
+        name = "m3-nodedup"
+        self.sessions.add(name)
+        data = self.cli(name, "node", "start", str(self.m3_deep),
+                        "--src", str(root),
+                        "--break", "deep.js:6", "--break", "deep.js:6",
+                        "--timeout", "15")
+        self.assertEqual(data["location"]["line"], 6)
+        stops = self.cli(name, "breaks")["stops"]
+        self.assertEqual(len([s for s in stops if s["kind"] == "break"]), 1)
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+        # Conflicts fail fast before the target runs (no session dir left).
+        for args in (
+            ["--break", "deep.js:6", "--break", "deep.js:6|i > 1"],
+            ["--break", "deep.js:6", "--logpoint", "deep.js:6:t={i}"],
+            ["--break", "dup.js:1"],
+            ["--break", "ghost.js:2"],
+        ):
+            bad = self.cli("m3-nodeneg", "node", "start", str(self.m3_deep),
+                           "--src", str(root), *args, "--timeout", "10",
+                           ok=False)
+            self.assertFalse(bad["ok"])
+            self.assertTrue(
+                (("conflicting" in bad["error"]) and ("deep.js:6" in args[1]))
+                or (("ambiguous" in bad["error"]) and ("dup.js" in args[1]))
+                or (("no such file" in bad["error"]) and ("ghost" in args[1])),
+                f"{args}: {bad['error']}")
+            self.assertNotIn("target exited", bad["error"])
+            self._assert_absent("m3-nodeneg")
+
+    def test_20_m3_node_catch_scope_and_bad_node(self):
+        """M3: catch bindings surface in vars+eval; a bad --node binary
+        (js and .ts) fails cleanly naming the binary, never a bare crash."""
+        self._ensure_m3_node_fixtures()
+        name = "m3-nodecatch"
+        self.sessions.add(name)
+        data = self.cli(name, "node", "start", str(self.m3_catch),
+                        "--break", f"{self.m3_catch}:5", "--timeout", "15")
+        self.assertEqual(data["location"]["line"], 5)
+        names = {v["name"] for v in self.cli(name, "vars")["locals"]}
+        self.assertIn("e", names)
+        self.assertIn("after", names)
+        self.assertEqual(self.cli(name, "eval", "e.message")["value"], "kaput")
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+        for prog in (self.m3_catch, self.m3_ts):
+            bad = self.cli("m3-badnode", "node", "start", str(prog),
+                           "--node", "/nonexistent-node-xyz-123",
+                           "--timeout", "10", ok=False)
+            self.assertFalse(bad["ok"])
+            self.assertIn("cannot run", bad["error"])
+            self.assertIn("/nonexistent-node-xyz-123", bad["error"])
+            self._assert_absent("m3-badnode")
+
+    def _ensure_m3_step_fixture(self):
+        """M3: one-shot head (startup break + 5s sleep a step-over hangs
+        in) followed by a gated loop tail (live-added break + logpoint)."""
+        if hasattr(self, "m3_step"):
+            return
+        if shutil.which("node") is None:
+            raise unittest.SkipTest("node unavailable")
+        gate = self.fixture / "m1go-js"
+        self.m3_step = self.fixture / "m3_step.js"
+        self.m3_step.write_text(
+            'const fs = require("fs");\nconsole.log("ready");\n'
+            f'const GATE = {str(gate)!r};\nasync function main() {{\n'
+            '  const once = 1;\n'
+            '  await new Promise((r) => setTimeout(r, 5000));\n'
+            '  for (let i = 0; i < 20000; i++) {\n    const x = i;\n'
+            '    if (fs.existsSync(GATE)) {\n      console.log("hit", x);\n'
+            '    }\n'
+            '    await new Promise((r) => setTimeout(r, 50));\n  }\n}\nmain();\n')
+
+    def test_21_m3_node_step_timeout_and_continue_truth(self):
+        """M3: a step that never lands times out and clears the step flag —
+        a later logpoint-only pause still auto-resumes (proving no stuck
+        step park), the next breakpoint classifies with hits, and an
+        immediate re-stop after continue reports stopped truth."""
+        self._ensure_m3_step_fixture()
+        name = "m3-nodestep"
+        gate = self.fixture / "m1go-js"
+        try:
+            gate.unlink()
+        except OSError:
+            pass
+        self.sessions.add(name)
+        # Line 6 = one-shot 5s await; line 10 = gate-guarded logpoint.
+        data = self.cli(name, "node", "start", str(self.m3_step),
+                        "--break", f"{self.m3_step}:6",
+                        "--logpoint", f"{self.m3_step}:10:hit={{x}}",
+                        "--timeout", "15")
+        self.assertEqual(data["location"]["line"], 6)
+        gate.touch()
+        # Step over the 5s sleep with a 2s timeout: the step never lands.
+        data = self.cli(name, "step", "over", "--timeout", "2", ok=False)
+        self.assertFalse(data["ok"])
+        self.assertIn("timeout", data["error"])
+        threads = self.cli(name, "threads")
+        self.assertTrue(threads["running"])
+        # The flag did not stick: the one-shot break never fires again and
+        # logpoint pauses auto-resume, so this continue (logpoint-only
+        # ahead) burns its timeout — a stuck awaitingStep would park at
+        # line 10 and return a stop instead.
+        data = self.cli(name, "continue", "--timeout", "8", ok=False)
+        self.assertFalse(data["ok"])
+        self.assertIn("timeout", data["error"])
+        stops = {s["kind"]: s for s in self.cli(name, "breaks")["stops"]}
+        self.assertGreaterEqual(stops["logpoint"]["hits"], 1)
+        # Breakpoints still classify: add line 8, continue lands on it as a
+        # real stop (stopInfo null, hits increment, changed names x).
+        added = self.cli(name, "breaks", "add", "--break", f"{self.m3_step}:8")
+        self.assertEqual(len(added["added"]), 1)
+        resumed = self.cli(name, "continue", "--timeout", "10")
+        self.assertEqual(resumed["snapshot"]["location"]["line"], 8)
+        self.assertIsNone(resumed["stopInfo"])
+        self.assertIn("x", resumed["changed"])
+        stops = self.cli(name, "breaks")["stops"]
+        # Specs carry canonical paths (/private/... on macOS): match tails.
+        live = next(s for s in stops
+                    if s["kind"] == "break" and s["spec"].endswith("m3_step.js:8"))
+        # The loop spins every 50ms, so a park may already have landed in
+        # the add->continue gap; either way the stop classifies (hits >= 1).
+        self.assertGreaterEqual(live["hits"], 1)
+        # The one-shot head break never refired: no phantom parks anywhere.
+        head = next(s for s in stops
+                    if s["kind"] == "break" and s["spec"].endswith("m3_step.js:6"))
+        self.assertEqual(head["hits"], 1)
+        # Immediate re-stop after continue: status tells the truth.
+        again = self.cli(name, "continue", "--timeout", "10")
+        self.assertEqual(again["snapshot"]["location"]["line"], 8)
+        row = next(r for r in self.cli(name, "status")["sessions"] if r["name"] == name)
+        self.assertTrue(row["stopped"])
+        self.assertEqual(row["lastStop"]["line"], 8)
+        try:
+            gate.unlink()
+        except OSError:
+            pass
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+
+    def test_22_m3_browser_catch_and_step_smoke(self):
+        """M3 browser (Chrome only): catch bindings in vars+eval, step
+        lands on the next line, status truth after the stop."""
+        chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        if not Path(chrome).exists():
+            self.skipTest("Chrome unavailable")
+
+        class QuietHandler(http.server.SimpleHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+        webdir = self.fixture / "m3web"
+        webdir.mkdir(exist_ok=True)
+        (webdir / "catchdemo.js").write_text(
+            'function load() {\n  let status = "ok";\n  try {\n'
+            '    throw new Error("boom");\n  } catch (e) {\n'
+            '    const note = "caught";\n'
+            '    console.log(note, e.message, status);\n  }\n'
+            '  console.log("done", status);\n}\n'
+            'window.addEventListener("load", load);\n')
+        (webdir / "index.html").write_text(
+            '<!doctype html><html><body>m3<script src="catchdemo.js"></script></body></html>\n')
+        handler = functools.partial(QuietHandler, directory=str(webdir))
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.shutdown)
+        self.addCleanup(httpd.server_close)
+        cdp_port = free_port()
+        url = f"http://127.0.0.1:{httpd.server_port}/index.html"
+        proc = subprocess.Popen(
+            [chrome, "--headless", "--disable-gpu", "--no-first-run",
+             f"--remote-debugging-port={cdp_port}",
+             f"--user-data-dir={self.home}/m3chrome", url],
+            stdout=self.log, stderr=self.log)
+        self.addCleanup(proc.terminate)
+        deadline = time.monotonic() + 20
+        while True:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{cdp_port}/json/list", timeout=1) as response:
+                    if any(t.get("url") == url for t in json.load(response)):
+                        break
+            except OSError:
+                pass
+            if time.monotonic() > deadline:
+                self.fail("Chrome did not expose test tab")
+            time.sleep(.1)
+        name = "m3-browser"
+        self.sessions.add(name)
+        self.cli(name, "browser", "attach", "--port", str(cdp_port), "--tab", url,
+                 "--break", "catchdemo.js:6")
+        stop = self.cli(name, "reload", "--timeout", "15")
+        self.assertEqual(stop["snapshot"]["location"]["line"], 6)
+        names = {v["name"] for v in self.cli(name, "vars")["locals"]}
+        self.assertIn("e", names)
+        self.assertIn("note", names)
+        self.assertIn("status", names)
+        self.assertEqual(self.cli(name, "eval", "e.message")["value"], "boom")
+        stepped = self.cli(name, "step", "over", "--timeout", "10")
+        self.assertEqual(stepped["snapshot"]["location"]["line"], 7)
+        row = next(r for r in self.cli(name, "status")["sessions"] if r["name"] == name)
+        self.assertTrue(row["stopped"])
+        self.assertEqual(row["lastStop"]["line"], 7)
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+
     def _m1_target(self, lang, port):
         if lang == "py":
             return [str(VENV_PY), "-Xfrozen_modules=off", "-m", "debugpy",

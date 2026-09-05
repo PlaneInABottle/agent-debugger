@@ -1,5 +1,6 @@
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.List;
 
 // argv parsing and stop-spec validation for attach/launch/session modes. Moved verbatim from JdiBridge.java.
 class BridgeCli {
@@ -144,6 +145,7 @@ class BridgeCli {
         } catch (NumberFormatException e) {
             throw new UsageException("bad line in --break: " + spec);
         }
+        if (line < 1) throw new UsageException("bad line in --break (must be >= 1): " + spec);
         cfg.breakpoints.computeIfAbsent(cls, k -> new ArrayList<>()).add(line);
         if (cond != null) cfg.condByLoc.put(cls + ":" + line, cond);
     }
@@ -155,13 +157,44 @@ class BridgeCli {
      */
 
     static void validateCond(String cond) throws UsageException {
-        if (cond == null || cond.isEmpty()) throw new UsageException("empty condition after '|'");
+        if (cond == null || cond.trim().isEmpty()) throw new UsageException("empty condition after '|'");
+        // Single operator outside string literals (longest match first).
         String[] ops = {"==", "!=", ">=", "<=", ">", "<"};
-        boolean found = false;
-        for (String op : ops) {
-            if (cond.contains(op)) { found = true; break; }
+        List<int[]> found = new ArrayList<>(); // {pos, len}
+        boolean inStr = false;
+        for (int i = 0; i < cond.length(); i++) {
+            char c = cond.charAt(i);
+            if (c == '"' && (i == 0 || cond.charAt(i - 1) != '\\')) { inStr = !inStr; continue; }
+            if (inStr) continue;
+            boolean matched = false;
+            for (String op : ops) {
+                if (cond.startsWith(op, i)) {
+                    // A two-char op's first char also prefixes a one-char op;
+                    // longest-first order + single advance keeps it atomic.
+                    found.add(new int[]{i, op.length()});
+                    i += op.length() - 1;
+                    matched = true;
+                    break;
+                }
+            }
+            if (matched) continue;
+            // Stray single `!` or `=` outside an operator is never valid.
+            if (c == '!' || c == '=') {
+                throw new UsageException("invalid operator in condition: " + cond);
+            }
         }
-        if (!found) throw new UsageException("condition needs ==, !=, >, <, >= or <= : " + cond);
+        if (inStr) throw new UsageException("unbalanced \" in condition: " + cond);
+        if (found.isEmpty()) throw new UsageException("condition needs ==, !=, >, <, >= or <= : " + cond);
+        if (found.size() > 1) throw new UsageException("condition takes one comparison only: " + cond);
+        int at = found.get(0)[0];
+        int len = found.get(0)[1];
+        String left = cond.substring(0, at).trim();
+        String right = cond.substring(at + len).trim();
+        if (left.isEmpty() || right.isEmpty()) {
+            throw new UsageException("condition needs <path> <op> <literal|null> (empty side): " + cond);
+        }
+        validateCondSide(left, cond, true);
+        validateCondSide(right, cond, false);
         // Calls: only the read-only allowlist with literal args. Anything else
         // could mutate target state on every loop iteration.
         int i = 0;
@@ -174,11 +207,11 @@ class BridgeCli {
             }
             int depth = 1;
             int k = i + 1;
-            boolean inStr = false;
+            boolean inS = false;
             while (k < cond.length() && depth > 0) {
                 char c = cond.charAt(k);
-                if (c == '"' && cond.charAt(k - 1) != '\\') inStr = !inStr;
-                if (!inStr) {
+                if (c == '"' && cond.charAt(k - 1) != '\\') inS = !inS;
+                if (!inS) {
                     if (c == '(') depth++;
                     else if (c == ')') depth--;
                 }
@@ -189,6 +222,61 @@ class BridgeCli {
             validateCondArgs(name, argText, cond);
             i = k;
         }
+    }
+
+    /** Light path/literal shape check (not a full parser). String literals
+     *  are stripped before punctuation checks so `==` inside quotes is fine. */
+    static void validateCondSide(String side, String cond, boolean isLeft) throws UsageException {
+        if (side.startsWith("\"")) {
+            if (side.length() < 2 || !side.endsWith("\"")) {
+                throw new UsageException("unbalanced \" in condition: " + cond);
+            }
+            return;
+        }
+        if (!isLeft && (side.equals("null") || side.equals("true") || side.equals("false")
+                || side.matches("-?\\d+") || side.matches("-?\\d+\\.\\d+"))) {
+            return;
+        }
+        // Path-ish: must start with an identifier char, never with ./[/)/,/;/=,
+        // never end with a dangling dot/paren, no empty segments or stray punctuation.
+        char f = side.charAt(0);
+        if (!Character.isJavaIdentifierStart(f)) {
+            throw new UsageException("bad path in condition: " + cond);
+        }
+        char l = side.charAt(side.length() - 1);
+        if (l == '.' || l == '(' || l == ',' || l == '[') {
+            throw new UsageException("bad path in condition: " + cond);
+        }
+        String bare = stripCondStrings(side);
+        if (bare.contains("..") || bare.contains(";;") || bare.contains("==")
+                || bare.contains("!=") || bare.contains("&&") || bare.contains("||")
+                || bare.contains(">=") || bare.contains("<=")) {
+            throw new UsageException("bad path in condition: " + cond);
+        }
+        for (int k = 0; k < bare.length(); k++) {
+            char c = bare.charAt(k);
+            // The single comparison operator was split out already; any
+            // leftover comparison/stmt char outside strings is malformed.
+            if (c == ';' || c == '{' || c == '}' || c == '='
+                    || c == '!' || c == '>' || c == '<') {
+                throw new UsageException("bad path in condition: " + cond);
+            }
+        }
+    }
+
+    /** Remove double-quoted runs (with backslash escapes) for punctuation checks. */
+    static String stripCondStrings(String s) {
+        StringBuilder sb = new StringBuilder(s.length());
+        boolean inStr = false;
+        for (int k = 0; k < s.length(); k++) {
+            char c = s.charAt(k);
+            if (c == '"' && (k == 0 || s.charAt(k - 1) != '\\')) {
+                inStr = !inStr;
+                continue;
+            }
+            if (!inStr) sb.append(c);
+        }
+        return sb.toString();
     }
 
     static void validateCondArgs(String name, String argText, String cond) throws UsageException {
@@ -216,6 +304,7 @@ class BridgeCli {
         } catch (NumberFormatException e) {
             throw new UsageException("bad line in --logpoint: " + spec);
         }
+        if (line < 1) throw new UsageException("bad line in --logpoint (must be >= 1): " + spec);
         String template = spec.substring(c2 + 1);
         if (template.isEmpty()) throw new UsageException("--logpoint template is empty: " + spec);
         // Holes must be call-free paths (evaluated on every hit, possibly 1000s).

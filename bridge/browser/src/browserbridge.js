@@ -155,6 +155,9 @@ function parseArgs(argv) {
     throw new Usage(`browser is attach-only for now (got --kind ${cfg.kind}); launch lands later`);
   }
   if (!Number.isFinite(cfg.timeout) || cfg.timeout <= 0 || cfg.timeout > 3600) throw new Usage('timeout must be between 0 and 3600 seconds');
+  // Fold startup specs here (fail-fast before any CDP traffic); armBreakpoints
+  // re-applies the same idempotent fold as a belt-and-braces gate.
+  dedupeStartupBreaks(cfg);
   return cfg;
 }
 
@@ -188,6 +191,48 @@ function displayUrl(url) {
 
 function tabSummary(t) {
   return `${truncStr(t.title || '(no title)', 60)} <${truncStr(t.url || '', 100)}>`;
+}
+
+/** Fold startup specs before any CDP traffic (mirrors nodebridge + the live
+ *  `breaks add` contract, keyed on URL frag): exact same frag/line/cond
+ *  repeats are idempotent; the same frag/line with a different condition —
+ *  or any same-line logpoint — fails fast. */
+function dedupeStartupBreaks(cfg) {
+  const kept = [];
+  const seen = new Set();
+  for (const b of cfg.breaks) {
+    const key = `${b.frag}:${b.line}|${b.cond || ''}`;
+    if (seen.has(key)) continue; // exact duplicate: idempotent
+    const other = kept.find((o) => o.frag === b.frag && o.line === b.line);
+    if (other) {
+      throw new Usage(`conflicting condition for ${b.frag}:${b.line} ` +
+        `(already requested${other.cond ? ` as '${other.cond}'` : ' plain'}): ` +
+        `${b.frag}:${b.line}${b.cond ? `|${b.cond}` : ''}`);
+    }
+    seen.add(key);
+    kept.push(b);
+  }
+  cfg.breaks = kept;
+  const keptLogs = [];
+  const seenLogs = new Set();
+  for (const l of cfg.logpoints) {
+    const key = `${l.frag}:${l.line}|${l.template}`;
+    if (seenLogs.has(key)) continue; // exact duplicate: idempotent
+    const brk = cfg.breaks.find((b) => b.frag === l.frag && b.line === l.line);
+    if (brk) {
+      throw new Usage(`conflicting condition for ${l.frag}:${l.line} ` +
+        `(already requested as breakpoint${brk.cond ? ` '${brk.cond}'` : ''}): ` +
+        `logpoint ${l.frag}:${l.line}`);
+    }
+    const other = keptLogs.find((o) => o.frag === l.frag && o.line === l.line);
+    if (other) {
+      throw new Usage(`conflicting condition for ${l.frag}:${l.line} ` +
+        `(already requested as logpoint): logpoint ${l.frag}:${l.line}`);
+    }
+    seenLogs.add(key);
+    keptLogs.push(l);
+  }
+  cfg.logpoints = keptLogs;
 }
 
 // ---------------------------------------------------------------- CDP conn
@@ -271,9 +316,48 @@ function amOwner(dir) {
 }
 
 function writeFile(p, content) {
+  // Atomic same-dir publish: unique temp (create-new) + rename, so a
+  // concurrent `status` read never sees a torn session.json. Best effort
+  // (callers treat state files as advisory), but a temp is never left
+  // behind. Plain log appends stay append-only — only full rewrites (state
+  // files, log-ring trims) come through here.
   try {
-    fs.writeFileSync(p, content);
+    const dir = path.dirname(p);
+    for (let i = 0; i < 8; i++) {
+      const tmp = path.join(dir,
+        `.tmp-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e9)}`);
+      try {
+        fs.writeFileSync(tmp, content, { flag: 'wx' });
+      } catch (e) {
+        if (e && e.code === 'EEXIST') continue;
+        return;
+      }
+      try {
+        fs.renameSync(tmp, p);
+      } catch (_) {
+        try {
+          fs.unlinkSync(tmp);
+        } catch (_) { /* already gone */ }
+      }
+      return;
+    }
   } catch (_) { /* best effort */ }
+}
+
+// Sanitized unexpected-crash payload: class + message + short stack tail,
+// ~2KB cap. Never env/secrets — only the failure itself. Known Usage /
+// BridgeErr messages bypass this (exact text on the error.json path).
+const MAX_ERROR_CHARS = 2048;
+function sanitizeUnexpected(e) {
+  const kind = (e && e.constructor && e.constructor.name) || 'Error';
+  let body = `${kind}: ${(e && e.message) || e}`;
+  try {
+    const frames = String((e && e.stack) || '').split('\n').slice(1, 7);
+    if (frames.length > 0) body += '\n' + frames.join('\n');
+  } catch (_) { /* message alone still helps */ }
+  body = body.trim();
+  if (body.length > MAX_ERROR_CHARS) body = body.slice(0, MAX_ERROR_CHARS - 1) + '…';
+  return `internal: ${body}`;
 }
 
 function sleep(ms) {
@@ -304,6 +388,7 @@ class Session {
     this.stopInfo = null;
     this.outputTail = '';
     this.logCount = 0;
+    this.logDropped = 0; // lifetime lines evicted by the log ring
     this.sessionPort = 0; // our TCP port (set in main, for republishing)
     this.lastStop = null; // {file,line,method} of the latest stop
   }
@@ -361,6 +446,12 @@ class Session {
   }
 
   async armBreakpoints() {
+    // Startup fold (same contract as nodebridge + live `breaks add`): an
+    // exact same frag/line/cond repeat is idempotent (kept once); the same
+    // frag/line with a different condition — or any same-line logpoint
+    // (one V8 breakpoint per line wins) — fails fast BEFORE any CDP
+    // setBreakpointByUrl traffic, instead of silently overwriting.
+    dedupeStartupBreaks(this.cfg);
     // Same collision rule as nodebridge: a real break and a logpoint on the
     // same line — the break wins, the logpoint is reported and skipped.
     // Every requested stop lands in this.stopStates (served by `breaks`)
@@ -568,7 +659,9 @@ class Session {
     if (this.closing || this.exited || this.paused) {
       // Single target: a second pause cannot arrive while one is held (the
       // page is frozen). If it ever does, hold the first stop; the next
-      // resume flushes the rest.
+      // resume flushes the rest. The park below is set SYNCHRONOUSLY
+      // (before the first await), so even a fire-and-forget duplicate
+      // landing in the same tick sees it and never clobbers the stop.
       return;
     }
     const hits = p.hitBreakpoints || [];
@@ -576,25 +669,49 @@ class Session {
     const logHits = hits.filter((id) => this.logpointIds.has(id));
     const realHits = hits.filter((id) => !this.logpointIds.has(id));
     this.countHits(p);
-    for (const id of logHits) {
-      await this.fireLogpoint(id, frames);
-    }
     if (p.reason === 'exception') {
       this.stopInfo = this.excInfo(p.data);
-      await this.trackChanges(frames);
+      // Park first, synchronously — trackChanges awaits must never strand
+      // a CDP pause with a running state when they throw.
       this.paused = { frames, stopInfo: this.stopInfo };
+      this.publishState(true);
+      try {
+        for (const id of logHits) {
+          await this.fireLogpoint(id, frames);
+        }
+        await this.trackChanges(frames);
+      } catch (_) {
+        // Still parked and published; change detail just goes quiet.
+        if (!this.cachedLocals) this.cachedLocals = [];
+        this.lastChanged = '[]';
+      }
       this.publishState(true);
       return;
     }
     if (realHits.length > 0 || this.awaitingStep) {
       this.awaitingStep = false;
       this.stopInfo = null;
-      await this.trackChanges(frames);
+      // Park first, synchronously — see above.
       this.paused = { frames, stopInfo: null };
+      this.publishState(true);
+      try {
+        for (const id of logHits) {
+          await this.fireLogpoint(id, frames);
+        }
+        await this.trackChanges(frames);
+      } catch (_) {
+        if (!this.cachedLocals) this.cachedLocals = [];
+        this.lastChanged = '[]';
+      }
       this.publishState(true);
       return;
     }
     if (logHits.length > 0) {
+      for (const id of logHits) {
+        try {
+          await this.fireLogpoint(id, frames);
+        } catch (_) { /* template holes already degrade to '?' */ }
+      }
       await this.cdp.request('Debugger.resume').catch(() => {});
       return;
     }
@@ -694,12 +811,42 @@ class Session {
 
   appendLog(line) {
     if (line === null || line === undefined) return;
-    if (this.logCount >= MAX_LOG_LINES) return;
     // One physical line per entry: multi-line values would shatter structure.
     const flat = String(line).replace(/\r?\n/g, '⏎');
+    this._appendLogParts([flat]);
+  }
+
+  /** Ring-kept logs: logs.jsonl holds the latest MAX_LOG_LINES physical
+   *  lines; older lines are evicted (counted in logDropped, surfaced by
+   *  `logs`) instead of silently dropping NEW lines — the old cap froze
+   *  `logs --tail` on stale output once full. */
+  _appendLogParts(parts) {
+    if (parts.length === 0) return;
+    const file = path.join(this.cfg.dir, 'logs.jsonl');
     try {
-      fs.appendFileSync(path.join(this.cfg.dir, 'logs.jsonl'), flat + '\n');
-      this.logCount += 1;
+      if (this.logCount + parts.length <= MAX_LOG_LINES) {
+        fs.appendFileSync(file, parts.join('\n') + '\n');
+        this.logCount += parts.length;
+        return;
+      }
+      // Ring trim: keep the latest MAX lines. Bounded rewrite of a
+      // ≤2000-line file (published atomically, so concurrent `logs`
+      // readers never see a torn file); plain appends stay append-only.
+      let kept = [];
+      try {
+        kept = fs.readFileSync(file, 'utf-8').split('\n');
+        if (kept.length > 0 && kept[kept.length - 1] === '') kept.pop();
+      } catch (_) {
+        kept = [];
+      }
+      kept.push(...parts);
+      const evicted = kept.length - MAX_LOG_LINES;
+      if (evicted > 0) {
+        kept = kept.slice(evicted);
+        this.logDropped = (this.logDropped || 0) + evicted;
+      }
+      writeFile(file, kept.length > 0 ? kept.join('\n') + '\n' : '');
+      this.logCount = kept.length;
     } catch (_) { /* best effort */ }
   }
 
@@ -851,11 +998,12 @@ class Session {
       throw new BridgeErr(`no frame ${index} (have ${frames.length})`);
     }
     const chain = frames[index].scopeChain || [];
-    // Same merge as nodebridge: local/block/closure/module, innermost wins.
+    // Same merge as nodebridge: local/block/closure/module/catch/script,
+    // innermost wins.
     const seen = new Set();
     let props = [];
     for (const s of chain) {
-      if (s.type !== 'local' && s.type !== 'block' && s.type !== 'closure' && s.type !== 'module') continue;
+      if (s.type !== 'local' && s.type !== 'block' && s.type !== 'closure' && s.type !== 'module' && s.type !== 'catch' && s.type !== 'script') continue;
       for (const pr of await this.scopeProps(s)) {
         if (!seen.has(pr.name)) {
           seen.add(pr.name);
@@ -1007,26 +1155,49 @@ class Session {
     const mode = req.mode || 'over';
     const method = { over: 'Debugger.stepOver', into: 'Debugger.stepInto', out: 'Debugger.stepOut' }[mode];
     if (!method) throw new BridgeErr(`bad step mode: ${mode}`);
+    // Publish running BEFORE the step request: session.json must show live
+    // truth even if the request hangs, and an immediate later pause (landed
+    // via events) must never be overwritten by our bookkeeping below.
+    const saved = this.paused;
     this.paused = null;
     this.cachedLocals = [];
     this.awaitingStep = true;
+    this.publishState(false);
     try {
       await this.cdp.request(method);
     } catch (e) {
+      // Synchronous request failure: restore the park (unless a fresh pause
+      // already won) so the session file stops lying about running, and
+      // clear the flag so the next real stop does not misreport as a step.
       this.awaitingStep = false;
+      if (!this.paused) {
+        this.paused = saved;
+        this.publishState(true);
+      }
       throw e;
     }
-    this.publishState(false);
     return this.resumeAndWait(timeout);
   }
 
   async cmdContinue(req, timeout) {
     this.requireLive();
     if (this.paused) {
+      // Publish running BEFORE the resume request (same ordering as step).
+      const saved = this.paused;
       this.paused = null;
       this.cachedLocals = [];
-      await this.cdp.request('Debugger.resume');
       this.publishState(false);
+      try {
+        await this.cdp.request('Debugger.resume');
+      } catch (e) {
+        // Synchronous request failure: restore the park unless a fresh
+        // pause already won the race.
+        if (!this.paused) {
+          this.paused = saved;
+          this.publishState(true);
+        }
+        throw e;
+      }
     }
     // Running already: nothing to resume (a bare resume errors on some
     // targets) — just wait for the next stop.
@@ -1052,7 +1223,16 @@ class Session {
   }
 
   async resumeAndWait(timeout) {
-    await this.pump(timeout);
+    try {
+      await this.pump(timeout);
+    } catch (e) {
+      // Pump timeout (or tab exit) must clear the step flag — otherwise the
+      // NEXT real stop misreports as a step landing. Never touch a newly
+      // landed pause: if onPaused parked concurrently it already consumed
+      // the flag and published.
+      if (!this.paused) this.awaitingStep = false;
+      throw e;
+    }
     return {
       ok: true,
       stopped: true,
@@ -1087,7 +1267,15 @@ class Session {
     } catch (_) {
       lines = [];
     }
-    return { ok: true, total: lines.length, truncated: lines.length > tail, lines: lines.slice(-tail) };
+    // total = retained lines on disk (<= MAX_LOG_LINES); dropped = lifetime
+    // lines evicted by the ring; truncated = the tail was cut OR any line
+    // was ever evicted (historical drops, not just the cut).
+    const dropped = this.logDropped || 0;
+    return {
+      ok: true, total: lines.length,
+      truncated: lines.length > tail || dropped > 0,
+      dropped, lines: lines.slice(-tail),
+    };
   }
 
   async cmdBreaks() {
@@ -1391,7 +1579,16 @@ async function main(argv) {
       } catch (_) { /* best effort */ }
       process.exit(e instanceof Usage ? 2 : 1);
     }
-    throw e;
+    // Unexpected setup crash (never a silent exit-1): same detach, then a
+    // sanitized error.json the CLI surfaces. The name stays reusable — the
+    // CLI removes failed-setup dirs wholesale.
+    const detail = sanitizeUnexpected(e);
+    writeFile(path.join(cfg.dir, 'error.json'), JSON.stringify({ error: detail }));
+    await st.cleanup().catch(() => {});
+    try {
+      server.close();
+    } catch (_) { /* best effort */ }
+    process.exit(1);
   }
 }
 

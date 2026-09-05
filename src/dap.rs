@@ -38,19 +38,37 @@ pub fn encode_message(body: &Value) -> Vec<u8> {
 
 /// Try to decode one DAP message from the front of `buf`.
 ///
-/// Returns `None` when the buffer holds no complete message yet.
+/// Returns `Ok(None)` when the buffer holds no complete message yet
+/// (missing header, unparsable header, or a short body — the caller reads
+/// more bytes). Returns `Err` the moment a COMPLETE frame carries corrupt
+/// JSON, so the caller fails fast instead of waiting out a read timeout.
+/// Header/size probing stays in [`validate_frame_size`]; this function only
+/// classifies body completeness vs corruption.
 /// On success returns `(body, bytes_consumed)`.
-pub fn try_decode_message(buf: &[u8]) -> Option<(Value, usize)> {
-    let header_end = find_header_end(buf)?;
-    let header = std::str::from_utf8(&buf[..header_end]).ok()?;
-    let content_length = parse_content_length(header)?;
-    let body_start = header_end;
-    let body_end = body_start.checked_add(content_length)?;
+pub fn try_decode_message(buf: &[u8]) -> anyhow::Result<Option<(Value, usize)>> {
+    let Some(header_end) = find_header_end(buf) else {
+        return Ok(None);
+    };
+    let Ok(header) = std::str::from_utf8(&buf[..header_end]) else {
+        return Ok(None);
+    };
+    let Some(content_length) = parse_content_length(header) else {
+        return Ok(None);
+    };
+    let Some(body_end) = header_end.checked_add(content_length) else {
+        return Ok(None);
+    };
     if buf.len() < body_end {
-        return None;
+        return Ok(None);
     }
-    let body: Value = serde_json::from_slice(&buf[body_start..body_end]).ok()?;
-    Some((body, body_end))
+    let text = std::str::from_utf8(&buf[header_end..body_end])
+        .map_err(|e| anyhow::anyhow!("bridge sent invalid JSON: {e}"))?;
+    let body: Value =
+        serde_json::from_str(text).map_err(|e| anyhow::anyhow!("bridge sent invalid JSON: {e}"))?;
+    if !body.is_object() {
+        anyhow::bail!("bridge sent invalid JSON: expected object");
+    }
+    Ok(Some((body, body_end)))
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -90,7 +108,9 @@ mod tests {
     fn roundtrip_single_message() {
         let body = json!({"seq":1,"type":"request","command":"initialize"});
         let framed = encode_message(&body);
-        let (decoded, consumed) = try_decode_message(&framed).expect("must decode");
+        let (decoded, consumed) = try_decode_message(&framed)
+            .expect("decode must not fail")
+            .expect("must decode");
         assert_eq!(decoded, body);
         assert_eq!(consumed, framed.len());
     }
@@ -100,7 +120,29 @@ mod tests {
         let body = json!({"seq":2,"command":"launch"});
         let framed = encode_message(&body);
         let cut = framed.len() - 5;
-        assert!(try_decode_message(&framed[..cut]).is_none());
+        assert!(try_decode_message(&framed[..cut])
+            .expect("partial must not fail")
+            .is_none());
+    }
+
+    #[test]
+    fn complete_corrupt_json_errors_immediately() {
+        // A complete frame (declared length present) with garbage JSON must
+        // fail fast — never Ok(None), which would burn a read timeout.
+        let bad = b"Content-Length: 6\r\n\r\nnot-js";
+        assert!(try_decode_message(bad).is_err());
+        // Declared length present but body short stays incomplete.
+        assert!(try_decode_message(&bad[..bad.len() - 2])
+            .expect("short body must not fail")
+            .is_none());
+        // Complete non-object JSON is corrupt on this protocol too.
+        let null = b"Content-Length: 4\r\n\r\nnull";
+        assert!(try_decode_message(null).is_err());
+        // Missing/incomplete headers stay incomplete (size probing lives in
+        // validate_frame_size, unchanged).
+        assert!(try_decode_message(b"Content-Length: 4")
+            .expect("header prefix must not fail")
+            .is_none());
     }
 
     #[test]
@@ -111,9 +153,13 @@ mod tests {
         buf.extend_from_slice(&first);
         buf.extend_from_slice(&second);
 
-        let (b1, c1) = try_decode_message(&buf).expect("first");
+        let (b1, c1) = try_decode_message(&buf)
+            .expect("first must not fail")
+            .expect("first");
         assert_eq!(b1, json!({"seq":1}));
-        let (b2, c2) = try_decode_message(&buf[c1..]).expect("second");
+        let (b2, c2) = try_decode_message(&buf[c1..])
+            .expect("second must not fail")
+            .expect("second");
         assert_eq!(b2, json!({"seq":2}));
         assert_eq!(c1 + c2, buf.len());
     }
@@ -126,7 +172,9 @@ mod tests {
         let header = std::str::from_utf8(&framed).unwrap();
         let body_bytes = serde_json::to_vec(&body).unwrap();
         assert!(header.starts_with(&format!("Content-Length: {}", body_bytes.len())));
-        let (decoded, _) = try_decode_message(&framed).expect("must decode");
+        let (decoded, _) = try_decode_message(&framed)
+            .expect("decode must not fail")
+            .expect("must decode");
         assert_eq!(decoded, body);
     }
 }
