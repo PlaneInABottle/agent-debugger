@@ -39,7 +39,8 @@ struct Stops {
     /// Source roots for snippet mapping (repeatable for multi-module builds).
     #[arg(long, alias = "src")]
     source_paths: Vec<String>,
-    /// Breakpoints: Class:line, method:Class.method, exc:ExcClass (py: file:line).
+    /// Breakpoints: Class:line, method:Class.method, exc:ExcClass
+    /// (py: file:line; node: file:line; browser: url-frag:line).
     /// Append `|cond` for a condition, e.g. "com.Foo:54|order == null".
     #[arg(long, alias = "break")]
     breakpoints: Vec<String>,
@@ -167,7 +168,6 @@ struct NodeGroup {
 #[derive(Subcommand, Debug)]
 enum BrowserCmd {
     /// Attach to a browser tab via CDP and keep a persistent session.
-    /// B0: attach skeleton only (debug core lands in B1).
     Attach {
         /// Tab selector: substring of tab url or title (first page if omitted).
         #[arg(long)]
@@ -198,7 +198,7 @@ enum Commands {
     Py(PyGroup),
     /// Node targets (nodebridge + CDP).
     Node(NodeGroup),
-    /// Browser tabs (browserbridge + CDP; B0 skeleton, core in B1).
+    /// Browser tabs (browserbridge + CDP).
     Browser(BrowserGroup),
     /// Resume until the next breakpoint (or timeout / exit).
     #[command(name = "continue")]
@@ -213,6 +213,14 @@ enum Commands {
         #[arg(value_parser = ["over", "into", "out"], default_value = "over")]
         mode: String,
         /// Seconds to wait for the step to land.
+        #[arg(long, default_value_t = 20)]
+        timeout: u64,
+    },
+    /// Reload the page and wait for the next stop (browser tabs only).
+    /// The agent-side trigger for load-path code; interaction-path code
+    /// still needs a human click or agent-browser.
+    Reload {
+        /// Seconds to wait for the next stop after reload.
         #[arg(long, default_value_t = 20)]
         timeout: u64,
     },
@@ -393,6 +401,14 @@ fn dispatch(session: &str, cmd: Commands) -> (&'static str, anyhow::Result<Value
             session::forward(
                 session,
                 &json!({"cmd": "step", "mode": mode, "timeout": timeout}),
+                Duration::from_secs(timeout + 5),
+            ),
+        ),
+        Commands::Reload { timeout } => (
+            "reload",
+            session::forward(
+                session,
+                &json!({"cmd": "reload", "timeout": timeout}),
                 Duration::from_secs(timeout + 5),
             ),
         ),
@@ -625,7 +641,7 @@ fn doctor() -> anyhow::Result<Value> {
             "java": {"via": "embedded JDI bridge (persistent session)", "ready": true},
             "python": {"via": "embedded pybridge + debugpy (isolated venv)", "ready": debugpy["found"]},
             "node": {"via": "embedded nodebridge + CDP", "ready": node["found"]},
-            "browser": {"via": "embedded browserbridge + CDP (B0 skeleton, core in B1)", "ready": node["found"]},
+            "browser": {"via": "embedded browserbridge + CDP", "ready": node["found"]},
         },
     }))
 }

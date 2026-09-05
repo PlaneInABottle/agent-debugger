@@ -183,6 +183,12 @@ pub fn node_dir() -> PathBuf {
         .join("node")
 }
 
+/// Shared node_modules holding the `ws` client (provisioned once by the
+/// node adapter, reused by the browser bridge via NODE_PATH).
+pub fn node_modules_dir() -> PathBuf {
+    node_dir().join("node_modules")
+}
+
 /// Resolve the node binary running the bridge (explicit --node reaches the
 /// bridge for the *target*; the bridge itself always runs on PATH node).
 /// Returns "node" when `node --version` succeeds, else a helpful error.

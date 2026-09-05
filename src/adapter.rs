@@ -39,9 +39,7 @@ impl Language {
     /// Whether this binary can drive the language yet.
     pub fn is_available(self) -> bool {
         match self {
-            Self::Java | Self::Python | Self::Node => true,
-            // Browser session skeleton is live; debug core lands in B1.
-            Self::Browser => false,
+            Self::Java | Self::Python | Self::Node | Self::Browser => true,
         }
     }
 }
@@ -90,6 +88,6 @@ impl Adapter for BrowserAdapter {
         Language::Browser
     }
     fn describe(&self) -> &'static str {
-        "Browser tabs via browserbridge + CDP (B0 skeleton)"
+        "Browser tabs via browserbridge + CDP"
     }
 }

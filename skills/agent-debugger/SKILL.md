@@ -191,6 +191,31 @@ iterations cost zero LLM roundtrips.
   inspector targets the bridge does not follow (same boundary as
   subprocesses elsewhere). Breakpoints on worker-only lines time out.
 
+## Browser Notes (CDP tab attach)
+
+- `browser attach --tab '<url-or-title-fragment>'` attaches to a page in a
+  Chrome running with `--remote-debugging-port=9222` (default = the
+  agent-browser convention, so interaction and debugging share one warm
+  headless browser). Ambiguous/empty matches fail fast with the tab list.
+- Breakpoints are `url-frag:line` (`app.js:14` matches `.../app.js?v=3`);
+  conditions are FULL JS expressions (frame-locals only, same V8 trap as
+  Node). Bare `exc` = any uncaught exception. `method:`/`--watch`/`--exit`
+  do NOT exist and fail fast.
+- Attach is instant and never waits: an attached tab is usually idle (its
+  load code already ran), so `attach --break` only ARMS (`armed: N` in the
+  response). The agent loop: attach --break (fast) -> `reload` -> stop.
+  `reload` with nothing armed just refreshes (`{reloaded: true}`).
+- `logs` serves page `console.*` (captured via CDP, no pipes); snippets come
+  from the tab via `getScriptSource` (no disk access). Snippet/step shapes
+  match the other adapters.
+- Tabs don't exit like processes: script end is invisible, so a bare
+  continue-to-end burns its timeout (pass a short one). Dead browser / closed
+  tab surface as errors on `threads` (never stale `running:true`).
+- Coordination with agent-browser on the same tab: debugger paused =>
+  no clicks; interaction running => no step. Pause state is shared.
+- Never `rm -rf` a session dir instead of `close` (all four bridges now
+  self-reap on abandonment, but `close` is the contract).
+
 ## Threads, Async, Timing (Java; Python threads similar, no freeze caveat)
 
 - `current: true` marks the stopped thread; `+N more threads` is capped.

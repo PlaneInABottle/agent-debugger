@@ -127,10 +127,18 @@ pub fn spawn(name: &str, spec: &SpawnSpec) -> anyhow::Result<Value> {
         }
         "browser" => {
             // The bridge runs on Node (shared provisioning); Chrome is the
-            // target. No `ws` yet — B0 makes no WebSocket connection (B1 will
-            // ensure it then, keeping first-use provisioning lazy).
+            // target. `ws` is provisioned once by the node adapter and shared
+            // via NODE_PATH (no second install), prepended so any user value
+            // keeps working.
             let bin = bridge::ensure_node()?;
             let script = bridge::ensure_browserbridge()?;
+            bridge::ensure_ws()?;
+            let ws_dir = bridge::node_modules_dir().to_string_lossy().to_string();
+            let node_path = match std::env::var("NODE_PATH") {
+                Ok(existing) if !existing.is_empty() => format!("{ws_dir}:{existing}"),
+                _ => ws_dir,
+            };
+            std::env::set_var("NODE_PATH", node_path);
             (
                 bin,
                 vec![
