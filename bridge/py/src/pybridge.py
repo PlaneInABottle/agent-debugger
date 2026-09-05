@@ -20,6 +20,7 @@ frames/locals/changed/stopInfo) so agents see one uniform surface.
 """
 
 import json
+import math
 import os
 import socket
 import subprocess
@@ -48,28 +49,51 @@ class BridgeErr(Exception):
 # ---------------------------------------------------------------- framing
 
 def read_frame(conn):
+    deadline = time.monotonic() + 5
+    def recv(size):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise BridgeErr("frame read timed out")
+        conn.settimeout(remaining)
+        try:
+            return conn.recv(size)
+        except OSError as e:
+            raise BridgeErr(f"frame read failed: {e}") from e
     header = b""
     while b"\r\n\r\n" not in header:
-        chunk = conn.recv(4096)
+        chunk = recv(4096)
         if not chunk:
             raise BridgeErr("truncated frame")
         header += chunk
+        if b"\r\n\r\n" not in header and len(header) >= 8192:
+            raise BridgeErr("frame header too large")
     head, rest = header.split(b"\r\n\r\n", 1)
+    if len(head) + 4 > 8192:
+        raise BridgeErr("frame header too large")
     length = -1
-    for line in head.decode("ascii").split("\r\n"):
+    for line in head.decode("ascii", "replace").split("\r\n"):
         if ":" in line:
             name, val = line.split(":", 1)
             if name.strip().lower() == "content-length":
+                if length != -1 or not val.strip().isascii() or not val.strip().isdigit():
+                    raise BridgeErr("bad Content-Length")
                 length = int(val.strip())
-    if length < 0:
-        raise BridgeErr("bad frame: no Content-Length")
+    if not 0 <= length <= 1024 * 1024:
+        raise BridgeErr("invalid or oversized Content-Length")
     body = rest
     while len(body) < length:
-        chunk = conn.recv(max(4096, length - len(body)))
+        chunk = recv(min(65536, length - len(body)))
         if not chunk:
             raise BridgeErr("truncated frame")
         body += chunk
-    return json.loads(body.decode("utf-8"))
+    try:
+        req = json.loads(body[:length].decode("utf-8"))
+        if not isinstance(req, dict):
+            raise ValueError("expected object")
+    except (ValueError, UnicodeError) as e:
+        raise BridgeErr(f"bad frame: {e}") from e
+    conn.settimeout(5)
+    return req
 
 
 def write_frame(conn, obj):
@@ -106,8 +130,12 @@ class DapConn:
         # dap_request); pump() catches it to re-check its deadline. Converting
         # here would break both deadline semantics.
         while True:
+            if len(self.buf) > 64 * 1024 * 1024 + 8192:
+                raise BridgeErr("DAP frame too large")
             if b"\r\n\r\n" in self.buf:
                 head, rest = self.buf.split(b"\r\n\r\n", 1)
+                if len(head) + 4 > 8192:
+                    raise BridgeErr("DAP header too large")
                 length = -1
                 for line in head.decode("ascii", "replace").split("\r\n"):
                     if ":" in line:
@@ -117,10 +145,19 @@ class DapConn:
                                 length = int(val.strip())
                             except ValueError:
                                 length = -1
-                if length >= 0 and len(rest) >= length:
-                    msg = json.loads(rest[:length].decode("utf-8"))
+                if not 0 <= length <= 64 * 1024 * 1024:
+                    raise BridgeErr("invalid DAP Content-Length")
+                if len(rest) >= length:
+                    try:
+                        msg = json.loads(rest[:length].decode("utf-8"))
+                        if not isinstance(msg, dict):
+                            raise ValueError("expected object")
+                    except (ValueError, UnicodeError) as e:
+                        raise BridgeErr(f"invalid DAP message: {e}") from e
                     self.buf = rest[length:]
                     return msg
+            elif len(self.buf) >= 8192:
+                raise BridgeErr("DAP header too large")
             try:
                 chunk = self.sock.recv(65536)
             except (socket.timeout, TimeoutError):
@@ -172,10 +209,6 @@ class DapConn:
                     raise BridgeErr(msg.get("message", f"{command} failed"))
                 return msg.get("body", {})
             self.stash.append(msg)
-
-    def take_stash(self):
-        out, self.stash = self.stash, []
-        return out
 
 
 # ---------------------------------------------------------------- session
@@ -294,6 +327,8 @@ def parse_args(argv):
         elif a == "--timeout":
             i += 1
             cfg.timeout = float(argv[i])
+            if not math.isfinite(cfg.timeout) or not 0 < cfg.timeout <= 3600:
+                raise Usage("timeout must be between 0 and 3600 seconds")
         else:
             raise Usage(f"unknown arg: {a}")
         i += 1
@@ -760,7 +795,8 @@ class Session:
     def pump(self, timeout):
         """Wait for the next stopped/exited; returns 'stopped' or raises."""
         deadline = time.time() + timeout
-        for msg in self.dap.take_stash():
+        while self.dap.stash:
+            msg = self.dap.stash.pop(0)
             r = self._handle_pumped(msg)
             if r:
                 return r
@@ -793,10 +829,12 @@ class Session:
                 return r
 
     def _handle_pumped(self, msg):
-        if msg.get("type") != "event":
+        if not isinstance(msg, dict) or msg.get("type") != "event":
             return None
         ev = msg.get("event")
         body = msg.get("body", {})
+        if not isinstance(body, dict):
+            return None
         if ev == "stopped":
             reason = body.get("reason", "")
             # Wire trace: which stops the adapter reports (thread/reason).
@@ -814,54 +852,14 @@ class Session:
                           "data breakpoint", "entry", "goto"):
                 self.thread_id = body.get("threadId")
                 self.suspended = True
-                try:
-                    self.refresh_frames(timeout=15)
-                except BridgeErr:
-                    # Dead thread reports as failed stackTrace rather than
-                    # empty stackFrames — same ghost path as below.
-                    self.frames = []
+                self.frames = []
+                self.stop_info = None
+                # A failed stack read does not prove the thread died. Preserve
+                # the actual suspension and allow an explicit continue/retry.
+                self.publish_state(True)
+                self.refresh_frames(timeout=5)
                 if not self.frames:
-                    # The thread died between the event and our stackTrace
-                    # (e.g. a held HTTP handler whose client vanished:
-                    # BrokenPipe kills the worker). Parking a frameless
-                    # '?' stop poisons the session (later continues target
-                    # a dead thread). Retry briefly for slow suspends
-                    # (bounded 5s fetches); if still empty, skip and keep
-                    # waiting for a real stop instead of reporting a ghost.
-                    for _ in range(3):
-                        try:
-                            time.sleep(0.1)
-                        except Exception:
-                            pass
-                        try:
-                            self.refresh_frames(timeout=5)
-                        except BridgeErr:
-                            pass
-                        if self.frames:
-                            break
-                    if not self.frames:
-                        try:
-                            sys.stderr.write(
-                                f"dap: ghost stop skipped (thread {self.thread_id} "
-                                f"has no frames; reason={reason})\n")
-                            sys.stderr.flush()
-                        except Exception:
-                            pass
-                        # A skipped stop must not leave the target frozen
-                        # while we report running: resume best-effort (a
-                        # dead thread answers with an error, ignored).
-                        # Tradeoff, stated plainly: in the rare case of a
-                        # live stop with persistently unreadable frames,
-                        # we resume past it instead of parking a '?' ghost
-                        # that poisons every later command.
-                        try:
-                            self.dap_request("continue", {"threadId": self.thread_id},
-                                             timeout=5)
-                        except Exception:
-                            pass
-                        self.thread_id = None
-                        self.suspended = False
-                        return None
+                    raise BridgeErr("target stopped but stack is unavailable; retry context or continue")
                 if reason == "exception":
                     self.stop_info = self.exception_info()
                 else:
@@ -879,7 +877,7 @@ class Session:
             text = body.get("output", "")
             # Startup banners (ptvsd/debugpy) arrive during the handshake;
             # only collect once the session is configured.
-            if text and self.configured:
+            if isinstance(text, str) and text and self.configured:
                 self.output_tail = (self.output_tail + text)[-MAX_OUTPUT * 2:]
                 kept = "\n".join(
                     ln for ln in text.splitlines() if ln.strip() not in BANNER_LINES)
@@ -904,8 +902,11 @@ class Session:
             return
         try:
             with open(os.path.join(self.cfg.dir, "logs.jsonl"), "a") as f:
-                f.write(line + "\n")
-            self.log_count += 1
+                for part in line.splitlines():
+                    if self.log_count >= MAX_LOG_LINES:
+                        break
+                    f.write(part + "\n")
+                    self.log_count += 1
         except OSError:
             pass
 
@@ -985,6 +986,8 @@ class Session:
     def _resume_and_wait(self, timeout):
         """Resume after step/continue and wait for the next stop."""
         self.suspended = False
+        self.thread_id = None
+        self.frames = []
         self.publish_state(False)
         self.pump(timeout)
         return {"ok": True, "stopped": True, "changed": json.loads(self.last_changed),
@@ -1007,7 +1010,7 @@ class Session:
 
     def cmd_continue(self, req, timeout):
         self.require_live()
-        if self.thread_id is None:
+        if not self.suspended:
             # Never stopped: nothing to resume (a null threadId only
             # produces adapter errors) — the target already runs,
             # so go straight to waiting for the next stop.
@@ -1020,13 +1023,16 @@ class Session:
         waiting for a stop. Lets `logs` flush recently collected lines."""
         deadline = time.time() + budget
         while time.time() < deadline:
-            self.dap.sock.settimeout(max(0.05, deadline - time.time()))
-            try:
-                msg = self.dap._read_msg()
-            except (socket.timeout, TimeoutError):
-                return
-            except BridgeErr:
-                return
+            if self.dap.stash:
+                msg = self.dap.stash.pop(0)
+            else:
+                self.dap.sock.settimeout(max(0.05, deadline - time.time()))
+                try:
+                    msg = self.dap._read_msg()
+                except (socket.timeout, TimeoutError):
+                    return
+                except BridgeErr:
+                    return
             try:
                 self._handle_pumped(msg)
             except BridgeErr:
@@ -1066,7 +1072,9 @@ class Session:
         if not self.suspended or self.thread_id is None:
             raise BridgeErr("no stopped thread (target is running — continue first)")
         if not self.frames:
-            raise BridgeErr("no stopped thread yet in this session")
+            self.refresh_frames(timeout=5)
+            if not self.frames:
+                raise BridgeErr("target stopped but stack is unavailable; retry context or continue")
 
     def require_live(self):
         if self.exited:
@@ -1074,7 +1082,12 @@ class Session:
 
     def dispatch(self, req):
         cmd = req.get("cmd")
-        timeout = float(req.get("timeout", self.cfg.timeout))
+        try:
+            timeout = float(req.get("timeout", self.cfg.timeout))
+        except (ValueError, TypeError) as e:
+            raise BridgeErr("timeout must be between 0 and 3600 seconds") from e
+        if not math.isfinite(timeout) or not 0 < timeout <= 3600:
+            raise BridgeErr("timeout must be between 0 and 3600 seconds")
         if cmd == "close":
             raise _Close()
         if cmd == "context":
@@ -1160,52 +1173,44 @@ def am_owner(session_dir, nonce):
 
 
 def idle_pump(st):
-    """Process one already-arrived DAP message while idle (no waiter).
-
-    Single-threaded: serve() calls this only between commands, so there
-    is no race with pump()/request(). A stopped event parks exactly like
-    a waiter-observed stop (visible status, continuable); a response is
-    stashed for the request waiting for it (request() checks stash
-    first); output feeds logs. Partial frames stay buffered for the
-    next tick. Bounded work: at most one message per idle second.
-    """
+    """Drain a bounded batch between commands, using the sole DAP reader."""
+    if st.exited:
+        return
     sock = st.dap.sock
+    prev = sock.gettimeout()
+    deadline = time.monotonic() + 0.05
     try:
-        prev = sock.gettimeout()
-    except Exception:
-        return
-    try:
-        sock.settimeout(0.2)
-        try:
-            msg = st.dap._read_msg()
-        except (socket.timeout, TimeoutError):
-            return
-        except BridgeErr:
-            return
+        for _ in range(256):
+            if time.monotonic() >= deadline:
+                break
+            # Requests may have stashed events while inspecting an earlier
+            # stop. Consume those before reading newer socket messages.
+            if st.dap.stash:
+                msg = st.dap.stash.pop(0)
+            else:
+                sock.settimeout(max(0.001, deadline - time.monotonic()))
+                try:
+                    msg = st.dap._read_msg()
+                except (socket.timeout, TimeoutError):
+                    break
+                except BridgeErr:
+                    st.exited = True
+                    st.publish_state(False)
+                    break
+            try:
+                if st._handle_pumped(msg):
+                    break
+            except BridgeErr as e:
+                sys.stderr.write(f"dap: {e}\n")
+                break
     finally:
-        try:
-            sock.settimeout(prev)
-        except Exception:
-            pass
-    if not isinstance(msg, dict):
-        return
-    if msg.get("type") == "response":
-        # Nobody waits right now; stash for whoever asks next by seq.
-        st.dap.stash.append(msg)
-        return
-    try:
-        st._handle_pumped(msg)
-    except BridgeErr:
-        # Exited/dead-adapter while idle: state already updated
-        # (exited/published); the next command reports it.
-        pass
+        sock.settimeout(prev)
 
 
 def serve(st, server, nonce):
-    # Idle accept gets a 1s timeout so rm -rf abandonment is noticed even
-    # with zero traffic (blocking accept would orphan forever).
+    # Poll between commands without another DAP reader thread.
     try:
-        server.settimeout(1.0)
+        server.settimeout(0.1)
     except OSError:
         pass
     while True:
@@ -1216,12 +1221,10 @@ def serve(st, server, nonce):
             except Exception:
                 pass
             return
+        idle_pump(st)
         try:
             conn, _ = server.accept()
         except (socket.timeout, TimeoutError):
-            # Idle second: park already-arrived DAP stops so status sees
-            # them (Java drainer parity), then re-check abandonment.
-            idle_pump(st)
             continue
         except OSError:
             return
@@ -1265,9 +1268,9 @@ def main(argv):
         st = Session(cfg)
         st._nonce = nonce
         st.session_port = server.getsockname()[1]
-        if cfg.kind == "launch":
-            st.start_adapter()
         try:
+            if cfg.kind == "launch":
+                st.start_adapter()
             if cfg.kind == "launch":
                 st.handshake_launch()
             else:
