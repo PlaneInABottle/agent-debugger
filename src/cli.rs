@@ -238,7 +238,11 @@ pub(crate) enum Commands {
     /// List armed stops with plant state (verified/pending/slid/shadowed).
     /// No stop required — answers "which breakpoints do I have?" after
     /// compaction without reading bridge logs.
-    Breaks,
+    /// `breaks add --break SPEC` adds line breakpoints to the live session.
+    Breaks {
+        #[command(subcommand)]
+        cmd: Option<BreaksCmd>,
+    },
     /// Show collected logpoint lines.
     Logs {
         /// How many trailing lines to return (max 500).
@@ -251,6 +255,19 @@ pub(crate) enum Commands {
     Close,
     /// Check toolchains for current and future adapters.
     Doctor,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum BreaksCmd {
+    /// Add line breakpoints to the live session (running or parked).
+    /// Only confirmed additions persist to stops.json; duplicates are
+    /// idempotent, invalid batches change nothing.
+    Add {
+        /// Line breakpoint specs, e.g. com.Foo:54, app.py:42|x > 1.
+        /// Line breaks only (no method:/exc:/logpoint/watch/exit).
+        #[arg(long = "break", alias = "breakpoint", required = true)]
+        breaks: Vec<String>,
+    },
 }
 
 #[cfg(test)]
@@ -276,5 +293,43 @@ mod tests {
             }
         }
         assert!(Cli::try_parse_from(["agent-debugger", "continue", "--timeout", "3600"]).is_ok());
+    }
+
+    #[test]
+    fn breaks_bare_lists_and_add_needs_breaks_only() {
+        // Bare `breaks` lists (backward compatible, no subcommand).
+        assert!(Cli::try_parse_from(["agent-debugger", "breaks"]).is_ok());
+        // Add takes one or more --break specs.
+        assert!(
+            Cli::try_parse_from(["agent-debugger", "breaks", "add", "--break", "a.py:1"]).is_ok()
+        );
+        assert!(Cli::try_parse_from([
+            "agent-debugger",
+            "breaks",
+            "add",
+            "--break",
+            "a.py:1",
+            "--break",
+            "b.py:2"
+        ])
+        .is_ok());
+        // At least one --break is required.
+        assert!(Cli::try_parse_from(["agent-debugger", "breaks", "add"]).is_err());
+        // Add takes no timeout/logpoint/watch/exit/src.
+        for extra in ["--timeout", "--logpoint", "--watch", "--exit", "--src"] {
+            assert!(
+                Cli::try_parse_from([
+                    "agent-debugger",
+                    "breaks",
+                    "add",
+                    "--break",
+                    "a.py:1",
+                    extra,
+                    "x"
+                ])
+                .is_err(),
+                "{extra} must be rejected on breaks add"
+            );
+        }
     }
 }

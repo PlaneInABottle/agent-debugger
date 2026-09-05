@@ -117,6 +117,110 @@ class BridgeTests(unittest.TestCase):
             st.dispatch({"cmd": "nope", "timeout": "5"})
         self.assertIn("unknown cmd", str(cm.exception))
 
+    def test_stop_timeout_is_typed_bridge_err(self):
+        self.assertTrue(issubclass(bridge.StopTimeout, bridge.BridgeErr))
+
+    def test_first_stop_wait_timeout_raises_stop_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.session()
+            st.cfg.dir = tmp
+            st._nonce = bridge.write_owner(tmp)
+            st.dap = SimpleNamespace(stash=[])
+            with self.assertRaises(bridge.StopTimeout):
+                st.pump(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.session()
+            st.cfg.dir = tmp
+            st._nonce = bridge.write_owner(tmp)
+            st.dap = SimpleNamespace(stash=[])
+            with self.assertRaises(bridge.StopTimeout):
+                st.pump(0)
+
+    def add_session(self, tmp, breaks=()):
+        st = self.session()
+        st.cfg.dir = tmp
+        st.cfg.breaks = list(breaks)
+        st.dap_request = Mock()
+        return st
+
+    def test_breaks_add_rejects_non_line_specs_without_dap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.add_session(tmp)
+            for raw in ["method:foo", "exc", "exc:ValueError", "nope", "a.py:xx", ""]:
+                with self.assertRaises(bridge.BridgeErr):
+                    st.cmd_breaks_add({"breaks": [raw]})
+            st.dap_request.assert_not_called()
+            self.assertEqual(st.cfg.breaks, [])
+
+    def test_breaks_add_conflict_is_atomic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "a.py")
+            armed = (path, 5, None)
+            st = self.add_session(tmp, breaks=[armed])
+            st.stop_states = [{"spec": "a.py:5", "kind": "break", "state": "verified", "hits": 0}]
+            st._hitkeys = [("break", path, 5)]
+            with self.assertRaises(bridge.BridgeErr) as cm:
+                st.cmd_breaks_add({"breaks": [f"{path}:9", f"{path}:5|x > 1"]})
+            self.assertIn("conflicting", str(cm.exception))
+            st.dap_request.assert_not_called()
+            self.assertEqual(st.cfg.breaks, [armed])
+            self.assertEqual(len(st.stop_states), 1)
+
+    def test_breaks_add_duplicate_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "a.py")
+            st = self.add_session(tmp, breaks=[(path, 5, None)])
+            st.stop_states = [{"spec": "a.py:5", "kind": "break", "state": "verified", "hits": 0}]
+            st._hitkeys = [("break", path, 5)]
+            resp = st.cmd_breaks_add({"breaks": [f"{path}:5", f"{path}:5"]})
+            self.assertEqual(resp, {"ok": True, "added": [], "stops": st.stop_states})
+            st.dap_request.assert_not_called()
+
+    def test_breaks_add_success_confirms_subset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "a.py")
+            st = self.add_session(tmp)
+            st.dap_request.return_value = {"breakpoints": [{"verified": True}]}
+            raw = f"{path}:5"
+            resp = st.cmd_breaks_add({"breaks": [raw]})
+            self.assertTrue(resp["ok"])
+            self.assertEqual(len(resp["added"]), 1)
+            self.assertEqual(resp["added"][0]["raw"], raw)
+            self.assertEqual(resp["added"][0]["state"], "verified")
+            self.assertEqual(st.cfg.breaks, [(path, 5, None)])
+            self.assertEqual(len(st.stop_states), 1)
+            self.assertEqual(st._hitkeys, [("break", path, 5)])
+            # DAP saw the merged file list with a 5s bound.
+            _, kwargs = st.dap_request.call_args
+            self.assertEqual(kwargs.get("timeout"), 5)
+
+    def test_breaks_add_partial_ok_with_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = str(Path(tmp) / "a.py")
+            b = str(Path(tmp) / "b.py")
+            st = self.add_session(tmp)
+
+            def fake(command, args=None, timeout=30):
+                if args["source"]["path"] == a:
+                    return {"breakpoints": [{"verified": False, "message": "pending"}]}
+                raise bridge.BridgeErr("adapter exploded")
+            st.dap_request.side_effect = fake
+            resp = st.cmd_breaks_add({"breaks": [f"{a}:5", f"{b}:6"]})
+            self.assertTrue(resp["ok"])
+            self.assertEqual([e["raw"] for e in resp["added"]], [f"{a}:5"])
+            self.assertIn("warning", resp)
+            self.assertEqual(st.cfg.breaks, [(a, 5, None)])
+
+    def test_breaks_add_total_failure_is_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = str(Path(tmp) / "a.py")
+            st = self.add_session(tmp)
+            st.dap_request.side_effect = bridge.BridgeErr("adapter exploded")
+            with self.assertRaises(bridge.BridgeErr):
+                st.cmd_breaks_add({"breaks": [f"{a}:5"]})
+            self.assertEqual(st.cfg.breaks, [])
+            self.assertEqual(st.stop_states, [])
+
     def test_partial_dap_frame_is_preserved(self):
         left, right = socket.socketpair()
         self.addCleanup(left.close)

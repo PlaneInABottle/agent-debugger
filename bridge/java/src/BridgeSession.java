@@ -66,7 +66,19 @@ class BridgeSession {
             st.suspended = false;
             if (BridgeCli.hasStoppingBreaks(cfg)) {
                 // First stop, synchronously: CLI polls session.json for readiness.
-                awaitStop(st, cfg.timeoutMs);
+                try {
+                    awaitStop(st, cfg.timeoutMs);
+                } catch (StopTimeout t) {
+                    // Attach-only fallback: a live target that never hits
+                    // stays a running session with breaks armed; the agent
+                    // triggers the stop later via continue. Launch timeouts
+                    // still fail (outer catch maps them to error.json), and
+                    // target exit (BridgeException) never falls back.
+                    if (!cfg.sessionKind.equals("attach")) throw t;
+                    publishState(st, false);
+                    serveLoop(st, dir);
+                    return;
+                }
             }
             publishState(st, st.suspended);
             serveLoop(st, dir);
@@ -486,9 +498,13 @@ class BridgeSession {
     }
 
     static String dispatch(SessionState st, String reqJson) throws Exception {
+        // cmd first (depth-aware): breaksAdd carries a JSON array the flat
+        // parser cannot hold, so it branches before flat parsing.
+        String cmd = BridgeProto.parseCmd(reqJson);
+        if (cmd.equals("breaksAdd")) {
+            return breaksAddJson(st, BridgeProto.parseStringArray(reqJson, "breaks"));
+        }
         Map<String, String> req = BridgeProto.parseJsonObject(reqJson);
-        String cmd = req.get("cmd");
-        if (cmd == null) throw new BridgeException("request needs a cmd");
         long timeout = req.containsKey("timeout")
                 ? BridgeCli.timeoutMillis(req.get("timeout")) : st.cfg.timeoutMs;
         switch (cmd) {
@@ -724,8 +740,140 @@ class BridgeSession {
      */
 
     static String breaksJson(SessionState st) throws Exception {
+        return "{\"ok\":true,\"stops\":" + stopsArrayJson(st) + "}";
+    }
+
+    /**
+     * Additive line breaks on a live session (running or parked — never
+     * suspended/resumed here). Two phases: the whole batch validates first
+     * (parse, canonical dedup/conflict, read-only line checks) with zero JDI
+     * mutation, then every fresh break arms. Exact canonical duplicates are
+     * idempotent (added empty); the same line with a different condition
+     * rejects the batch before anything mutates.
+     */
+    static String breaksAddJson(SessionState st, List<String> raws) throws Exception {
+        if (st.exited) throw new BridgeException("target VM has exited — close this session");
+        if (raws.isEmpty()) throw new BridgeException("breaks add needs at least one --break");
+        List<AddedLine> fresh = new ArrayList<>();
+        Map<String, String> batchCond = new LinkedHashMap<>(); // loc -> cond (null = plain)
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        for (String raw : raws) {
+            AddedLine p = parseAddedLine(raw);
+            String loc = p.cls + ":" + p.line;
+            String key = loc + "|" + (p.cond == null ? "" : p.cond);
+            if (!seen.add(key)) continue; // intra-batch duplicate: idempotent
+            List<Integer> have = st.cfg.breakpoints.get(p.cls);
+            String haveCond = st.cfg.condByLoc.get(loc);
+            if (have != null && have.contains(p.line)) {
+                if (condEqual(haveCond, p.cond)) continue; // already armed: idempotent
+                throw new BridgeException("conflicting condition for " + loc + " (already armed"
+                        + (haveCond == null ? " plain" : " as '" + haveCond + "'") + "): " + raw);
+            }
+            if (batchCond.containsKey(loc) && !condEqual(batchCond.get(loc), p.cond)) {
+                throw new BridgeException("conflicting condition for " + loc + " (same batch): " + raw);
+            }
+            batchCond.put(loc, p.cond);
+            // Read-only line check for loaded classes (no JDI mutation yet).
+            for (ReferenceType rt : st.vm.classesByName(p.cls)) {
+                List<Location> locs;
+                try {
+                    locs = rt.locationsOfLine(p.line);
+                } catch (AbsentInformationException aie) {
+                    throw new BridgeException("class " + p.cls + " has no debug info — recompile with -g");
+                }
+                if (locs.isEmpty()) throw new BridgeException("no executable code at " + p.cls + ":" + p.line);
+            }
+            fresh.add(p);
+        }
+        StringBuilder added = new StringBuilder("[");
+        boolean first = true;
+        for (AddedLine p : fresh) {
+            st.cfg.breakpoints.computeIfAbsent(p.cls, k -> new ArrayList<>()).add(p.line);
+            if (p.cond != null) st.cfg.condByLoc.put(p.cls + ":" + p.line, p.cond);
+            List<ReferenceType> loaded = st.vm.classesByName(p.cls);
+            boolean verified;
+            String detail = null;
+            if (!loaded.isEmpty()) {
+                // Direct arm: class is loaded right now.
+                for (ReferenceType rt : loaded) {
+                    BridgeConn.setLines(st.vm, rt, java.util.Collections.singletonList(p.line));
+                }
+                verified = true;
+            } else {
+                watchClass(st.vm, p.cls);
+                // Class may have finished loading between validation and
+                // arming: recheck before settling for deferred.
+                loaded = st.vm.classesByName(p.cls);
+                if (!loaded.isEmpty()) {
+                    for (ReferenceType rt : loaded) {
+                        BridgeConn.setLines(st.vm, rt, java.util.Collections.singletonList(p.line));
+                    }
+                    verified = true;
+                } else {
+                    verified = false;
+                    detail = "class not loaded yet (deferred)";
+                }
+            }
+            String spec = p.cls + ":" + p.line + (p.cond == null ? "" : "|" + p.cond);
+            if (!first) added.append(',');
+            first = false;
+            added.append("{\"raw\":").append(JdiBridge.quote(p.raw));
+            added.append(",\"spec\":").append(JdiBridge.quote(spec));
+            added.append(",\"kind\":\"break\"");
+            added.append(",\"state\":").append(JdiBridge.quote(verified ? "verified" : "pending"));
+            if (detail != null) added.append(",\"detail\":").append(JdiBridge.quote(detail));
+            added.append(",\"hits\":").append(hitsOf(st, "break|" + p.cls + "|" + p.line));
+            added.append('}');
+        }
+        added.append(']');
+        return "{\"ok\":true,\"added\":" + added + ",\"stops\":" + stopsArrayJson(st) + "}";
+    }
+
+    /** Line-break-only parse (mirrors BridgeCli.parseBreakpoint normalization). */
+    static AddedLine parseAddedLine(String raw) throws UsageException {
+        String cond = null;
+        String head = raw;
+        int bar = raw.indexOf('|');
+        if (bar >= 0) {
+            cond = raw.substring(bar + 1).trim();
+            head = raw.substring(0, bar);
+            BridgeCli.validateCond(cond);
+        }
+        if (head.startsWith("method:") || head.startsWith("exc:")) {
+            throw new UsageException("breaks add takes line breaks only (got '" + raw + "')");
+        }
+        int colon = head.lastIndexOf(':');
+        if (colon <= 0) throw new UsageException("--break must look like com.example.Hello:30, got: " + raw);
+        String cls = head.substring(0, colon).replace('/', '.');
+        if (cls.endsWith(".java")) cls = cls.substring(0, cls.length() - 5).replace('/', '.');
+        int line;
+        try {
+            line = Integer.parseInt(head.substring(colon + 1));
+        } catch (NumberFormatException e) {
+            throw new UsageException("bad line in --break: " + raw);
+        }
+        AddedLine p = new AddedLine();
+        p.raw = raw;
+        p.cls = cls;
+        p.line = line;
+        p.cond = cond;
+        return p;
+    }
+
+    static class AddedLine {
+        String raw;
+        String cls;
+        int line;
+        String cond;
+    }
+
+    static boolean condEqual(String a, String b) {
+        return a == null ? b == null : a.equals(b);
+    }
+
+    static String stopsArrayJson(SessionState st) throws Exception {
         Config cfg = st.cfg;
-        StringBuilder sb = new StringBuilder("{\"ok\":true,\"stops\":[");
+        StringBuilder sb = new StringBuilder("[");
         boolean first = true;
         for (Map.Entry<String, List<Integer>> e : cfg.breakpoints.entrySet()) {
             boolean loaded = !st.vm.classesByName(e.getKey()).isEmpty();
@@ -770,7 +918,7 @@ class BridgeSession {
                         hitsOf(st, "exit|" + e.getKey() + "." + m));
             }
         }
-        return sb.append("]}").toString();
+        return sb.append(']').toString();
     }
 
     static boolean breakRec(StringBuilder sb, boolean first,

@@ -1099,6 +1099,120 @@ class Session {
     return { ok: true, stops: this.stopStates };
   }
 
+  /**
+   * Additive line breaks on a live tab (running or parked — never
+   * suspended/resumed here). The whole batch validates first (parse,
+   * canonical dedup/conflict incl. same-frag-line startup logpoints) with
+   * no CDP traffic, then each fresh break installs via setBreakpointByUrl
+   * (<=5s). Exact canonical duplicates are idempotent (added empty); the
+   * same line with a different condition — or any same-line logpoint —
+   * rejects the batch before anything mutates.
+   */
+  async cmdBreaksAdd(req) {
+    await this.verifyTab();
+    if (this.exited) throw new BridgeErr(EXITED_MSG);
+    const raws = req.breaks;
+    if (!Array.isArray(raws) || raws.length === 0) {
+      throw new BridgeErr('breaks add needs at least one --break');
+    }
+    for (const r of raws) {
+      if (typeof r !== 'string' || !r) throw new BridgeErr(`bad break spec: ${JSON.stringify(r)}`);
+    }
+    const scratch = { breaks: [], logpoints: [], wantExc: false };
+    for (const raw of raws) {
+      const bar = raw.indexOf('|');
+      const head = bar < 0 ? raw : raw.slice(0, bar);
+      if (head === 'exc' || head.startsWith('exc:') || head.startsWith('method:')) {
+        throw new BridgeErr(`breaks add takes line breaks only (got '${raw}')`);
+      }
+      try {
+        parseBreak(raw, scratch);
+      } catch (e) {
+        throw new BridgeErr(e instanceof Usage ? e.message : String((e && e.message) || e));
+      }
+    }
+    const canonKey = (frag, line, cond) => `${frag}:${line}|${cond || ''}`;
+    // Armed lines: breaks carry their cond, logpoints always conflict.
+    const armed = new Map(); // `${frag}:${line}` -> {cond, kind}
+    for (const b of this.cfg.breaks) {
+      armed.set(`${b.frag}:${b.line}`, { cond: b.cond || null, kind: 'break' });
+    }
+    for (const l of this.cfg.logpoints) {
+      if (!armed.has(`${l.frag}:${l.line}`)) {
+        armed.set(`${l.frag}:${l.line}`, { cond: null, kind: 'logpoint' });
+      }
+    }
+    const conflictDetail = (o) => o.kind === 'logpoint'
+      ? 'as logpoint'
+      : (o.cond ? `as '${o.cond}'` : 'plain');
+    const seen = new Set();
+    const batchLoc = new Map();
+    const fresh = []; // {raw, frag, line, cond}
+    for (let i = 0; i < raws.length; i++) {
+      const b = scratch.breaks[i];
+      const key = canonKey(b.frag, b.line, b.cond);
+      if (seen.has(key)) continue; // intra-batch duplicate: idempotent
+      seen.add(key);
+      const loc = `${b.frag}:${b.line}`;
+      if (armed.has(loc)) {
+        const o = armed.get(loc);
+        if (o.kind === 'break' && (o.cond || null) === (b.cond || null)) continue; // idempotent
+        throw new BridgeErr(`conflicting condition for ${b.frag}:${b.line} ` +
+          `(already armed ${conflictDetail(o)}): ${raws[i]}`);
+      }
+      if (batchLoc.has(loc) && (batchLoc.get(loc) || null) !== (b.cond || null)) {
+        throw new BridgeErr(`conflicting condition for ${b.frag}:${b.line} (same batch): ${raws[i]}`);
+      }
+      batchLoc.set(loc, b.cond || null);
+      fresh.push({ raw: raws[i], frag: b.frag, line: b.line, cond: b.cond || null });
+    }
+    if (fresh.length === 0) return { ok: true, added: [], stops: this.stopStates };
+    const added = [];
+    const failed = [];
+    for (const f of fresh) {
+      const params = { urlRegex: fragRegex(f.frag), lineNumber: f.line - 1 };
+      if (f.cond) params.condition = f.cond;
+      let res;
+      try {
+        res = await this.cdp.request('Debugger.setBreakpointByUrl', params, 5000);
+      } catch (e) {
+        failed.push(f);
+        continue;
+      }
+      const bpId = res.breakpointId;
+      if (!bpId) {
+        failed.push(f);
+        continue;
+      }
+      const rec = { spec: this.dispSpec(f, 'break'), kind: 'break', hits: 0 };
+      this.breakIdToRec.set(bpId, { rec, line: f.line });
+      const locs = res.locations || [];
+      const slidLoc = (locs.map((l) => l.lineNumber + 1).find((n) => n !== f.line));
+      if (slidLoc !== undefined) {
+        rec.state = 'slid';
+        rec.detail = `slid to line ${slidLoc}`;
+      } else {
+        rec.state = locs.length > 0 ? 'verified' : 'pending';
+        if (rec.state === 'pending') rec.detail = 'no locations yet (script not parsed or line not executable)';
+      }
+      this.stopStates.push(rec);
+      this.cfg.breaks.push({ frag: f.frag, line: f.line, cond: f.cond });
+      const entry = { raw: f.raw, spec: rec.spec, kind: 'break', state: rec.state, hits: 0 };
+      if (rec.detail) entry.detail = rec.detail;
+      added.push(entry);
+    }
+    if (added.length === 0) {
+      throw new BridgeErr(`breaks add failed for ${failed.length} break(s): ` +
+        failed.map((f) => `${f.frag}:${f.line}`).join(', '));
+    }
+    const resp = { ok: true, added, stops: this.stopStates };
+    if (failed.length > 0) {
+      resp.warning = 'partial add: no change for ' +
+        failed.map((f) => `${f.frag}:${f.line}`).join(', ');
+    }
+    return resp;
+  }
+
   async dispatch(req) {
     const cmd = req.cmd;
     let timeout = Number(req.timeout !== undefined ? req.timeout : this.cfg.timeout);
@@ -1113,6 +1227,7 @@ class Session {
     if (cmd === 'reload') return await this.cmdReload(req, timeout);
     if (cmd === 'threads') return await this.cmdThreads();
     if (cmd === 'breaks') return await this.cmdBreaks();
+    if (cmd === 'breaksAdd') return await this.cmdBreaksAdd(req);
     if (cmd === 'logs') return this.cmdLogs(req);
     throw new BridgeErr(`unknown cmd: ${cmd}`);
   }

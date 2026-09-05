@@ -79,6 +79,74 @@ fn session_port(name: &str) -> anyhow::Result<u16> {
         .ok_or_else(|| anyhow::anyhow!("corrupt session file for '{name}'"))
 }
 
+/// Add line breakpoints to a live session, persisting only what the bridge
+/// confirms. Forward bound: min(10 + 5*N, 65)s for N raw specs (each bridge
+/// round-trip is bounded server-side). Transport failure persists nothing —
+/// the bridge may still have applied, so the error points at bare `breaks`.
+/// Bridge ok:false also persists nothing (zero confirmed by contract).
+pub fn cmd_breaks_add(name: &str, breaks: &[String]) -> anyhow::Result<Value> {
+    check_name(name)?;
+    let port = session_port(name)?;
+    let secs = std::cmp::min(10 + 5 * breaks.len() as u64, 65);
+    let body = serde_json::json!({"cmd": "breaksAdd", "breaks": breaks});
+    let resp = client::request(port, &body, Duration::from_secs(secs)).map_err(|e| {
+        anyhow::anyhow!(
+            "breaks add may or may not have applied ({e:#}) — persistence skipped; \
+             run bare `breaks` to check live stops"
+        )
+    })?;
+    if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let msg = resp
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown bridge error");
+        anyhow::bail!("{msg}");
+    }
+    let confirmed: Vec<String> = resp
+        .get("added")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| e.get("raw").and_then(|r| r.as_str()).map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !confirmed.is_empty() {
+        append_confirmed_breaks(name, &confirmed)?;
+    }
+    Ok(resp)
+}
+
+/// Append confirmed raw specs to stops.json's breaks list. Atomic tmp+rename
+/// in the same dir; every other field (timeout, target, unknown) is preserved
+/// byte-for-byte in value (only the breaks array grows).
+fn append_confirmed_breaks(name: &str, raws: &[String]) -> anyhow::Result<()> {
+    append_confirmed_breaks_in(&checked_session_dir(name)?, raws)
+}
+
+fn append_confirmed_breaks_in(dir: &std::path::Path, raws: &[String]) -> anyhow::Result<()> {
+    let path = dir.join("stops.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("cannot read session intent: {e}"))?;
+    let mut intent: Value =
+        serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("corrupt session intent: {e}"))?;
+    let list = intent
+        .get_mut("breaks")
+        .and_then(|b| b.as_array_mut())
+        .ok_or_else(|| anyhow::anyhow!("corrupt session intent: breaks is not a list"))?;
+    for r in raws {
+        list.push(Value::String(r.clone()));
+    }
+    let tmp = dir.join("stops.json.tmp");
+    std::fs::write(
+        &tmp,
+        serde_json::to_string_pretty(&intent).unwrap_or_else(|_| "{}".to_string()),
+    )
+    .map_err(|e| anyhow::anyhow!("cannot persist session intent: {e}"))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| anyhow::anyhow!("cannot persist session intent: {e}"))?;
+    Ok(())
+}
 /// Forward one command to the session; map {ok:false} to Err.
 /// Both adapters speak the same session protocol, so forwarding is
 /// language-agnostic (the session's lang only selects the adapter process).
@@ -640,6 +708,41 @@ mod tests {
             armed,
             json!({"breaks": 2, "logpoints": 0, "watches": 1, "exits": 0})
         );
+    }
+
+    #[test]
+    fn appended_breaks_preserve_intent_fields() {
+        // Atomic append grows only the breaks list: timeout/target/unknown
+        // fields survive, and no tmp file is left behind.
+        let dir = tmpdir("append");
+        std::fs::write(
+            dir.join("stops.json"),
+            r#"{"breaks":["a.py:1"],"logpoints":[],"watches":[],"exits":[],
+                "sources":[],"timeout":7,"target":{"program":"a.py"},
+                "futureField":{"nested":true}}"#,
+        )
+        .unwrap();
+        append_confirmed_breaks_in(&dir, &["b.py:2".to_string(), "c.py:3|x > 1".to_string()])
+            .unwrap();
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("stops.json")).unwrap())
+                .unwrap();
+        assert_eq!(v["breaks"], json!(["a.py:1", "b.py:2", "c.py:3|x > 1"]));
+        assert_eq!(v["timeout"], json!(7));
+        assert_eq!(v["target"]["program"], json!("a.py"));
+        assert_eq!(v["futureField"]["nested"], json!(true));
+        assert!(!dir.join("stops.json.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_rejects_missing_or_non_list_breaks() {
+        let dir = tmpdir("append-bad");
+        std::fs::write(dir.join("stops.json"), r#"{"timeout":7}"#).unwrap();
+        assert!(append_confirmed_breaks_in(&dir, &["b.py:2".to_string()]).is_err());
+        std::fs::write(dir.join("stops.json"), r#"{"breaks":"nope"}"#).unwrap();
+        assert!(append_confirmed_breaks_in(&dir, &["b.py:2".to_string()]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

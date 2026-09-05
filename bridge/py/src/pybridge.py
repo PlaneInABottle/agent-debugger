@@ -46,6 +46,12 @@ class BridgeErr(Exception):
     pass
 
 
+class StopTimeout(BridgeErr):
+    """First-stop wait timed out. Typed so attach can fall back to a live
+    running session while launch still fails — never match by message."""
+    pass
+
+
 # ---------------------------------------------------------------- framing
 
 def read_frame(conn):
@@ -812,7 +818,7 @@ class Session:
                 raise SystemExit(0)
             remaining = deadline - time.time()
             if remaining <= 0:
-                raise BridgeErr(
+                raise StopTimeout(
                     f"timeout: no stop within {timeout:g}s")
             self.dap.sock.settimeout(min(remaining, 1.0))
             try:
@@ -1051,6 +1057,148 @@ class Session:
             raise BridgeErr("target VM has exited — close this session")
         return {"ok": True, "stops": self.stop_states}
 
+    def cmd_breaks_add(self, req):
+        """Additive line breaks on a live session (running or parked — never
+        suspended/resumed here). The whole batch validates first (parse,
+        canonical dedup/conflict) with no DAP traffic; then each touched file
+        is re-sent merged with existing breaks (setBreakpoints replaces per
+        file). Per-file DAP successes become the confirmed subset (partial
+        ok + warning); total failure is ok:false with nothing mutated."""
+        if self.exited:
+            raise BridgeErr("target VM has exited — close this session")
+        raws = req.get("breaks")
+        if not isinstance(raws, list) or not raws:
+            raise BridgeErr("breaks add needs at least one --break")
+        for r in raws:
+            if not isinstance(r, str) or not r:
+                raise BridgeErr(f"bad break spec: {r!r}")
+        scratch = Config()
+        try:
+            for r in raws:
+                head = r.split("|", 1)[0]
+                if head == "exc" or head.startswith("exc:") or head.startswith("method:"):
+                    raise Usage(f"breaks add takes line breaks only (got {r!r})")
+                parse_break(r, scratch)
+            if scratch.methods or scratch.want_exc:
+                raise Usage("breaks add takes line breaks only")
+        except Usage as e:
+            raise BridgeErr(str(e))
+        have = {(p, ln, c) for p, ln, c in self.cfg.breaks}
+        seen = set()
+        batch_locs = {}  # (path, line) -> cond of fresh items this batch
+        fresh = []  # (raw, path, line, cond)
+        for r, (path, line, cond) in zip(raws, scratch.breaks):
+            key = (path, line, cond)
+            if key in seen or key in have:
+                continue  # idempotent (intra-batch dup or already armed)
+            seen.add(key)
+            other, hit = None, False
+            for p, ln, c in self.cfg.breaks:
+                if p == path and ln == line:
+                    other, hit = c, True
+                    break
+            if not hit and (path, line) in batch_locs:
+                other, hit = batch_locs[(path, line)], True
+            if hit:
+                raise BridgeErr(
+                    f"conflicting condition for {self.rel_file(path)}:{line} "
+                    f"(already armed{' as ' + repr(other) if other else ' plain'}): {r}")
+            batch_locs[(path, line)] = cond
+            fresh.append((r, path, line, cond))
+        if not fresh:
+            return {"ok": True, "added": [], "stops": self.stop_states}
+        by_file = {}
+        for item in fresh:
+            by_file.setdefault(item[1], []).append(item)
+        added = []
+        failed = []
+        for path, items in by_file.items():
+            # Existing entries ride along (breaks in cfg order, then
+            # logpoints): setBreakpoints REPLACES the file, so omitting them
+            # would drop live stops.
+            exist_breaks = [(ln, c) for p, ln, c in self.cfg.breaks if p == path]
+            exist_logs = [(ln, t) for p, ln, t in self.cfg.logpoints if p == path]
+            params = []
+            for ln, c in exist_breaks:
+                bp = {"line": ln}
+                if c:
+                    bp["condition"] = c
+                params.append(bp)
+            for ln, t in exist_logs:
+                params.append({"line": ln, "logMessage": t})
+            for _, _, ln, c in items:
+                bp = {"line": ln}
+                if c:
+                    bp["condition"] = c
+                params.append(bp)
+            try:
+                body = self.dap_request("setBreakpoints",
+                                        {"source": {"path": path},
+                                         "breakpoints": params},
+                                        timeout=5)
+            except BridgeErr:
+                failed.append(path)
+                continue
+            got_list = body.get("breakpoints", [])
+            # Positional refresh (request order above): existing breaks, then
+            # logpoints, then new. Short answers leave old records untouched.
+            bi = [i for i, k in enumerate(self._hitkeys)
+                  if k[0] == "break" and len(k) == 3 and k[1] == path]
+            li = [i for i, k in enumerate(self._hitkeys)
+                  if k[0] == "logpoint" and len(k) == 3 and k[1] == path]
+            for pos, i in enumerate(bi):
+                if pos < len(got_list):
+                    self._refresh_rec(self.stop_states[i], got_list[pos], False)
+            for pos, i in enumerate(li):
+                idx = len(exist_breaks) + pos
+                if idx < len(got_list):
+                    # Reset to the template first: repeated refreshes must
+                    # not stack "(msg)" suffixes on the detail.
+                    line_of = self._hitkeys[i][2]
+                    tmpl = next((t for p, ln, t in self.cfg.logpoints
+                                 if p == path and ln == line_of), None)
+                    if tmpl is not None:
+                        self.stop_states[i]["detail"] = tmpl
+                    self._refresh_rec(self.stop_states[i], got_list[idx], True)
+            base = len(exist_breaks) + len(exist_logs)
+            for k, (r, _, ln, c) in enumerate(items):
+                got = got_list[base + k] if base + k < len(got_list) else {}
+                spec = f"{self.rel_file(path)}:{ln}"
+                if c:
+                    spec += f"|{c}"
+                rec = {"spec": spec, "kind": "break", "hits": 0}
+                self._refresh_rec(rec, got, False)
+                self.stop_states.append(rec)
+                self._hitkeys.append(("break", path, ln))
+                self.cfg.breaks.append((path, ln, c))
+                entry = {"raw": r, "spec": spec, "kind": "break",
+                         "state": rec["state"], "hits": 0}
+                if "detail" in rec:
+                    entry["detail"] = rec["detail"]
+                added.append(entry)
+        if not added:
+            raise BridgeErr(
+                f"breaks add failed for {len(failed)} file(s): "
+                + ", ".join(self.rel_file(p) for p in failed))
+        resp = {"ok": True, "added": added, "stops": self.stop_states}
+        if failed:
+            resp["warning"] = ("partial add: no change for "
+                               + ", ".join(self.rel_file(p) for p in failed))
+        return resp
+
+    def _refresh_rec(self, rec, got, is_logpoint):
+        """Apply one setBreakpoints answer to a record (shared by arm/add)."""
+        verified = bool(got.get("verified", False))
+        rec["state"] = "verified" if verified else "pending"
+        if not verified:
+            msg = got.get("message", "pending")
+            if is_logpoint and "detail" in rec:
+                rec["detail"] = f"{rec['detail']} ({msg})"
+            elif not is_logpoint or "detail" not in rec:
+                rec["detail"] = msg
+        elif "detail" in rec and not is_logpoint:
+            del rec["detail"]
+
     def cmd_logs(self, req):
         tail = max(1, min(500, int(req.get("tail", 50))))
         # Flush recently arrived output first: in logpoints-only sessions
@@ -1106,6 +1254,8 @@ class Session:
             return self.cmd_threads()
         if cmd == "breaks":
             return self.cmd_breaks()
+        if cmd == "breaksAdd":
+            return self.cmd_breaks_add(req)
         if cmd == "logs":
             return self.cmd_logs(req)
         raise BridgeErr(f"unknown cmd: {cmd}")
@@ -1276,7 +1426,19 @@ def main(argv):
             else:
                 st.handshake_attach()
             if cfg.breaks or cfg.methods or cfg.want_exc:
-                st.pump(cfg.timeout)
+                try:
+                    st.pump(cfg.timeout)
+                except StopTimeout:
+                    # Attach-only fallback: a live target that never hits
+                    # stays a running session with breaks armed; the agent
+                    # triggers the stop later via continue. Launch timeouts
+                    # re-raise into the error.json path below, and target
+                    # exit (plain BridgeErr) never falls back.
+                    if cfg.kind != "attach":
+                        raise
+                    st.publish_state(False)
+                    serve(st, server, nonce)
+                    return
             write_file(os.path.join(cfg.dir, "session.json"), json.dumps(
                 {"name": os.path.basename(cfg.dir), "kind": cfg.kind,
                  "port": server.getsockname()[1],

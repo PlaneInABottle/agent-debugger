@@ -12,8 +12,9 @@ editor.
 
 Target commands live under a language group (`java ...`, `py ...`,
 `node ...`); session commands (`continue step eval vars stack context
-threads breaks logs reload close`) are language-agnostic and read the
-session's language themselves (`reload` is browser-only).
+threads breaks logs reload close`, plus `breaks add --break SPEC`) are
+language-agnostic and read the session's language themselves (`reload`
+is browser-only).
 Output shapes are identical across languages: learn once.
 
 ## Core Workflow
@@ -66,10 +67,21 @@ agent-debugger --session cart context  # where it is parked (if stopped)
 - `breaks` also reports `hits`: times the stop fired. Step landings
   never count (Python/Java exclude them structurally; Node/browser count
   only adapter-reported hit ids), so a dead breakpoint honestly reads 0.
-  Logpoint fires count wherever visible (Java client-side, Node/browser
-  auto-resumed pauses); `hits:null` means uncountable, not zero (Python
-  logpoints fire inside debugpy, invisibly). After compaction, hits tell
-  you which of your breakpoints are actually live.
+   Logpoint fires count wherever visible (Java client-side, Node/browser
+   auto-resumed pauses); `hits:null` means uncountable, not zero (Python
+   logpoints fire inside debugpy, invisibly). After compaction, hits tell
+   you which of your breakpoints are actually live.
+- Additive breaks: `breaks add --break app.py:55` arms line breaks on the
+  live session, running or parked (line breaks with `|cond` allowed;
+  method:/exc:/logpoint/watch/exit are rejected). Only confirmed additions
+  persist to `stops.json`, so `status`/`breaks`/intent reconverge on their
+  own. Duplicates are idempotent; a same-line different-condition (or a
+  same-line logpoint on Node/browser) rejects the whole batch atomically.
+  Never add while a `continue`/`step`/`reload` is still outstanding — the
+  command queues behind it, so park (or stay idle-running) first.
+- Delayed recipe: attach with a never-hit (or no) break returns a running
+  session fast instead of burning `--timeout`; `breaks add` the real lines
+  once you know them, trigger the target, then `continue` to the stop.
 - Name sessions after the task (`--session cart-npe`): the name is the
   only "why" that survives, and it costs nothing extra.
 - Never `rm -rf` a session dir instead of `close` (bridges self-reap, but

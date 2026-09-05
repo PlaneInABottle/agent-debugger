@@ -180,10 +180,15 @@ fn dispatch(session: &str, cmd: cli::Commands) -> (&'static str, anyhow::Result<
             "threads",
             session::forward(session, &json!({"cmd": "threads"}), Duration::from_secs(15)),
         ),
-        cli::Commands::Breaks => (
-            "breaks",
-            session::forward(session, &json!({"cmd": "breaks"}), Duration::from_secs(10)),
-        ),
+        cli::Commands::Breaks { cmd } => match cmd {
+            None => (
+                "breaks",
+                session::forward(session, &json!({"cmd": "breaks"}), Duration::from_secs(10)),
+            ),
+            Some(cli::BreaksCmd::Add { breaks }) => {
+                ("breaks", session::cmd_breaks_add(session, &breaks))
+            }
+        },
         cli::Commands::Vars { frame } => (
             "vars",
             session::forward(

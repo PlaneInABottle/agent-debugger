@@ -5,7 +5,9 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 // Wire + text IO: TCP framing, minimal JSON parser, file appends, target-output drain. Moved verbatim from JdiBridge.java.
@@ -111,6 +113,98 @@ class BridgeProto {
     static int skipWs(String s, int i) {
         while (i < s.length() && Character.isWhitespace(s.charAt(i))) i++;
         return i;
+    }
+
+    /**
+     * Top-level "cmd" of a request object, without assuming flat values:
+     * values are skipped depth-aware (arrays/objects survive), so a later
+     * string value containing "\"cmd\"" can never shadow the real key.
+     */
+    static String parseCmd(String json) throws BridgeException {
+        int i = skipWs(json, 0);
+        if (i >= json.length() || json.charAt(i) != '{') throw new BridgeException("bad request json");
+        i++;
+        while (true) {
+            i = skipWs(json, i);
+            if (i < json.length() && json.charAt(i) == '}') break;
+            if (i >= json.length() || json.charAt(i) != '"') throw new BridgeException("bad request json");
+            int[] end = new int[1];
+            String key = parseJsonString(json, i, end);
+            i = skipWs(json, end[0]);
+            if (i >= json.length() || json.charAt(i) != ':') throw new BridgeException("bad request json");
+            i = skipWs(json, i + 1);
+            if (key.equals("cmd")) {
+                if (i >= json.length() || json.charAt(i) != '"') throw new BridgeException("request needs a cmd");
+                return parseJsonString(json, i, end);
+            }
+            i = skipValue(json, i);
+            i = skipWs(json, i);
+            if (i < json.length() && json.charAt(i) == ',') { i++; continue; }
+            if (i < json.length() && json.charAt(i) == '}') break;
+            if (i >= json.length()) break;
+            throw new BridgeException("bad request json");
+        }
+        throw new BridgeException("request needs a cmd");
+    }
+
+    /** Skip one JSON value starting at i (string/array/object/scalar). */
+    static int skipValue(String json, int i) throws BridgeException {
+        if (i >= json.length()) throw new BridgeException("bad request json");
+        char c = json.charAt(i);
+        if (c == '"') {
+            int[] end = new int[1];
+            parseJsonString(json, i, end);
+            return end[0];
+        }
+        if (c == '[' || c == '{') {
+            char open = c;
+            char close = open == '[' ? ']' : '}';
+            int depth = 0;
+            while (i < json.length()) {
+                char d = json.charAt(i);
+                if (d == '"') {
+                    int[] end = new int[1];
+                    parseJsonString(json, i, end);
+                    i = end[0];
+                    continue;
+                }
+                if (d == open) depth++;
+                else if (d == close) {
+                    depth--;
+                    if (depth == 0) return i + 1;
+                }
+                i++;
+            }
+            throw new BridgeException("bad request json");
+        }
+        int j = i;
+        while (j < json.length() && ",}".indexOf(json.charAt(j)) < 0) j++;
+        return j;
+    }
+
+    /** String array under a top-level key (the flat parser cannot hold arrays). */
+    static List<String> parseStringArray(String json, String key) throws BridgeException {
+        String quoted = "\"" + key + "\"";
+        int k = json.indexOf(quoted);
+        if (k < 0) throw new BridgeException("request needs \"" + key + "\"");
+        int c = json.indexOf(':', k + quoted.length());
+        if (c < 0) throw new BridgeException("request needs \"" + key + "\"");
+        int i = skipWs(json, c + 1);
+        if (i >= json.length() || json.charAt(i) != '[') throw new BridgeException("\"" + key + "\" must be an array");
+        i = skipWs(json, i + 1);
+        List<String> out = new ArrayList<>();
+        if (i < json.length() && json.charAt(i) == ']') return out;
+        while (true) {
+            i = skipWs(json, i);
+            if (i >= json.length() || json.charAt(i) != '"') throw new BridgeException("bad request json");
+            int[] end = new int[1];
+            out.add(parseJsonString(json, i, end));
+            i = skipWs(json, end[0]);
+            if (i < json.length() && json.charAt(i) == ',') { i++; continue; }
+            if (i < json.length() && json.charAt(i) == ']') break;
+            throw new BridgeException("bad request json");
+        }
+        return out;
     }
 
     static String parseJsonString(String s, int start, int[] end) throws BridgeException {
