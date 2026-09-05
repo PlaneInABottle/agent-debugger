@@ -7,12 +7,13 @@
 // scaffolding for later phases
 #![allow(dead_code)]
 
-/// Languages the CLI supports. All three are live via embedded bridges.
+/// Languages the CLI supports. All four are live via embedded bridges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
     Java,
     Python,
     Node,
+    Browser,
 }
 
 impl Language {
@@ -21,6 +22,7 @@ impl Language {
             "java" => Some(Self::Java),
             "python" | "py" => Some(Self::Python),
             "node" | "js" | "javascript" | "typescript" | "ts" => Some(Self::Node),
+            "browser" | "web" | "chrome" => Some(Self::Browser),
             _ => None,
         }
     }
@@ -30,6 +32,7 @@ impl Language {
             Self::Java => "java",
             Self::Python => "python",
             Self::Node => "node",
+            Self::Browser => "browser",
         }
     }
 
@@ -37,6 +40,8 @@ impl Language {
     pub fn is_available(self) -> bool {
         match self {
             Self::Java | Self::Python | Self::Node => true,
+            // Browser session skeleton is live; debug core lands in B1.
+            Self::Browser => false,
         }
     }
 }
@@ -51,6 +56,7 @@ pub trait Adapter {
 pub struct JavaAdapter;
 pub struct PythonAdapter;
 pub struct NodeAdapter;
+pub struct BrowserAdapter;
 
 impl Adapter for JavaAdapter {
     fn language(&self) -> Language {
@@ -76,5 +82,14 @@ impl Adapter for NodeAdapter {
     }
     fn describe(&self) -> &'static str {
         "Node via nodebridge + CDP"
+    }
+}
+
+impl Adapter for BrowserAdapter {
+    fn language(&self) -> Language {
+        Language::Browser
+    }
+    fn describe(&self) -> &'static str {
+        "Browser tabs via browserbridge + CDP (B0 skeleton)"
     }
 }

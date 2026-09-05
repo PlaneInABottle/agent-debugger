@@ -1,4 +1,4 @@
-// agent-debugger: agent-first CLI debugger. Java + Python + Node.
+// agent-debugger: agent-first CLI debugger. Java + Python + Node + Browser.
 
 mod adapter;
 mod bridge;
@@ -12,7 +12,7 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-/// Agent-first CLI debugger. Java + Python + Node over one session protocol.
+/// Agent-first CLI debugger. Java + Python + Node + Browser over one session protocol.
 ///
 /// Default output is a stable JSON envelope for agents.
 /// Pass `--human` for pretty human-readable output.
@@ -165,6 +165,32 @@ struct NodeGroup {
 }
 
 #[derive(Subcommand, Debug)]
+enum BrowserCmd {
+    /// Attach to a browser tab via CDP and keep a persistent session.
+    /// B0: attach skeleton only (debug core lands in B1).
+    Attach {
+        /// Tab selector: substring of tab url or title (first page if omitted).
+        #[arg(long)]
+        tab: Option<String>,
+        /// CDP port (start Chrome with --remote-debugging-port=PORT).
+        /// Default 9222 = the agent-browser convention, so interaction and
+        /// debugging share one warm browser instead of two.
+        #[arg(long, default_value_t = 9222)]
+        port: u16,
+        #[arg(long, default_value = "localhost")]
+        host: String,
+        #[command(flatten)]
+        stops: Stops,
+    },
+}
+
+#[derive(Args, Debug)]
+struct BrowserGroup {
+    #[command(subcommand)]
+    cmd: BrowserCmd,
+}
+
+#[derive(Subcommand, Debug)]
 enum Commands {
     /// Java targets (embedded JDI bridge, zero setup).
     Java(JavaGroup),
@@ -172,6 +198,8 @@ enum Commands {
     Py(PyGroup),
     /// Node targets (nodebridge + CDP).
     Node(NodeGroup),
+    /// Browser tabs (browserbridge + CDP; B0 skeleton, core in B1).
+    Browser(BrowserGroup),
     /// Resume until the next breakpoint (or timeout / exit).
     #[command(name = "continue")]
     Continue {
@@ -330,6 +358,28 @@ fn dispatch(session: &str, cmd: Commands) -> (&'static str, anyhow::Result<Value
                 ),
             ),
         },
+        Commands::Browser(group) => match group.cmd {
+            BrowserCmd::Attach {
+                tab,
+                port,
+                host,
+                stops,
+            } => (
+                "attach",
+                cmd_spawn(
+                    session,
+                    "browser",
+                    "attach",
+                    Target::BrowserAttach {
+                        host: &host,
+                        port,
+                        tab: tab.as_deref(),
+                    },
+                    &stops,
+                    &[],
+                ),
+            ),
+        },
         Commands::Continue { timeout } => (
             "continue",
             session::forward(
@@ -412,6 +462,11 @@ enum Target<'a> {
         host: &'a str,
         port: u16,
     },
+    BrowserAttach {
+        host: &'a str,
+        port: u16,
+        tab: Option<&'a str>,
+    },
 }
 
 fn cmd_spawn(
@@ -465,6 +520,16 @@ fn cmd_spawn(
             args.push(host.to_string());
             args.push("--port".to_string());
             args.push(port.to_string());
+        }
+        Target::BrowserAttach { host, port, tab } => {
+            args.push("--host".to_string());
+            args.push(host.to_string());
+            args.push("--port".to_string());
+            args.push(port.to_string());
+            if let Some(t) = tab {
+                args.push("--tab".to_string());
+                args.push(t.to_string());
+            }
         }
     }
     for b in &stops.breakpoints {
@@ -523,6 +588,12 @@ fn doctor() -> anyhow::Result<Value> {
         probe("python3", &["-c", "import debugpy"])
     };
     let node = probe("node", &["--version"]);
+    let chrome = match bridge::find_chrome() {
+        Some((bin, version)) => json!({"found": true, "version": version, "bin": bin}),
+        None => {
+            json!({"found": false, "version": "", "hint": "install Chrome/Chromium or start it with --remote-debugging-port=9222"})
+        }
+    };
     let ws_pkg = bridge::node_dir()
         .join("node_modules")
         .join("ws")
@@ -549,10 +620,12 @@ fn doctor() -> anyhow::Result<Value> {
         "debugpy": debugpy,
         "node": node,
         "ws": ws,
+        "chrome": chrome,
         "adapters": {
             "java": {"via": "embedded JDI bridge (persistent session)", "ready": true},
             "python": {"via": "embedded pybridge + debugpy (isolated venv)", "ready": debugpy["found"]},
             "node": {"via": "embedded nodebridge + CDP", "ready": node["found"]},
+            "browser": {"via": "embedded browserbridge + CDP (B0 skeleton, core in B1)", "ready": node["found"]},
         },
     }))
 }

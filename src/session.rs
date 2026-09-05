@@ -54,7 +54,7 @@ pub fn forward(name: &str, body: &Value, timeout: Duration) -> anyhow::Result<Va
 }
 
 pub struct SpawnSpec {
-    pub lang: &'static str, // "java" | "py" | "node"
+    pub lang: &'static str, // "java" | "py" | "node" | "browser"
     pub kind: &'static str, // "attach" | "launch"
     pub bridge_args: Vec<String>,
     pub wait_secs: u64,
@@ -113,6 +113,24 @@ pub fn spawn(name: &str, spec: &SpawnSpec) -> anyhow::Result<Value> {
             let bin = bridge::ensure_node()?;
             let script = bridge::ensure_nodebridge()?;
             bridge::ensure_ws()?;
+            (
+                bin,
+                vec![
+                    script.to_string_lossy().to_string(),
+                    "session".to_string(),
+                    "--kind".to_string(),
+                    spec.kind.to_string(),
+                    "--dir".to_string(),
+                    dir.to_string_lossy().to_string(),
+                ],
+            )
+        }
+        "browser" => {
+            // The bridge runs on Node (shared provisioning); Chrome is the
+            // target. No `ws` yet — B0 makes no WebSocket connection (B1 will
+            // ensure it then, keeping first-use provisioning lazy).
+            let bin = bridge::ensure_node()?;
+            let script = bridge::ensure_browserbridge()?;
             (
                 bin,
                 vec![

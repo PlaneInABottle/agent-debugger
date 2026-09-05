@@ -16,6 +16,8 @@ const PYBRIDGE_SOURCE: &str = include_str!("../bridge/py/src/pybridge.py");
 
 const NODEBRIDGE_SOURCE: &str = include_str!("../bridge/node/src/nodebridge.js");
 
+const BROWSERBRIDGE_SOURCE: &str = include_str!("../bridge/browser/src/browserbridge.js");
+
 pub fn adapter_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(home)
@@ -244,4 +246,55 @@ pub fn ensure_nodebridge() -> anyhow::Result<PathBuf> {
             .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", dest.to_string_lossy()))?;
     }
     Ok(dest)
+}
+
+pub fn browser_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home)
+        .join(".agent-debugger")
+        .join("adapters")
+        .join("browser")
+}
+
+/// Write the embedded browserbridge when it changed; return its path.
+/// The bridge itself runs on Node (shared provisioning); Chrome is the
+/// *target* and is never installed by us — see find_chrome().
+pub fn ensure_browserbridge() -> anyhow::Result<PathBuf> {
+    let dir = browser_dir();
+    let dest = dir.join("browserbridge.js");
+    let stale = match std::fs::read_to_string(&dest) {
+        Ok(existing) => existing != BROWSERBRIDGE_SOURCE,
+        Err(_) => true,
+    };
+    if stale {
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.to_string_lossy()))?;
+        std::fs::write(&dest, BROWSERBRIDGE_SOURCE)
+            .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", dest.to_string_lossy()))?;
+    }
+    Ok(dest)
+}
+
+/// Locate a Chrome/Chromium binary for the browser adapter (target only —
+/// we attach to it, never provision it). Returns (binary, version line).
+pub fn find_chrome() -> Option<(String, String)> {
+    let candidates = [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+    ];
+    for bin in candidates {
+        if let Ok(out) = std::process::Command::new(bin).arg("--version").output() {
+            if out.status.success() {
+                let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+                text.push_str(&String::from_utf8_lossy(&out.stderr));
+                let first = text.lines().next().unwrap_or("").trim().to_string();
+                return Some((bin.to_string(), first));
+            }
+        }
+    }
+    None
 }
