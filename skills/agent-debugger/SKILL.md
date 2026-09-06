@@ -355,8 +355,28 @@ bridges long-poll for you:
 - Any setup crash on any bridge writes `error.json` with a sanitized
   `internal:` cause (exception class + short stack, ~2KB, no env) and the
   CLI surfaces it; failed starts are removed wholesale so the name stays
-  reusable. `session.json` itself is published atomically — concurrent
-  `status` never reads a torn file.
+   reusable. `session.json` itself is published atomically — concurrent
+   `status` never reads a torn file.
+
+## Attach collisions + diagnostics (py/node/java)
+
+- One debug server takes one debugger: a second `attach` to an endpoint
+  already owned by a live session fails fast with
+  `endpoint-already-attached` (names the owner — use it or `close` it
+  first). The first session and its target are untouched; `localhost` /
+  `127.0.0.1` / `::1` (plus the rest of 127/8) count as the same
+  endpoint. This is a conservative safety policy, not a proven fact
+  about every server: debugpy observably refuses a second attach (and
+  can kill the target), while Node-inspector/JDWP single-client
+  behavior is configuration-dependent — we block anyway because the
+  risk is refusal or target death. Browser tabs multiplex, so
+  `browser attach` is never blocked here.
+- A failed `attach` carries `diagnosis: {code, confidence, evidence,
+  recommendation}` next to the unchanged bridge error:
+  `endpoint-not-listening` (start the debug server), `endpoint-rejected`
+  (listener is up but refused — it may already have another debugger
+  client), `endpoint-closed-during-attach` (the target may have exited),
+  `endpoint-unreachable` (remote host, low confidence).
 
 ## Python Notes (debugpy)
 

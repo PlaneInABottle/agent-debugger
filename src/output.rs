@@ -35,11 +35,15 @@ pub fn emit(command: &str, result: anyhow::Result<Value>, human: bool) -> i32 {
         }
         Err(e) => {
             // A bridge failure may carry additive structured context
-            // (wait/capture timeouts carry `waitContext`); the message
-            // stays the display string, the context rides alongside.
-            let wait_context = e
-                .downcast_ref::<crate::session::BridgeFailure>()
-                .and_then(|b| b.wait_context.clone());
+            // (wait/capture timeouts carry `waitContext`; attach setup
+            // failures carry `diagnosis` + redacted `targetIdentity` /
+            // `requestedTarget`); the message stays the display string,
+            // the context rides alongside.
+            let failure = e.downcast_ref::<crate::session::BridgeFailure>();
+            let wait_context = failure.and_then(|b| b.wait_context.clone());
+            let diagnosis = failure.and_then(|b| b.diagnosis.clone());
+            let target_identity = failure.and_then(|b| b.target_identity.clone());
+            let requested_target = failure.and_then(|b| b.requested_target.clone());
             if human {
                 let _ = writeln!(std::io::stderr(), "error: {e:#}");
                 if let Some(ctx) = &wait_context {
@@ -50,6 +54,31 @@ pub fn emit(command: &str, result: anyhow::Result<Value>, human: bool) -> i32 {
                         Err(_) => {}
                     }
                 }
+                if let Some(d) = &diagnosis {
+                    match serde_json::to_string_pretty(&serde_json::json!({"diagnosis": d})) {
+                        Ok(pretty) => {
+                            let _ = writeln!(std::io::stderr(), "{pretty}");
+                        }
+                        Err(_) => {}
+                    }
+                }
+                // Concise single-line identities (already redacted upstream:
+                // observed argv is masked+capped, requested is host/port
+                // only) — one line each, no multi-KB pretty dump.
+                if let Some(t) = &target_identity {
+                    if let Ok(compact) = serde_json::to_string(&serde_json::json!({
+                        "targetIdentity": t
+                    })) {
+                        let _ = writeln!(std::io::stderr(), "{compact}");
+                    }
+                }
+                if let Some(r) = &requested_target {
+                    if let Ok(compact) = serde_json::to_string(&serde_json::json!({
+                        "requestedTarget": r
+                    })) {
+                        let _ = writeln!(std::io::stderr(), "{compact}");
+                    }
+                }
             } else {
                 let mut envelope = serde_json::json!({
                     "ok": false,
@@ -58,6 +87,15 @@ pub fn emit(command: &str, result: anyhow::Result<Value>, human: bool) -> i32 {
                 });
                 if let Some(ctx) = wait_context {
                     envelope["waitContext"] = ctx;
+                }
+                if let Some(d) = diagnosis {
+                    envelope["diagnosis"] = d;
+                }
+                if let Some(t) = target_identity {
+                    envelope["targetIdentity"] = t;
+                }
+                if let Some(r) = requested_target {
+                    envelope["requestedTarget"] = r;
                 }
                 let code = write_stdout(format!("{envelope}\n"), 1);
                 return code;

@@ -329,12 +329,19 @@ fn remove_confirmed_breaks_in(dir: &std::path::Path, raws: &[String]) -> anyhow:
 /// (timeout prefixes like `timeout: no stop within Ns` are preserved
 /// verbatim for compatibility); `wait_context` carries the bridge's
 /// additive `waitContext` (wait/capture timeouts only) through the CLI to
-/// the JSON/human error envelope. Display is the message alone so every
-/// existing string match keeps working.
+/// the JSON/human error envelope. Attach setup failures additionally carry
+/// `diagnosis` (`{code, confidence, evidence, recommendation}`), the
+/// redacted attempted `target_identity`, and the redacted
+/// `requested_target` endpoint — all additive, the message never changes
+/// shape for them. Display is the message alone so every existing string
+/// match keeps working.
 #[derive(Debug)]
 pub struct BridgeFailure {
     pub message: String,
     pub wait_context: Option<Value>,
+    pub diagnosis: Option<Value>,
+    pub target_identity: Option<Value>,
+    pub requested_target: Option<Value>,
 }
 
 impl std::fmt::Display for BridgeFailure {
@@ -358,6 +365,9 @@ fn bridge_failure(resp: &Value) -> anyhow::Error {
     BridgeFailure {
         message,
         wait_context,
+        diagnosis: None,
+        target_identity: None,
+        requested_target: None,
     }
     .into()
 }
@@ -735,7 +745,7 @@ pub fn attach_observed(host: &str, port: u16) -> Value {
         "source": Value::Null,
         "observedAt": now,
     });
-    let local = matches!(host, "localhost" | "127.0.0.1" | "::1");
+    let local = normalize_attach_host(host) == "loopback";
     if !local {
         missing = vec![
             unavailable("pid", "remote host has no local source"),
@@ -869,10 +879,16 @@ fn tcp_listen_inode(port: u16) -> Option<String> {
                 continue;
             }
             let ip = f[1].split(':').next().unwrap_or("");
-            // Loopback only: 127.0.0.1 or ::1 (zero-padded hex forms).
+            // Loopback (`127.0.0.1`, `::1` incl. the v4-mapped form) plus
+            // wildcard listeners (`0.0.0.0`, `::`): a server bound to all
+            // interfaces still serves loopback attach destinations, so its
+            // pid is the right owner/coroboration for our lookup.
             let loopback = ip == "0100007F"
                 || ip == "00000000000000000000000001000000"
-                || ip == "0000000000000000FFFF00000100007F";
+                || ip == "0000000000000000FFFF00000100007F"
+                || ip == "00000000"
+                || ip == "00000000000000000000000000000000"
+                || ip == "0000000000000000FFFF000000000000";
             if loopback {
                 return Some(f[9].to_string());
             }
@@ -1225,11 +1241,16 @@ impl Drop for StartupGuard {
 }
 
 fn startup_nonce() -> String {
+    // Padded with a process-wide atomic counter: `SystemTime` nanos can
+    // repeat across threads racing in the same instant, and two lock
+    // records must never share a nonce (release deletes by nonce match).
+    static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{}-{nanos}", std::process::id())
+    format!("{}-{nanos}-{n}", std::process::id())
 }
 
 fn startup_lock_is_mine(path: &std::path::Path, nonce: &str) -> bool {
@@ -1307,6 +1328,774 @@ pub fn spawn(name: &str, spec: &SpawnSpec) -> anyhow::Result<Value> {
     spawn_in(&sessions_dir(), name, spec)
 }
 
+// ---- attach endpoint collision prevention ----
+
+/// Loopback aliases share one endpoint identity: `localhost` (case- and
+/// trailing-dot-insensitive: `LOCALHOST.` counts), the whole 127/8 range,
+/// and `::1` in any textual form (compressed, expanded, bracketed, or
+/// IPv4-mapped like `::ffff:127.0.0.1`). Anything else compares
+/// exact/lowercase (IPv6 brackets stripped). The unspecified addresses
+/// `0.0.0.0`/`::` are NOT loopback — they are rejected as attach
+/// destinations (see `is_unspecified_host`), never silently merged.
+pub fn normalize_attach_host(host: &str) -> String {
+    let h = host.trim();
+    let inner = if h.starts_with('[') && h.ends_with(']') && h.len() > 2 {
+        &h[1..h.len() - 1]
+    } else {
+        h
+    };
+    let lower = inner.to_ascii_lowercase();
+    let fqdn = lower.strip_suffix('.').unwrap_or(&lower);
+    if fqdn == "localhost" || ip_is_loopback(fqdn) {
+        return "loopback".to_string();
+    }
+    fqdn.to_string()
+}
+
+/// True for IPv4 loopback (all of 127/8), IPv6 `::1`, and IPv4-mapped or
+/// IPv4-compatible forms wrapping a loopback v4 (`::ffff:127.0.0.1`).
+/// Anything unparseable is not loopback — never a guess.
+fn ip_is_loopback(s: &str) -> bool {
+    let ip: std::net::IpAddr = match s.parse() {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
+    if ip.is_loopback() {
+        return true;
+    }
+    match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+        std::net::IpAddr::V4(_) => false, // non-loopback v4, already checked
+    }
+}
+
+/// Unspecified/wildcard destinations can never be attach targets: dialing
+/// `0.0.0.0` is platform-dependent (Linux loops back, elsewhere it fails),
+/// so it fails fast with a clear error pointing at an explicit address.
+fn is_unspecified_host(host: &str) -> bool {
+    let h = host.trim();
+    let inner = if h.starts_with('[') && h.ends_with(']') && h.len() > 2 {
+        &h[1..h.len() - 1]
+    } else {
+        h
+    };
+    matches!(
+        inner.to_ascii_lowercase().as_str(),
+        "0.0.0.0" | "::" | "0:0:0:0:0:0:0:0"
+    )
+}
+
+/// Capability-aware exclusivity as a conservative safety policy (not a
+/// proven universal fact): debugpy observably refuses a second attach —
+/// and can kill the target — so Python blocks unconditionally. The Node
+/// inspector and JDWP single-debugger behavior is configuration-dependent
+/// (some servers/setups may tolerate more), but a second agent-debugger
+/// session risks refusal or target death, so they block too, with an
+/// actionable message pointing at the existing session. Browser CDP
+/// multiplexes tabs/clients, so browser attach is never blocked here
+/// (fail open for unknown langs too).
+pub fn attach_exclusive(lang: &str) -> bool {
+    matches!(lang, "py" | "node" | "java")
+}
+
+/// The attach endpoint a spawn targets, from the redacted requested
+/// identity (host/port only — never argv). `None` for launch intents and
+/// anything without a host/port (browser tab selects don't collide).
+/// `Err` only for an unspecified destination (`0.0.0.0`/`::`): dialing it
+/// is platform-dependent, so it fails fast with a clear error instead of
+/// a misleading handshake failure. Unparseable intents stay `None` (fail
+/// open — never block on what we cannot read).
+fn attach_endpoint(spec: &SpawnSpec) -> anyhow::Result<Option<(String, u16)>> {
+    if spec.kind != "attach" || !attach_exclusive(spec.lang) {
+        return Ok(None);
+    }
+    let host = spec
+        .requested
+        .get("host")
+        .and_then(|h| h.as_str())
+        .unwrap_or("");
+    let port = spec
+        .requested
+        .get("port")
+        .and_then(|p| p.as_u64())
+        .and_then(|p| u16::try_from(p).ok());
+    match (host, port) {
+        (h, _) if is_unspecified_host(h) => anyhow::bail!(
+            "cannot attach to unspecified address '{h}' \
+             (use localhost, 127.0.0.1, or an explicit interface address)"
+        ),
+        (h, Some(p)) if !h.is_empty() => Ok(Some((h.to_string(), p))),
+        _ => Ok(None),
+    }
+}
+
+/// Listener presence without connecting: OS-observed only (`lsof`/proc via
+/// `port_lookup`), never a diagnostic socket — a TCP probe could itself
+/// consume or perturb a single-client handshake. Remote hosts have no
+/// local source: `None` (unknown), never fabricated.
+fn listener_present(host: &str, port: u16) -> Option<bool> {
+    if normalize_attach_host(host) != "loopback" {
+        return None;
+    }
+    Some(port_lookup(port).is_some())
+}
+
+/// A session daemon is live when its bridge port answers a short TCP probe
+/// (same probe as the status row; the daemon is ours, not the target — no
+/// target connection is ever opened here). Two attempts at a 1s bound
+/// absorb scheduling flakes on loaded machines; when both fail but the
+/// bridge published state moments ago, the session still counts as live
+/// (fail closed — a wedged probe must never authorize a second attach
+/// onto a live target). The corroboration window is bounded (2min), so a
+/// truly dead session stops blocking shortly after its last publish.
+fn daemon_alive_in(dir: &std::path::Path) -> bool {
+    const DAEMON_PROBE: Duration = Duration::from_secs(1);
+    const RECENT_PUBLISH: Duration = Duration::from_secs(120);
+    let parsed: Option<Value> = std::fs::read_to_string(dir.join("session.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok());
+    let port = parsed
+        .as_ref()
+        .and_then(|v| {
+            v.get("port")
+                .and_then(|p| p.as_u64())
+                .and_then(|p| u16::try_from(p).ok())
+        })
+        .unwrap_or(0);
+    if port == 0 {
+        return false; // no daemon port recorded: nothing to be live
+    }
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    for _ in 0..2 {
+        if std::net::TcpStream::connect_timeout(&addr, DAEMON_PROBE).is_ok() {
+            return true;
+        }
+    }
+    // Probe failed twice: only a very recent bridge publish keeps the
+    // session live (transient probe failure, not a dead daemon).
+    let updated_ago = parsed
+        .as_ref()
+        .and_then(|v| v.get("updatedAt").and_then(|u| u.as_u64()))
+        .and_then(|s| {
+            std::time::UNIX_EPOCH
+                .checked_add(Duration::from_secs(s))
+                .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+        });
+    matches!(updated_ago, Some(age) if age < RECENT_PUBLISH)
+}
+
+/// Attach endpoint from a persisted intent: `requestedTarget` first (exact
+/// CLI request), `target` summary as fallback (string ports there).
+/// Anything unparseable reads as absent — never a block.
+fn intent_endpoint(stops: &Value) -> Option<(String, u16)> {
+    for key in ["requestedTarget", "target"] {
+        let v = stops.get(key)?;
+        let host = v.get("host")?.as_str()?;
+        let port = v
+            .get("port")
+            .and_then(|p| p.as_u64().or_else(|| p.as_str()?.parse::<u64>().ok()))?;
+        if let Ok(port) = u16::try_from(port) {
+            return Some((host.to_string(), port));
+        }
+    }
+    None
+}
+
+/// A confirmed live owner of an attach endpoint: a session dir (not a
+/// symlink, valid name) whose intent names the same normalized endpoint,
+/// whose lang is exclusive, whose kind is attach/launch, and whose daemon
+/// answers. Stale/dead dirs never block; nothing is deleted as a side
+/// effect — this is a read-only scan.
+fn find_live_endpoint_owner_in(
+    sessions_root: &std::path::Path,
+    exclude: &str,
+    host: &str,
+    port: u16,
+) -> Option<String> {
+    let norm = normalize_attach_host(host);
+    let entries = std::fs::read_dir(sessions_root).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == exclude || check_name(&name).is_err() {
+            continue;
+        }
+        let dir = sessions_root.join(&name);
+        // Symlink or non-dir entries are never followed (same guard as the
+        // stale-dir clear) and silently skipped here — not our session.
+        match std::fs::symlink_metadata(&dir) {
+            Ok(m) if m.file_type().is_dir() => {}
+            _ => continue,
+        }
+        let stops: Value = std::fs::read_to_string(dir.join("stops.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())?;
+        let (eh, ep) = intent_endpoint(&stops)?;
+        if ep != port || normalize_attach_host(&eh) != norm {
+            continue;
+        }
+        // Capability-aware: only exclusive owners collide. A browser
+        // session on the same CDP port (different tab) never blocks.
+        if !attach_exclusive(session_lang_opt(&dir).as_deref().unwrap_or("")) {
+            continue;
+        }
+        let sess: Value = std::fs::read_to_string(dir.join("session.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())?;
+        match sess.get("kind").and_then(|k| k.as_str()) {
+            Some("attach") | Some("launch") => {}
+            _ => continue,
+        }
+        if !daemon_alive_in(&dir) {
+            continue;
+        }
+        return Some(name);
+    }
+    None
+}
+
+// ---- endpoint-scoped atomic reservation ----
+
+/// Locks live under `~/.agent-debugger/endpoint-locks/`, one file per
+/// normalized language/host/port, so two different endpoints never block
+/// each other. The lock is held from preflight through bridge handshake
+/// until session ownership is published; afterwards the published session
+/// (found by the scan above) owns the endpoint.
+fn endpoint_locks_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home)
+        .join(".agent-debugger")
+        .join("endpoint-locks")
+}
+
+/// Locks dir scoped to a sessions root (unit tests pass a tmpdir so the
+/// reservation is exercised without touching the real namespace).
+/// Production roots (`~/.agent-debugger/sessions`) map to the canonical
+/// `~/.agent-debugger/endpoint-locks`.
+fn endpoint_locks_dir_for(sessions_root: &std::path::Path) -> PathBuf {
+    sessions_root
+        .parent()
+        .map(|p| p.join("endpoint-locks"))
+        .unwrap_or_else(endpoint_locks_dir)
+}
+
+fn endpoint_lock_path(
+    locks_dir: &std::path::Path,
+    lang: &str,
+    norm_host: &str,
+    port: u16,
+) -> PathBuf {
+    let safe: String = norm_host
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    locks_dir.join(format!("{lang}-{safe}-{port}.lock"))
+}
+
+/// A lock is provably stale only by owner liveness/age: a dead holder pid
+/// (past a short grace for just-created locks) or an age past the bound
+/// (backstop for pid reuse / wedged holders). Unreadable clocks fail
+/// closed — a retry costs one wait, a wrongful steal costs a live attach.
+const ENDPOINT_LOCK_STALE: Duration = Duration::from_secs(7200);
+const ENDPOINT_LOCK_GRACE: Duration = Duration::from_secs(10);
+
+#[derive(Debug)]
+struct EndpointGuard {
+    path: PathBuf,
+    nonce: String,
+}
+
+impl Drop for EndpointGuard {
+    fn drop(&mut self) {
+        release_endpoint_lock(&self.path, &self.nonce);
+    }
+}
+
+/// Only our own nonce is ever removed (parsed out of the JSON record —
+/// never a blind delete), so a live starter's lock is never stolen on
+/// release.
+fn release_endpoint_lock(path: &std::path::Path, nonce: &str) {
+    let mine = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.get("nonce").and_then(|n| n.as_str()).map(|n| n == nonce))
+        .unwrap_or(false);
+    if mine {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Another starter holds (or just held) this endpoint.
+#[derive(Debug)]
+struct EndpointBusy {
+    session: String,
+    published: bool,
+}
+
+fn endpoint_lock_session_name(path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| {
+            v.get("session")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string())
+        })
+}
+
+/// Three-state holder liveness: only a provably-dead holder makes a lock
+/// stealable. `Unknown` (probe itself failed) fails closed — treated as
+/// live — so a wedged `ps` can never authorize deleting a live starter's
+/// lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    Alive,
+    Dead,
+    Unknown,
+}
+
+/// Best-effort holder liveness. Linux reads /proc directly (no
+/// subprocess); elsewhere a bounded `ps` probe answers.
+#[cfg(target_os = "linux")]
+fn holder_alive(pid: u32) -> Liveness {
+    let p = std::path::PathBuf::from(format!("/proc/{pid}"));
+    match std::fs::symlink_metadata(&p) {
+        Ok(m) if m.file_type().is_dir() => Liveness::Alive,
+        Ok(_) => Liveness::Unknown, // exists but unreadable shape: no verdict
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Liveness::Dead,
+        Err(_) => Liveness::Unknown,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn holder_alive(pid: u32) -> Liveness {
+    ps_has_pid(pid)
+}
+
+/// Dedicated bounded `ps` status probe (non-Linux only): the exit status —
+/// not mere output presence — is the signal. `ps -p <dead>` exits nonzero
+/// (dead); spawn failure or timeout means the probe itself failed
+/// (unknown), never "dead". No shell, fixed argv, 5s hard bound.
+#[cfg(not(target_os = "linux"))]
+fn ps_has_pid(pid: u32) -> Liveness {
+    const PS_TIMEOUT: Duration = Duration::from_secs(5);
+    let want = pid.to_string();
+    let child = match std::process::Command::new("ps")
+        .args(["-p", &want, "-o", "pid="])
+        .stdin(Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return Liveness::Unknown, // ps missing/unforkable: no verdict
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(PS_TIMEOUT) {
+        Ok(Ok(out)) if out.status.success() => {
+            // Success lists the pid when alive (headerless `-o pid=` row);
+            // a bare success without the row still reads as dead — ps
+            // exited 0 only when the selection matched... defensively, an
+            // empty match is dead, never alive.
+            if String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|l| l.trim() == want)
+            {
+                Liveness::Alive
+            } else {
+                Liveness::Dead
+            }
+        }
+        Ok(Ok(_)) => Liveness::Dead,     // nonzero exit: no such process
+        Ok(Err(_)) => Liveness::Unknown, // wait/reap failure: no verdict
+        Err(_) => Liveness::Unknown,     // timeout: probe failed, not the holder
+    }
+}
+
+/// Snapshot decision: is this exact lock record stale as of `mtime`?
+/// Pure over bytes + timestamp (no IO) so tests exercise the policy
+/// without clocks or sleeps. A future mtime fails closed (not stale).
+fn lock_snapshot_is_stale(raw: &str, mtime: std::time::SystemTime) -> bool {
+    let age = match std::time::SystemTime::now().duration_since(mtime) {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    if age >= ENDPOINT_LOCK_STALE {
+        return true;
+    }
+    if age < ENDPOINT_LOCK_GRACE {
+        return false;
+    }
+    let pid = serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|v| v.get("pid").and_then(|p| p.as_u64()))
+        .and_then(|p| u32::try_from(p).ok());
+    matches!(pid.map(holder_alive), Some(Liveness::Dead))
+}
+
+/// Remove a stale endpoint lock without ever deleting a fresh claimant's.
+/// Protocol: snapshot the record, re-verify the exact bytes, then detach
+/// via atomic `rename` into a unique quarantine file (never `remove_file`
+/// on the live path — a verify→unlink race could otherwise delete a fresh
+/// lock a rival just claimed). Only a quarantined record that still equals
+/// the verified-stale bytes is dropped; anything else is restored or left
+/// for its owner. Concurrent reclaimers of the same stale bytes all
+/// succeed at detaching (exactly one wins the rename; the rest see
+/// NotFound and proceed); the subsequent atomic `create_new` claim still
+/// admits exactly one holder. Returns true when no stale record remains.
+fn reclaim_stale_lock(path: &std::path::Path) -> bool {
+    // Snapshot record + metadata together.
+    let raw = match std::fs::read_to_string(path) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    let mtime = match std::fs::metadata(path).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    if !lock_snapshot_is_stale(&raw, mtime) {
+        return false;
+    }
+    quarantine_verified(path, &raw)
+}
+
+/// Detach-and-verify (test seam for interleavings): re-read the exact
+/// bytes, atomically quarantine, and drop only a still-stale match.
+/// Returns false (hands off, fresh record intact) on any deviation.
+fn quarantine_verified(path: &std::path::Path, expected: &str) -> bool {
+    let raw2 = match std::fs::read_to_string(path) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    if raw2 != expected {
+        return false; // replaced under us: fresh claim or fellow reclaim
+    }
+    let q = match detach_to_quarantine(path) {
+        Ok(q) => q,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    reconcile_quarantine(path, &q, expected)
+}
+
+/// Atomically detach the lock file into a unique quarantine sibling (same
+/// dir = same filesystem). Exactly one concurrent detacher wins; the rest
+/// see NotFound.
+fn detach_to_quarantine(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    // Hidden `.q-` prefix marks it as temp (never scanned as a lock).
+    let q = path.with_file_name(format!(".q-{}-{}.tmp", std::process::id(), startup_nonce()));
+    std::fs::rename(path, &q).map(|()| q)
+}
+
+/// Reconcile a detached quarantine file against the verified-stale bytes.
+/// Match → drop it (stale detached, exactly as judged; its age only grew
+/// since the verdict, so no re-probe). Mismatch → the path changed under
+/// us (a fresh claim F): if the path is still free, restore F's bytes via
+/// a non-overwriting atomic claim; if a newer claim (F2) landed meanwhile,
+/// drop our copy — F's owner backs off at its pre-spawn nonce re-verify
+/// while F2's owner proceeds. Either way exactly one starter proceeds, no
+/// fresh record is ever deleted or overwritten, and the quarantine file
+/// never lingers (deleted or consumed on every path short of a crash).
+/// Returns true only for a dropped stale match.
+fn reconcile_quarantine(path: &std::path::Path, q: &std::path::Path, expected: &str) -> bool {
+    let qb = std::fs::read_to_string(q).unwrap_or_default();
+    if qb == expected {
+        let _ = std::fs::remove_file(q);
+        return true;
+    }
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Path looks free: restore by copy, never by move — the
+            // create_new claim below refuses if an F2 landed in the
+            // check→restore window, so overwrite is impossible.
+            let _ = restore_quarantine_bytes(path, q);
+            let _ = std::fs::remove_file(q); // consumed either way
+        }
+        _ => {
+            let _ = std::fs::remove_file(q);
+        }
+    }
+    false
+}
+
+/// Restore quarantined bytes to an absent path without ever overwriting:
+/// exclusive `create_new` wins the slot atomically — a rival F2 that lands
+/// first (or a planted symlink, which create_new refuses to follow into)
+/// makes us fail closed with the rival's record untouched. If creation
+/// succeeds but the write fails, only the file we just created is removed
+/// (nothing else's — create_new proves no other record was there) and we
+/// fail closed. Best-effort `sync_all` so a restored record is durable.
+fn restore_quarantine_bytes(path: &std::path::Path, q: &std::path::Path) -> bool {
+    let bytes = match std::fs::read(q) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let mut f = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    use std::io::Write as _;
+    if f.write_all(&bytes).is_err() {
+        let _ = std::fs::remove_file(path); // ours alone: just created it
+        return false;
+    }
+    let _ = f.sync_all();
+    true
+}
+
+/// Pre-spawn ownership check: our endpoint reservation must still hold our
+/// nonce immediately before the bridge spawns, or we back off. Combined
+/// with quarantine-restore this admits exactly one bridge per endpoint
+/// even when a rival detached around us: the rival either restores our
+/// record (we proceed, it backs off) or owns the path (we back off).
+/// A momentarily-absent path (mid-restore flap) retries briefly; a
+/// different record fails at once.
+fn still_holds_endpoint(guard: &EndpointGuard) -> bool {
+    for _ in 0..10 {
+        match std::fs::read_to_string(&guard.path) {
+            Ok(raw) => {
+                return serde_json::from_str::<Value>(&raw)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("nonce")
+                            .and_then(|n| n.as_str())
+                            .map(|n| n == guard.nonce)
+                    })
+                    .unwrap_or(false);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// How an endpoint-claim attempt resolves. IO failures surface as
+/// `anyhow::Error` with their actual message — never disguised as a
+/// collision with our own session.
+#[derive(Debug)]
+enum EndpointClaim {
+    Held(EndpointGuard),
+    Busy(EndpointBusy),
+}
+
+/// Claim the endpoint lock (single reclaim retry for a stale lock). A live
+/// lock reports the holder — the caller turns it into an
+/// endpoint-already-attached error, never a wait.
+fn acquire_endpoint_lock(
+    locks_dir: &std::path::Path,
+    sessions_root: &std::path::Path,
+    name: &str,
+    lang: &str,
+    norm_host: &str,
+    port: u16,
+) -> anyhow::Result<EndpointClaim> {
+    std::fs::create_dir_all(locks_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot create endpoint locks dir {}: {e}",
+            locks_dir.display()
+        )
+    })?;
+    let path = endpoint_lock_path(locks_dir, lang, norm_host, port);
+    let claim = || -> anyhow::Result<EndpointGuard> {
+        let nonce = startup_nonce();
+        let content = serde_json::json!({
+            "nonce": nonce,
+            "pid": std::process::id(),
+            "session": name,
+            "createdAt": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        })
+        .to_string();
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        use std::io::Write as _;
+        f.write_all(content.as_bytes())
+            .map_err(|e| anyhow::anyhow!("cannot write endpoint lock: {e}"))?;
+        Ok(EndpointGuard {
+            path: path.clone(),
+            nonce,
+        })
+    };
+    match claim() {
+        Ok(g) => return Ok(EndpointClaim::Held(g)),
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .map(|io| io.kind() == std::io::ErrorKind::AlreadyExists)
+                .unwrap_or(false) => {}
+        Err(e) => return Err(e),
+    }
+    if reclaim_stale_lock(&path) {
+        match claim() {
+            Ok(g) => return Ok(EndpointClaim::Held(g)),
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .map(|io| io.kind() == std::io::ErrorKind::AlreadyExists)
+                    .unwrap_or(false) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let session =
+        endpoint_lock_session_name(&path).unwrap_or_else(|| "another session".to_string());
+    // A published session.json under the holder's name means the handshake
+    // finished (the scan will confirm ownership); otherwise another attach
+    // is still in flight.
+    let published = sessions_root.join(&session).join("session.json").exists();
+    Ok(EndpointClaim::Busy(EndpointBusy { session, published }))
+}
+
+// ---- attach failure classification ----
+
+/// Classify an attach setup failure from OS-observed listener state taken
+/// immediately pre-attach (`pre`) and immediately after the failure
+/// (`post`). `None` is unknown (remote hosts have no local source).
+/// Confidence is calibrated, never certain about foreign clients: a
+/// present-but-rejecting listener *may* already have another debugger
+/// client — it is not claimed as fact.
+fn attach_diagnosis(pre: Option<bool>, post: Option<bool>, endpoint: &str) -> Value {
+    let (code, confidence, recommendation) = match (pre, post) {
+        (Some(true), Some(false)) => (
+            "endpoint-closed-during-attach",
+            "medium",
+            "the debug server was listening before attach but is gone now; \
+             the target may have exited — restart it and retry",
+        ),
+        (Some(true), Some(_)) | (Some(false), Some(true)) => (
+            "endpoint-rejected",
+            "medium",
+            "the listener is up but refused the handshake; it may already \
+             have another debugger client — use that session, or restart the \
+             target without the existing client and retry",
+        ),
+        (Some(false), Some(false)) => (
+            "endpoint-not-listening",
+            "high",
+            "nothing listens on this endpoint; verify the target was started \
+             with the debug server on this host/port and retry",
+        ),
+        _ => (
+            "endpoint-unreachable",
+            "low",
+            "the host cannot be inspected locally; verify the host/port are \
+             reachable and the debug server is up, then retry",
+        ),
+    };
+    serde_json::json!({
+        "code": code,
+        "confidence": confidence,
+        "evidence": {
+            "endpoint": endpoint,
+            "listenerBefore": pre.map(Value::from).unwrap_or(Value::Null),
+            "listenerAfter": post.map(Value::from).unwrap_or(Value::Null),
+        },
+        "recommendation": recommendation,
+    })
+}
+
+/// Bounded `host:port` display for messages and diagnosis evidence: the
+/// host is CLI input of unbounded length, so over-long hosts truncate with
+/// the shared marker instead of bloating the envelope. The exact requested
+/// host still lives in `requestedTarget`; this is display only.
+fn display_endpoint(host: &str, port: u16) -> String {
+    const HOST_CAP: usize = 128;
+    let h = if host.chars().count() > HOST_CAP {
+        trunc_chars(host, HOST_CAP)
+    } else {
+        host.to_string()
+    };
+    format!("{h}:{port}")
+}
+
+/// One classification site for every attach setup failure (fast error.json,
+/// late-settling error.json, bridge exit, first-forward transport): probe
+/// the OS listener now, classify pre-vs-post, keep the bridge/transport
+/// message verbatim, and attach the redacted identities. The debuggee is
+/// never fabricated — on a failed attach the attempted identity keeps its
+/// `unavailable` entries as the bridge/lookup reported them.
+fn attach_setup_failure(
+    host: &str,
+    port: u16,
+    pre: Option<bool>,
+    message: String,
+    spec: &SpawnSpec,
+) -> anyhow::Error {
+    let post = listener_present(host, port);
+    let diagnosis = attach_diagnosis(pre, post, &display_endpoint(host, port));
+    attach_failure(message, diagnosis, &spec.observed, &spec.requested)
+}
+
+/// Build the typed attach-setup failure: the bridge message stays verbatim
+/// (existing `attach failed` matches keep working); the diagnosis,
+/// redacted attempted identity, and redacted requested endpoint ride
+/// alongside into the outer envelope.
+fn attach_failure(
+    message: String,
+    diagnosis: Value,
+    observed: &Value,
+    requested: &Value,
+) -> anyhow::Error {
+    BridgeFailure {
+        message,
+        wait_context: None,
+        diagnosis: Some(diagnosis),
+        target_identity: Some(observed.clone()),
+        requested_target: Some(requested.clone()),
+    }
+    .into()
+}
+
+/// Preflight rejection when a live session already owns the endpoint.
+/// Names the confirmed owner and the redacted endpoint; tells the agent to
+/// reuse or close it. No bridge is ever spawned, so the first session's
+/// target is untouched.
+fn endpoint_owned_failure(
+    owner: &str,
+    in_progress: bool,
+    lang: &str,
+    host: &str,
+    port: u16,
+    observed: &Value,
+    requested: &Value,
+) -> anyhow::Error {
+    let endpoint = display_endpoint(host, port);
+    let message = if in_progress {
+        format!(
+            "endpoint-already-attached: session '{owner}' is attaching to {lang} \
+             {endpoint} — use the existing session or wait and retry"
+        )
+    } else {
+        format!(
+            "endpoint-already-attached: session '{owner}' already owns {lang} \
+             {endpoint} — use the existing session or close it first"
+        )
+    };
+    let diagnosis = serde_json::json!({
+        "code": "endpoint-already-attached",
+        "confidence": "high",
+        "evidence": {
+            "endpoint": endpoint,
+            "ownerSession": owner,
+            "inProgress": in_progress,
+        },
+        "recommendation": "use the existing session for this endpoint, or close it first and retry",
+    });
+    attach_failure(message, diagnosis, observed, requested)
+}
+
 /// `spawn` with an explicit sessions root (unit tests pass a tmpdir so the
 /// interlock is exercised without touching the real sessions dir).
 fn spawn_in(
@@ -1332,6 +2121,72 @@ fn spawn_in(
     if dir.join("session.json").exists() {
         anyhow::bail!("session '{name}' already exists (close it first)");
     }
+    // Attach collision preflight (exclusive endpoints only: launch has no
+    // pre-known endpoint and browser multiplexes tabs, so neither takes
+    // this path). The endpoint lock is claimed BEFORE the session scan so
+    // two concurrent second attaches cannot both pass it (preflight alone
+    // would be TOCTOU); it stays held through the handshake below until
+    // session ownership publishes. The scan under the lock then catches
+    // already-published owners. Nothing here deletes or touches other
+    // sessions — preflight is read-only plus our own lock file.
+    let endpoint = attach_endpoint(spec)?;
+    let pre_listener = endpoint.as_ref().map(|(h, p)| listener_present(h, *p));
+    let _endpoint_guard = match &endpoint {
+        Some((host, port)) => {
+            let norm = normalize_attach_host(host);
+            let locks = endpoint_locks_dir_for(sessions_root);
+            match acquire_endpoint_lock(&locks, sessions_root, name, spec.lang, &norm, *port)? {
+                EndpointClaim::Held(g) => {
+                    if let Some(owner) =
+                        find_live_endpoint_owner_in(sessions_root, name, host, *port)
+                    {
+                        drop(g);
+                        return Err(endpoint_owned_failure(
+                            &owner,
+                            false,
+                            spec.lang,
+                            host,
+                            *port,
+                            &spec.observed,
+                            &spec.requested,
+                        ));
+                    }
+                    // Final ownership gate before any bridge spawns: a
+                    // rival that verified a stale record earlier may have
+                    // detached around us (it restores what isn't stale and
+                    // backs off, but only our nonce match proves we won).
+                    if !still_holds_endpoint(&g) {
+                        let cur = endpoint_lock_session_name(&g.path)
+                            .unwrap_or_else(|| "another session".to_string());
+                        let published = sessions_root.join(&cur).join("session.json").exists();
+                        drop(g);
+                        return Err(endpoint_owned_failure(
+                            &cur,
+                            !published,
+                            spec.lang,
+                            host,
+                            *port,
+                            &spec.observed,
+                            &spec.requested,
+                        ));
+                    }
+                    Some(g)
+                }
+                EndpointClaim::Busy(busy) => {
+                    return Err(endpoint_owned_failure(
+                        &busy.session,
+                        !busy.published,
+                        spec.lang,
+                        host,
+                        *port,
+                        &spec.observed,
+                        &spec.requested,
+                    ));
+                }
+            }
+        }
+        None => None,
+    };
     // A leftover dir without session.json is a failed attempt, not a live
     // session: clear it so the name is reusable. A live session is caught
     // by the session.json check above. Re-validate immediately before the
@@ -1387,6 +2242,13 @@ fn spawn_in(
             let msg = read_bridge_error(&dir);
             reap(&mut child);
             let _ = std::fs::remove_dir_all(&dir);
+            // Attach setup failure: classify from OS-observed listener
+            // state (pre-attach vs now). The bridge message stays verbatim;
+            // the diagnosis + redacted identities ride alongside.
+            if let Some((host, port)) = &endpoint {
+                let pre = pre_listener.flatten();
+                return Err(attach_setup_failure(host, *port, pre, msg, spec));
+            }
             anyhow::bail!("{msg}");
         }
         if dir.join("session.json").exists() {
@@ -1426,6 +2288,12 @@ fn spawn_in(
                     if let Some(msg) = settle_for_bridge_error(&dir) {
                         reap(&mut child);
                         let _ = std::fs::remove_dir_all(&dir);
+                        // Late-settling attach failure: same envelope as the
+                        // fast path (message verbatim + fresh post probe).
+                        if let Some((host, port)) = &endpoint {
+                            let pre = pre_listener.flatten();
+                            return Err(attach_setup_failure(host, *port, pre, msg, spec));
+                        }
                         anyhow::bail!("{msg}");
                     }
                     // Fast program + logpoints-only: the target may exit before
@@ -1449,9 +2317,21 @@ fn spawn_in(
                     }
                     // No session was established and nothing is collectible:
                     // take the daemon down and remove the dir, so the name
-                    // is reusable and no orphan lingers.
+                    // is reusable and no orphan lingers. For attach, the
+                    // transport message stays verbatim inside the same
+                    // classified envelope (fresh post probe + identities).
                     reap(&mut child);
                     let _ = std::fs::remove_dir_all(&dir);
+                    if let Some((host, port)) = &endpoint {
+                        let pre = pre_listener.flatten();
+                        return Err(attach_setup_failure(
+                            host,
+                            *port,
+                            pre,
+                            format!("{e:#}"),
+                            spec,
+                        ));
+                    }
                     return Err(e);
                 }
             }
@@ -1463,6 +2343,19 @@ fn spawn_in(
         {
             let log_tail = read_log_tail(&dir);
             let _ = std::fs::remove_dir_all(&dir);
+            // An attach bridge that dies without an error file still gets
+            // listener evidence (same classification, same verbatim
+            // message policy).
+            if let Some((host, port)) = &endpoint {
+                let pre = pre_listener.flatten();
+                return Err(attach_setup_failure(
+                    host,
+                    *port,
+                    pre,
+                    format!("bridge exited during setup (code {status}). {log_tail}"),
+                    spec,
+                ));
+            }
             anyhow::bail!("bridge exited during setup (code {status}). {log_tail}");
         }
         if Instant::now() > deadline {
@@ -2480,5 +3373,754 @@ mod tests {
         assert_eq!(session_entry(&dir)["targetIdentity"], Value::Null);
         assert_eq!(cmd_targets_in(&dir)["targetIdentity"], Value::Null);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- attach endpoint collision prevention ----
+
+    #[test]
+    fn attach_host_normalization_collapses_loopback() {
+        for alias in [
+            "localhost",
+            "LOCALHOST",
+            "localhost.", // FQDN root form
+            "LOCALHOST. ",
+            "127.0.0.1",
+            "127.0.0.5", // whole 127/8
+            "127.255.200.1",
+            "::1",
+            "[::1]",
+            "0:0:0:0:0:0:0:1",  // expanded
+            "::ffff:127.0.0.1", // v4-mapped
+            "[::ffff:127.0.0.1]",
+            " localhost ",
+        ] {
+            assert_eq!(normalize_attach_host(alias), "loopback", "{alias}");
+        }
+        // Non-loopback compares exact/lowercase, brackets stripped.
+        assert_eq!(normalize_attach_host("Example.COM"), "example.com");
+        assert_eq!(normalize_attach_host("[2001:db8::1]"), "2001:db8::1");
+        assert_eq!(normalize_attach_host("2001:db8::1"), "2001:db8::1");
+        assert_ne!(normalize_attach_host("example.com"), "loopback");
+        // Unspecified is not loopback (rejected as a destination, never
+        // silently merged into the loopback identity).
+        assert_ne!(normalize_attach_host("0.0.0.0"), "loopback");
+        assert_ne!(normalize_attach_host("::"), "loopback");
+        assert!(is_unspecified_host("0.0.0.0"));
+        assert!(is_unspecified_host("::"));
+        assert!(is_unspecified_host("[::]"));
+        assert!(!is_unspecified_host("localhost"));
+        assert!(!is_unspecified_host("127.0.0.1"));
+        assert!(!is_unspecified_host("example.com"));
+    }
+
+    #[test]
+    fn attach_exclusivity_matrix_is_capability_aware() {
+        // Single-client process adapters collide.
+        assert!(attach_exclusive("py"));
+        assert!(attach_exclusive("node"));
+        assert!(attach_exclusive("java"));
+        // Browser CDP multiplexes tabs/clients: never blocked.
+        assert!(!attach_exclusive("browser"));
+        // Unknown languages fail open (never block what we don't know).
+        assert!(!attach_exclusive("mystery"));
+        assert!(!attach_exclusive(""));
+    }
+
+    #[test]
+    fn attach_endpoint_only_for_exclusive_attach() {
+        let spec = |lang: &'static str, kind: &'static str, requested: Value| SpawnSpec {
+            lang,
+            kind,
+            bridge_args: vec![],
+            wait_secs: 1,
+            stops: json!({}),
+            requested,
+            observed: Value::Null,
+            observed_hint: String::new(),
+        };
+        let req = json!({"host": "localhost", "port": 5678, "pid": Value::Null});
+        assert_eq!(
+            attach_endpoint(&spec("py", "attach", req.clone()))
+                .expect("valid endpoint")
+                .as_ref()
+                .map(|(h, p)| (h.clone(), *p)),
+            Some(("localhost".to_string(), 5678))
+        );
+        // Launch has no pre-known endpoint; browser never collides.
+        assert!(attach_endpoint(&spec("py", "launch", req.clone()))
+            .unwrap()
+            .is_none());
+        assert!(attach_endpoint(&spec("browser", "attach", req.clone()))
+            .unwrap()
+            .is_none());
+        assert!(attach_endpoint(&spec("mystery", "attach", req.clone()))
+            .unwrap()
+            .is_none());
+        // Missing/corrupt endpoint reads as absent, never a block.
+        assert!(attach_endpoint(&spec("py", "attach", json!({})))
+            .unwrap()
+            .is_none());
+        assert!(
+            attach_endpoint(&spec("py", "attach", json!({"host": "h", "port": 99999})))
+                .unwrap()
+                .is_none()
+        );
+        // Unspecified destinations fail fast with a clear error (dialing
+        // 0.0.0.0 is platform-dependent) — narrow gate, only attach with
+        // an unspecified host is affected.
+        for bad in ["0.0.0.0", "::", "[::]"] {
+            let err = attach_endpoint(&spec(
+                "py",
+                "attach",
+                json!({"host": bad, "port": 5678, "pid": Value::Null}),
+            ))
+            .expect_err("unspecified destination must fail");
+            assert!(format!("{err:#}").contains("unspecified"), "{bad}");
+        }
+    }
+
+    /// One fake session dir: intent names an endpoint, session.json names a
+    /// kind + daemon port, lang.json names the adapter.
+    fn fake_owner(
+        root: &std::path::Path,
+        name: &str,
+        lang: &str,
+        kind: &str,
+        host: &str,
+        port: serde_json::Value,
+        daemon_port: u16,
+    ) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lang.json"), format!("{{\"lang\":\"{lang}\"}}")).unwrap();
+        std::fs::write(
+            dir.join("stops.json"),
+            json!({
+                "breaks": [], "requestedTarget": {"host": host, "port": port, "pid": Value::Null},
+                "target": {"host": host, "port": port},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("session.json"),
+            json!({"name": name, "kind": kind, "port": daemon_port}).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn endpoint_scan_finds_only_live_exclusive_owners() {
+        let root = tmpdir("endpoint-scan");
+        // Live owner: hold a real localhost socket so the daemon probe
+        // passes, and point the fake session's daemon port at it.
+        let sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let live = sock.local_addr().unwrap().port();
+        fake_owner(
+            &root,
+            "owner",
+            "py",
+            "attach",
+            "127.0.0.1",
+            json!(5678),
+            live,
+        );
+        // Same endpoint via the loopback alias must match.
+        assert_eq!(
+            find_live_endpoint_owner_in(&root, "new", "127.0.0.1", 5678),
+            Some("owner".to_string())
+        );
+        assert_eq!(
+            find_live_endpoint_owner_in(&root, "new", "localhost", 5678),
+            Some("owner".to_string())
+        );
+        // Different port, different host: no block (two endpoints coexist).
+        assert!(find_live_endpoint_owner_in(&root, "new", "127.0.0.1", 5679).is_none());
+        assert!(find_live_endpoint_owner_in(&root, "new", "example.com", 5678).is_none());
+        // The owner's own name is excluded (a session never blocks itself).
+        assert!(find_live_endpoint_owner_in(&root, "owner", "127.0.0.1", 5678).is_none());
+        // Dead daemon (port 1: nothing listens) never blocks.
+        fake_owner(&root, "dead", "py", "attach", "127.0.0.1", json!(9999), 1);
+        assert!(find_live_endpoint_owner_in(&root, "new", "127.0.0.1", 9999).is_none());
+        // Stale dir without session.json (failed start): no block.
+        let stale = root.join("stale");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(
+            stale.join("stops.json"),
+            r#"{"requestedTarget":{"host":"127.0.0.1","port":7777,"pid":null}}"#,
+        )
+        .unwrap();
+        assert!(find_live_endpoint_owner_in(&root, "new", "127.0.0.1", 7777).is_none());
+        // Launch kind with a live daemon and same endpoint still matches
+        // (kind attach/launch both count when the endpoint is known).
+        fake_owner(
+            &root,
+            "launcher",
+            "py",
+            "launch",
+            "127.0.0.1",
+            json!(8888),
+            live,
+        );
+        assert_eq!(
+            find_live_endpoint_owner_in(&root, "new", "127.0.0.1", 8888),
+            Some("launcher".to_string())
+        );
+        // Browser owner on the same port never blocks (shared CDP port,
+        // different tab capability).
+        fake_owner(
+            &root,
+            "tab",
+            "browser",
+            "attach",
+            "127.0.0.1",
+            json!(9222),
+            live,
+        );
+        fake_owner(&root, "py9222", "py", "attach", "127.0.0.1", json!(9223), 1);
+        assert!(find_live_endpoint_owner_in(&root, "new", "127.0.0.1", 9222).is_none());
+        drop(sock);
+        // Socket closed: the owner reads dead now, no block, no cleanup.
+        assert!(find_live_endpoint_owner_in(&root, "new", "127.0.0.1", 5678).is_none());
+        assert!(root.join("owner").exists(), "scan must not delete");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Merge extra keys into a fake session's session.json (updatedAt
+    /// control for the liveness corroboration window).
+    fn patch_session(root: &std::path::Path, name: &str, patch: Value) {
+        let path = root.join(name).join("session.json");
+        let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for (k, val) in patch.as_object().unwrap() {
+            v[k] = val.clone();
+        }
+        std::fs::write(&path, v.to_string()).unwrap();
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn endpoint_scan_corroborates_recent_publish_on_probe_failure() {
+        // Daemon port is dead in both cases (port 1 refuses fast); only
+        // the bridge's publish freshness differs. Recent publish fails
+        // closed (a wedged probe must not authorize a second attach onto
+        // a live target); an hour-old publish stops blocking.
+        let root = tmpdir("endpoint-scan-recent");
+        fake_owner(&root, "fresh", "py", "attach", "127.0.0.1", json!(4444), 1);
+        patch_session(&root, "fresh", json!({"updatedAt": now_secs() - 10}));
+        assert_eq!(
+            find_live_endpoint_owner_in(&root, "new", "127.0.0.1", 4444),
+            Some("fresh".to_string())
+        );
+        fake_owner(&root, "old", "py", "attach", "127.0.0.1", json!(4445), 1);
+        patch_session(&root, "old", json!({"updatedAt": now_secs() - 3600}));
+        assert!(find_live_endpoint_owner_in(&root, "new", "127.0.0.1", 4445).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn endpoint_scan_skips_symlinks_and_bad_names() {
+        let root = tmpdir("endpoint-scan-links");
+        let sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let live = sock.local_addr().unwrap().port();
+        fake_owner(&root, "owner", "py", "attach", "h", json!(1111), live);
+        // A symlink with a colliding name must be skipped, never followed.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("owner"), root.join("evil")).unwrap();
+            // "evil" has no intent of its own; even if it resolved, the
+            // name is valid — the symlink guard must skip it. Point the
+            // real owner elsewhere so any follow would false-positive.
+            assert!(find_live_endpoint_owner_in(&root, "new", "h", 2222).is_none());
+        }
+        // Invalid names never resolve (check_name rejects escapes).
+        assert!(
+            find_live_endpoint_owner_in(&root, "../owner", "h", 1111) == Some("owner".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn endpoint_lock_is_exclusive_per_endpoint_with_stale_recovery() {
+        let base = tmpdir("endpoint-lock");
+        let locks = base.join("locks");
+        let sessions = base.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let held = |r: anyhow::Result<EndpointClaim>| match r.unwrap() {
+            EndpointClaim::Held(g) => g,
+            EndpointClaim::Busy(b) => panic!("expected hold, got busy: {b:?}"),
+        };
+        let busy = |r: anyhow::Result<EndpointClaim>| match r.unwrap() {
+            EndpointClaim::Busy(b) => b,
+            EndpointClaim::Held(_) => panic!("expected busy, got hold"),
+        };
+        // First claim wins; second sees the live holder.
+        let g = held(acquire_endpoint_lock(
+            &locks, &sessions, "first", "py", "loopback", 5678,
+        ));
+        let b = busy(acquire_endpoint_lock(
+            &locks, &sessions, "second", "py", "loopback", 5678,
+        ));
+        assert_eq!(b.session, "first");
+        assert!(!b.published, "no session.json yet: in flight");
+        // A different endpoint never blocks.
+        let g2 = held(acquire_endpoint_lock(
+            &locks, &sessions, "second", "py", "loopback", 5679,
+        ));
+        // A different lang on the same port is a different reservation key
+        // (scan-level capability decides collisions, not the lock).
+        let g3 = held(acquire_endpoint_lock(
+            &locks, &sessions, "b", "browser", "loopback", 5678,
+        ));
+        // Release frees the endpoint (guard drops only our own nonce).
+        drop(g);
+        let g4 = held(acquire_endpoint_lock(
+            &locks, &sessions, "second", "py", "loopback", 5678,
+        ));
+        drop(g2);
+        drop(g3);
+        drop(g4);
+        // Stale lock (dead pid, old mtime) is reclaimed with bounded wait.
+        let stale_holder = held(acquire_endpoint_lock(
+            &locks, &sessions, "crashed", "py", "loopback", 1,
+        ));
+        let live_pid = std::process::id();
+        drop(stale_holder);
+        // Rewrite the record with a provably-dead pid and old mtime.
+        let path = endpoint_lock_path(&locks, "py", "loopback", 1);
+        std::fs::write(
+            &path,
+            json!({"nonce": "dead", "pid": 4199999u32, "session": "crashed", "createdAt": 1})
+                .to_string(),
+        )
+        .unwrap();
+        backdate(&path, ENDPOINT_LOCK_STALE + Duration::from_secs(5));
+        assert!(reclaim_stale_lock(&path), "dead pid + old age must reclaim");
+        assert!(!path.exists(), "reclaimed record must be gone");
+        let g5 = held(acquire_endpoint_lock(
+            &locks, &sessions, "retry", "py", "loopback", 1,
+        ));
+        drop(g5);
+        // Fresh lock with our own live pid is never stale (even the test's
+        // own pid, which is alive by definition).
+        let g6 = held(acquire_endpoint_lock(
+            &locks, &sessions, "live", "py", "loopback", 2,
+        ));
+        let path2 = endpoint_lock_path(&locks, "py", "loopback", 2);
+        // Rewrite mtime old but keep the live pid: liveness wins over age
+        // until the backstop bound.
+        let nonce_live = std::fs::read_to_string(&path2).unwrap();
+        let mut v: Value = serde_json::from_str(&nonce_live).unwrap();
+        v["pid"] = json!(live_pid);
+        std::fs::write(&path2, v.to_string()).unwrap();
+        backdate(&path2, Duration::from_secs(60));
+        assert!(
+            !reclaim_stale_lock(&path2),
+            "live pid must not be reclaimed"
+        );
+        assert!(path2.exists(), "live record must survive");
+        // Foreign release never removes our lock.
+        release_endpoint_lock(&path2, "not-mine");
+        assert!(path2.exists());
+        drop(g6);
+        assert!(!path2.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Set a file's mtime into the past (stale-policy tests control age
+    /// directly — nothing here waits out a real bound).
+    fn backdate(path: &std::path::Path, age: Duration) {
+        let old = std::time::SystemTime::now()
+            .checked_sub(age)
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(old).unwrap();
+        drop(f);
+    }
+
+    /// A provably-dead pid on any platform: spawn `true`, wait for it, and
+    /// reuse its (now free) pid. No sleep, no guess.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("true must spawn");
+        let pid = child.id();
+        child.wait().expect("true must exit");
+        // The pid is free now (reuse in the wild is vanishingly unlikely
+        // inside this assertion window; the stale tests pair it with old
+        // mtimes, and holder_alive runs immediately).
+        pid
+    }
+
+    #[test]
+    fn holder_liveness_distinguishes_dead_from_live() {
+        // Self is alive by definition; a reaped child is dead. Unknown
+        // (ps missing/timed out) has no deterministic trigger and is
+        // covered by the fail-closed match arm in lock_snapshot_is_stale.
+        assert_eq!(holder_alive(std::process::id()), Liveness::Alive);
+        assert_eq!(holder_alive(dead_pid()), Liveness::Dead);
+    }
+
+    #[test]
+    fn stale_reclaim_never_deletes_a_fresh_claimant() {
+        let base = tmpdir("endpoint-reclaim-swap");
+        let locks = base.join("locks");
+        std::fs::create_dir_all(&locks).unwrap();
+        let path = endpoint_lock_path(&locks, "py", "loopback", 7001);
+        // Seed a stale record and snapshot its exact bytes (the reclaimer's
+        // view before the interleaving).
+        let stale = json!({"nonce": "old", "pid": dead_pid(), "session": "gone", "createdAt": 1})
+            .to_string();
+        std::fs::write(&path, &stale).unwrap();
+        backdate(&path, Duration::from_secs(60));
+        // Interleaving: a fresh claimant replaces the record before our
+        // re-verify runs (same live-test pid, current mtime).
+        let fresh = json!({
+            "nonce": "new",
+            "pid": std::process::id(),
+            "session": "fresh",
+            "createdAt": 2,
+        })
+        .to_string();
+        std::fs::write(&path, &fresh).unwrap();
+        // The stale snapshot must not authorize deleting the fresh record.
+        assert!(!quarantine_verified(&path, &stale));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            fresh,
+            "fresh claimant must survive"
+        );
+        // And the full reclaim path agrees on the swapped file.
+        assert!(!reclaim_stale_lock(&path));
+        assert!(path.exists());
+        // Backstop bound: age past 2h reclaims even with an unparseable
+        // record (mtime set directly — no real 2h wait).
+        std::fs::write(&path, "not-json{{{").unwrap();
+        backdate(&path, ENDPOINT_LOCK_STALE + Duration::from_secs(5));
+        assert!(reclaim_stale_lock(&path));
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn quarantine_restore_keeps_fresh_records() {
+        // Deterministic coverage of the reconcile branches: detach F
+        // (as if a rename won after the bytes changed), then reconcile
+        // against different expected bytes.
+        let base = tmpdir("endpoint-quarantine");
+        let locks = base.join("locks");
+        std::fs::create_dir_all(&locks).unwrap();
+        let no_quarantine_orphans = || {
+            let leftovers: Vec<_> = std::fs::read_dir(&locks)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with(".q-"))
+                .collect();
+            assert!(leftovers.is_empty(), "quarantine files must not linger");
+        };
+        // (a) Path free after detach: F moves back intact, hands off.
+        let path = locks.join("ep.lock");
+        let fresh = json!({"nonce": "n1", "pid": std::process::id(), "session": "f"}).to_string();
+        std::fs::write(&path, &fresh).unwrap();
+        let q = detach_to_quarantine(&path).unwrap();
+        assert!(!path.exists());
+        assert!(!reconcile_quarantine(&path, &q, "stale-bytes"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), fresh);
+        no_quarantine_orphans();
+        // (b) Path taken by F2 after detach: our copy drops, F2 intact,
+        // hands off (F's owner backs off at its pre-spawn nonce check).
+        std::fs::write(&path, &fresh).unwrap();
+        let q2 = detach_to_quarantine(&path).unwrap();
+        let fresh2 = json!({"nonce": "n2", "pid": std::process::id(), "session": "f2"}).to_string();
+        std::fs::write(&path, &fresh2).unwrap();
+        assert!(!reconcile_quarantine(&path, &q2, "stale-bytes"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), fresh2);
+        no_quarantine_orphans();
+        // (d) Non-overwriting restore unit behavior: free path restores
+        // bytes verbatim; an F2 that lands between the absence check and
+        // the restore (the old rename-overwrite window) is preserved
+        // byte-for-byte while we fail closed; an unreadable quarantine
+        // source leaves the path untouched.
+        let qp = locks.join(".q-restore-src.tmp");
+        std::fs::write(&qp, &fresh).unwrap();
+        let rp = locks.join("restore-free.lock");
+        assert!(restore_quarantine_bytes(&rp, &qp));
+        assert_eq!(std::fs::read_to_string(&rp).unwrap(), fresh);
+        let rp2 = locks.join("restore-raced.lock");
+        std::fs::write(&rp2, &fresh2).unwrap();
+        assert!(!restore_quarantine_bytes(&rp2, &qp));
+        assert_eq!(
+            std::fs::read_to_string(&rp2).unwrap(),
+            fresh2,
+            "an F2 in the check→restore window must survive intact"
+        );
+        let missing_q = locks.join(".q-never-written.tmp");
+        let rp3 = locks.join("restore-no-src.lock");
+        assert!(!restore_quarantine_bytes(&rp3, &missing_q));
+        assert!(!rp3.exists(), "failed restore must not plant a file");
+        let _ = std::fs::remove_file(&qp);
+        no_quarantine_orphans();
+        // (c) Match: stale detached exactly as judged → dropped, true.
+        std::fs::write(&path, &fresh).unwrap();
+        let q3 = detach_to_quarantine(&path).unwrap();
+        assert!(reconcile_quarantine(&path, &q3, &fresh));
+        assert!(!path.exists());
+        no_quarantine_orphans();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn stale_reclaim_racers_admit_exactly_one() {
+        // N starters race one stale-seeded lock: reclaimers may all detach
+        // the same stale bytes to quarantine, but the atomic claim admits
+        // exactly one. Outcome assertion is deterministic (count == 1);
+        // only scheduling varies. Guards stay held through the count (see
+        // race test note).
+        let base = tmpdir("endpoint-reclaim-race");
+        let locks = base.join("locks");
+        let sessions = base.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&locks).unwrap();
+        let path = endpoint_lock_path(&locks, "py", "loopback", 7002);
+        std::fs::write(
+            &path,
+            json!({"nonce": "old", "pid": dead_pid(), "session": "gone", "createdAt": 1})
+                .to_string(),
+        )
+        .unwrap();
+        backdate(&path, Duration::from_secs(60));
+        std::thread::scope(|s| {
+            let mut handles = vec![];
+            let locks_r = &locks;
+            let sess_r = &sessions;
+            for i in 0..8 {
+                handles.push(s.spawn(move || {
+                    acquire_endpoint_lock(
+                        locks_r,
+                        sess_r,
+                        &format!("reclaimer-{i}"),
+                        "py",
+                        "loopback",
+                        7002,
+                    )
+                    .ok()
+                    .and_then(|c| match c {
+                        EndpointClaim::Held(g) => Some(g),
+                        EndpointClaim::Busy(_) => None,
+                    })
+                }));
+            }
+            let results: Vec<Option<EndpointGuard>> =
+                handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert_eq!(
+                results.iter().filter(|g| g.is_some()).count(),
+                1,
+                "exactly one stale-reclaim racer must win"
+            );
+        });
+        // Every quarantine file is consumed (deleted or restored) on all
+        // reconcile paths short of a crash: none may linger after the race.
+        let orphans: Vec<_> = std::fs::read_dir(&locks)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".q-"))
+            .collect();
+        assert!(orphans.is_empty(), "quarantine files must not linger");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn endpoint_lock_concurrent_second_attach_loses() {
+        // Two starters race one endpoint: exactly one wins (atomic
+        // create_new), the other gets the holder — the TOCTOU preflight
+        // alone could never guarantee.
+        let base = tmpdir("endpoint-lock-race");
+        let locks = base.join("locks");
+        let sessions = base.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::thread::scope(|s| {
+            let mut handles = vec![];
+            let locks_r = &locks;
+            let sess_r = &sessions;
+            for i in 0..8 {
+                handles.push(s.spawn(move || {
+                    // Hold the guard: dropping it releases the endpoint,
+                    // so counting requires keeping winners alive. Only
+                    // Held counts — Busy is a (correct) loss, not a win.
+                    let r = acquire_endpoint_lock(
+                        locks_r,
+                        sess_r,
+                        &format!("racer-{i}"),
+                        "py",
+                        "loopback",
+                        6000,
+                    )
+                    .ok()
+                    .and_then(|c| match c {
+                        EndpointClaim::Held(g) => Some(g),
+                        EndpointClaim::Busy(_) => None,
+                    });
+                    (i, r)
+                }));
+            }
+            let results: Vec<(i32, Option<EndpointGuard>)> =
+                handles.into_iter().map(|h| h.join().unwrap()).collect();
+            // Guards stay alive in `results` through the count: joining is
+            // sequential, and dropping an early winner before late starters
+            // even claim would re-open the endpoint (that flake, not a lock
+            // bug, is why the count must hold every guard).
+            let winners: Vec<i32> = results
+                .iter()
+                .filter_map(|(i, g)| g.as_ref().map(|_| *i))
+                .collect();
+            assert_eq!(winners.len(), 1, "exactly one racer must win");
+        });
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn attach_classification_covers_four_cases_plus_remote() {
+        let ev = |d: &Value| d["evidence"].clone();
+        // Closed during attach: present before, gone after.
+        let d = attach_diagnosis(Some(true), Some(false), "127.0.0.1:1");
+        assert_eq!(d["code"], json!("endpoint-closed-during-attach"));
+        assert_eq!(ev(&d)["listenerBefore"], json!(true));
+        assert_eq!(ev(&d)["listenerAfter"], json!(false));
+        assert!(d["recommendation"]
+            .as_str()
+            .unwrap()
+            .contains("may have exited"));
+        // Rejected: still listening after the failure.
+        let d = attach_diagnosis(Some(true), Some(true), "h:2");
+        assert_eq!(d["code"], json!("endpoint-rejected"));
+        assert!(d["recommendation"]
+            .as_str()
+            .unwrap()
+            .contains("another debugger client"));
+        // Listener appeared mid-attach: still a refusal, same code.
+        let d = attach_diagnosis(Some(false), Some(true), "h:2");
+        assert_eq!(d["code"], json!("endpoint-rejected"));
+        // Nothing ever listened.
+        let d = attach_diagnosis(Some(false), Some(false), "h:3");
+        assert_eq!(d["code"], json!("endpoint-not-listening"));
+        assert_eq!(d["confidence"], json!("high"));
+        // Remote/unknown: generic, low confidence, no certainty claimed.
+        for (pre, post) in [(None, None), (None, Some(true)), (Some(true), None)] {
+            let d = attach_diagnosis(pre, post, "remote:4");
+            assert_eq!(d["code"], json!("endpoint-unreachable"));
+            assert_eq!(d["confidence"], json!("low"));
+        }
+        // Shape contract: every code carries all four fields.
+        for (pre, post) in [
+            (Some(true), Some(false)),
+            (Some(true), Some(true)),
+            (Some(false), Some(false)),
+            (None, None),
+        ] {
+            let d = attach_diagnosis(pre, post, "h:5");
+            for f in ["code", "confidence", "evidence", "recommendation"] {
+                assert!(d.get(f).is_some(), "{f} missing for {pre:?}/{post:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn attach_failure_envelope_keeps_message_adds_context() {
+        // The bridge message stays verbatim (existing `attach failed`
+        // matches keep working); diagnosis + redacted identities ride
+        // alongside. No raw argv anywhere in the envelope.
+        let msg = "attach failed (127.0.0.1:9): Connection refused — is the target started \
+             with debugpy --listen 9 ?";
+        let observed = attach_observed("127.0.0.1", 9);
+        let requested = json!({"host": "127.0.0.1", "port": 9, "pid": Value::Null});
+        let d = attach_diagnosis(Some(false), Some(false), "127.0.0.1:9");
+        let err = attach_failure(msg.to_string(), d, &observed, &requested);
+        assert_eq!(format!("{err:#}"), msg);
+        let bf = err.downcast_ref::<BridgeFailure>().expect("typed failure");
+        assert_eq!(
+            bf.diagnosis.as_ref().unwrap()["code"],
+            json!("endpoint-not-listening")
+        );
+        assert!(bf.wait_context.is_none());
+        assert_eq!(bf.requested_target.as_ref().unwrap()["port"], json!(9));
+        // Redacted by construction: observed argv (if any) carries no
+        // secrets and the envelope serializes within caps.
+        let ser = serde_json::to_string(bf.target_identity.as_ref().unwrap()).unwrap();
+        assert!(ser.len() <= OBSERVED_TOTAL_CAP);
+        // Preflight owner error names the session + endpoint, actionably.
+        let err = endpoint_owned_failure(
+            "first",
+            false,
+            "py",
+            "127.0.0.1",
+            5678,
+            &observed,
+            &requested,
+        );
+        let text = format!("{err:#}");
+        assert!(text.contains("endpoint-already-attached"), "{text}");
+        assert!(text.contains("'first'"), "{text}");
+        assert!(text.contains("5678"), "{text}");
+        assert!(text.contains("close it first"), "{text}");
+        let bf = err.downcast_ref::<BridgeFailure>().expect("typed failure");
+        assert_eq!(
+            bf.diagnosis.as_ref().unwrap()["evidence"]["ownerSession"],
+            json!("first")
+        );
+        let in_flight = endpoint_owned_failure("w", true, "py", "h", 1, &observed, &requested);
+        assert!(
+            format!("{in_flight:#}").contains("is attaching"),
+            "in-flight wording"
+        );
+    }
+
+    #[test]
+    fn attach_setup_failure_classifies_with_verbatim_message() {
+        // Shared helper behind all four setup-failure branches (fast
+        // error.json, late settle, bridge exit, first-forward transport):
+        // the message stays byte-identical, the diagnosis reflects a
+        // fresh post probe, and the redacted identities ride along.
+        let mk_spec = || SpawnSpec {
+            lang: "py",
+            kind: "attach",
+            bridge_args: vec![],
+            wait_secs: 1,
+            stops: json!({}),
+            requested: json!({"host": "127.0.0.1", "port": 9, "pid": Value::Null}),
+            observed: attach_observed("127.0.0.1", 9),
+            observed_hint: String::new(),
+        };
+        let spec = mk_spec();
+        let msg = "cannot reach debug session on port 61234: connection refused (stale?)";
+        let err = attach_setup_failure("127.0.0.1", 9, Some(false), msg.to_string(), &spec);
+        assert_eq!(format!("{err:#}"), msg, "transport message verbatim");
+        let bf = err.downcast_ref::<BridgeFailure>().expect("typed failure");
+        // Port 9 is dead pre and post: not-listening, with identities.
+        assert_eq!(
+            bf.diagnosis.as_ref().unwrap()["code"],
+            json!("endpoint-not-listening")
+        );
+        assert!(bf.target_identity.is_some());
+        assert_eq!(bf.requested_target.as_ref().unwrap()["port"], json!(9));
+    }
+
+    #[test]
+    fn display_endpoint_caps_host_length() {
+        assert_eq!(display_endpoint("h", 1), "h:1");
+        let long = "x".repeat(500);
+        let shown = display_endpoint(&long, 5678);
+        assert!(shown.ends_with(":5678"), "{shown}");
+        assert!(
+            shown.chars().count() < 200,
+            "unbounded CLI host must not bloat the envelope: {shown}"
+        );
+        assert!(shown.contains("more chars"), "truncation must be marked");
     }
 }
