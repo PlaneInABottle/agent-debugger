@@ -2,12 +2,15 @@ import com.sun.jdi.Location;
 import com.sun.jdi.Method;
 import com.sun.jdi.ReferenceType;
 import com.sun.jdi.ThreadReference;
+import com.sun.jdi.VirtualMachine;
+import com.sun.jdi.request.EventRequestManager;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Proxy;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /** M6 unit parity for the wait/capture/diagnostics UX batch (no live VM:
@@ -16,7 +19,9 @@ import java.util.Map;
  *  (defaults + every rejection), line-only capture spec parsing, wait and
  *  capture occupying the outstanding slot (rival resume/mutation/eval
  *  busy, close still accepted), the capture-ephemeral dup/conflict rules
- *  without VM traffic, and stop diagnostics (monotonic stopId,
+ *  without VM traffic, the deferred capture's tagged ClassPrepareRequest
+ *  lifecycle (no timeout leak) and pending-ephemeral guard, and stop
+ *  diagnostics (monotonic stopId,
  *  same-location/same-thread/elapsed, requested/bound attribution, native
  *  hit ids never fabricated).
  *
@@ -275,6 +280,71 @@ public class M6JavaCheck {
             check(w.contains("\"diag\":{"), "wait carries diag");
             check(w.contains("HTTP handler remains open"), "wait carries parked warning");
             check(w.contains("\"target\":\"main\""), "wait stamps target main");
+        }
+
+        // 7. Deferred capture owns a tagged ClassPrepareRequest; unplant
+        // deletes it (no timeout leak); a pending ephemeral guards dupes.
+        {
+            SessionState st = freshState(tmp);
+            List<Object> created = new ArrayList<>();
+            List<Object> deleted = new ArrayList<>();
+            Map<String, Object> capProps = new LinkedHashMap<>();
+            Object cpr = Proxy.newProxyInstance(M6JavaCheck.class.getClassLoader(),
+                    new Class<?>[]{com.sun.jdi.request.ClassPrepareRequest.class},
+                    (proxy, m, args) -> {
+                        switch (m.getName()) {
+                            case "toString": return "fake-cpr";
+                            case "hashCode": return 1;
+                            case "equals": return proxy == args[0];
+                            case "putProperty":
+                                capProps.put((String) args[0], args[1]);
+                                return null;
+                            case "getProperty": return capProps.get((String) args[0]);
+                            default: return null;
+                        }
+                    });
+            Object erm = Proxy.newProxyInstance(M6JavaCheck.class.getClassLoader(),
+                    new Class<?>[]{EventRequestManager.class},
+                    (proxy, m, args) -> {
+                        switch (m.getName()) {
+                            case "toString": return "fake-erm";
+                            case "hashCode": return 2;
+                            case "equals": return proxy == args[0];
+                            case "createClassPrepareRequest":
+                                created.add(cpr);
+                                return cpr;
+                            case "classPrepareRequests":
+                                return new ArrayList<>(created);
+                            case "breakpointRequests":
+                                return new ArrayList<>();
+                            case "deleteEventRequest":
+                                created.remove(args[0]);
+                                deleted.add(args[0]);
+                                return null;
+                            default: return null;
+                        }
+                    });
+            Map<String, Object> vmAnswers = new LinkedHashMap<>();
+            vmAnswers.put("classesByName", new ArrayList<>());
+            vmAnswers.put("eventRequestManager", erm);
+            st.vm = fake(VirtualMachine.class, vmAnswers);
+            BridgeSession.AddedLine p = BridgeSession.parseAddedLine("com.Foo:54");
+            check(BridgeSession.plantCaptureBreak(st, p), "deferred capture plants its ephemeral");
+            check(created.size() == 1, "exactly one tagged prepare request created");
+            check("com.Foo".equals(st.captureCls) && st.captureLine == 54,
+                    "capture fields track the ephemeral");
+            BridgeSession.AddedLine dup = BridgeSession.parseAddedLine("com.Foo:54");
+            check(!BridgeSession.plantCaptureBreak(st, dup),
+                    "duplicate pending capture plants nothing");
+            check(created.size() == 1, "duplicate pending capture creates no request");
+            expectBridgeError("conflicting pending capture",
+                    () -> BridgeSession.plantCaptureBreak(st,
+                            BridgeSession.parseAddedLine("com.Foo:54|x > 1")),
+                    "already pending");
+            BridgeSession.unplantCaptureBreak(st);
+            check(deleted.size() == 1 && deleted.get(0) == cpr,
+                    "unplant deletes the capture prepare request (no timeout leak)");
+            check(st.captureCls == null, "unplant clears the ephemeral fields");
         }
 
         if (failures > 0) {

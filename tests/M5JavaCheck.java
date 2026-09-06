@@ -1,7 +1,10 @@
+import java.lang.reflect.Proxy;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /** M5 unit parity for the Java bridge (no JUnit on this path — plain
  *  asserts, nonzero exit on failure; no live VM needed: every case below
@@ -10,7 +13,11 @@ import java.util.List;
  *  the busy target reject immediately with the frozen busy shape; frame
  *  reads fail fast once the resume publishes running (never stale); close
  *  is accepted despite an outstanding resume; the handler bound is small
- *  and fixed; concurrent live dispatches from threads all succeed.
+ *  and fixed; concurrent live dispatches from threads all succeed; the
+ *  pump-serialization model (idle tryLock skips a held queue/outstanding);
+ *  the cached thread roster while outstanding; unknown step modes failing
+ *  fast; condition/logpoint evaluation completing without sessionLock
+ *  (delayed-JDI worker under a held lock); the post-timeout parked recheck.
  *
  *  Compile: javac -cp <bridge classes> -d <out> tests/M5JavaCheck.java
  *  Run:     java -cp <bridge classes>:<out> M5JavaCheck
@@ -57,6 +64,29 @@ public class M5JavaCheck {
 
     interface Throwing {
         void run() throws Exception;
+    }
+
+    /** Proxy a JDI interface by method name (unlisted methods return null). */
+    @SuppressWarnings("unchecked")
+    static <T> T fake(Class<T> iface, Map<String, Object> answers) {
+        java.lang.reflect.InvocationHandler h = (proxy, m, args) -> {
+            if (m.getName().equals("toString")) return "fake";
+            if (m.getName().equals("hashCode")) return 0;
+            if (m.getName().equals("equals")) return proxy == args[0];
+            return answers.get(m.getName());
+        };
+        return (T) Proxy.newProxyInstance(M5JavaCheck.class.getClassLoader(),
+                new Class<?>[]{iface}, h);
+    }
+
+    static com.sun.jdi.Location loc(String cls, int line, String method) {
+        com.sun.jdi.ReferenceType rt = fake(com.sun.jdi.ReferenceType.class, Map.of("name", cls));
+        com.sun.jdi.Method m = fake(com.sun.jdi.Method.class, Map.of("name", method));
+        Map<String, Object> a = new LinkedHashMap<>();
+        a.put("declaringType", rt);
+        a.put("lineNumber", line);
+        a.put("method", m);
+        return fake(com.sun.jdi.Location.class, a);
     }
 
     public static void main(String[] argv) throws Exception {
@@ -197,6 +227,190 @@ public class M5JavaCheck {
             synchronized (st.sessionLock) {
                 check(st.outstanding == null, "outstanding cleared after failed resume");
             }
+        }
+
+        // 8. Pump serialization model: at most one EventQueue.remove
+        // consumer. The idle pump skips while a dispatch pump holds the
+        // queue (vm is null here — any JDI touch would NPE, so a null return
+        // proves no touch) and while a resume is outstanding.
+        {
+            SessionState st = freshState(tmp);
+            // A rival pump thread owns the queue: the idle pump skips without
+            // touching JDI (vm is null here — any JDI touch would NPE, so a
+            // null return proves no touch). A separate holder thread matters:
+            // ReentrantLock is reentrant on the same thread.
+            java.util.concurrent.CountDownLatch held =
+                    new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.CountDownLatch release =
+                    new java.util.concurrent.CountDownLatch(1);
+            Thread holder = new Thread(() -> {
+                st.pumpLock.lock();
+                held.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException ignored) {
+                } finally {
+                    st.pumpLock.unlock();
+                }
+            });
+            holder.setDaemon(true);
+            holder.start();
+            held.await();
+            try {
+                long t0 = System.nanoTime();
+                String r = BridgeSession.awaitStopIdle(st, 5);
+                long ms = (System.nanoTime() - t0) / 1_000_000;
+                check(r == null, "idle pump skips while a dispatch pump holds the queue");
+                check(ms < 2000, "idle skip is prompt (" + ms + "ms)");
+            } finally {
+                release.countDown();
+                holder.join(5000);
+            }
+            synchronized (st.sessionLock) {
+                st.outstanding = "continue";
+            }
+            check(BridgeSession.awaitStopIdle(st, 5) == null,
+                    "idle pump skips while a resume is outstanding");
+            synchronized (st.sessionLock) {
+                st.outstanding = null;
+            }
+        }
+
+        // 9. Threads serves the cached roster while a resume owns the pump
+        // (no JDI while outstanding); empty only when nothing cached yet.
+        {
+            SessionState st = freshState(tmp);
+            synchronized (st.sessionLock) {
+                st.outstanding = "continue";
+                st.cachedThreads = "[{\"id\":7}]";
+            }
+            String r = BridgeSession.dispatch(st, "{\"cmd\":\"threads\"}");
+            check(r.contains("\"running\":true") && r.contains("\"id\":7"),
+                    "threads serves the cached roster while a resume owns the pump: " + r);
+            SessionState st2 = freshState(tmp);
+            synchronized (st2.sessionLock) {
+                st2.outstanding = "wait";
+            }
+            String r2 = BridgeSession.dispatch(st2, "{\"cmd\":\"threads\"}");
+            check(r2.contains("\"threads\":[]"),
+                    "no cache yet serves empty (never stale-shaped): " + r2);
+        }
+
+        // 10. Unknown step modes fail fast (before any JDI), and the
+        // outstanding slot still clears.
+        {
+            SessionState st = freshState(tmp);
+            synchronized (st.sessionLock) {
+                st.suspended = true;
+                st.thread = fake(com.sun.jdi.ThreadReference.class, new LinkedHashMap<>());
+            }
+            expectBridgeError("unknown step mode fails fast",
+                    () -> BridgeSession.dispatch(st, "{\"cmd\":\"step\",\"mode\":\"sideways\"}"),
+                    "unknown step mode");
+            synchronized (st.sessionLock) {
+                check(st.outstanding == null, "failed step clears the outstanding slot");
+            }
+        }
+
+        // 11. Condition/logpoint evaluation never takes sessionLock: a worker
+        // running both against slow JDI completes while the main thread holds
+        // the lock (a 10s invokeMethod join under the lock would stall this
+        // past the join budget and fail).
+        {
+            SessionState st = freshState(tmp);
+            Config cfg = new Config();
+            Logpoint lp = new Logpoint();
+            lp.cls = "com.Foo";
+            lp.line = 54;
+            lp.template = "v={x}";
+            cfg.logpoints.add(lp);
+            com.sun.jdi.Location location = loc("com.Foo", 54, "m");
+            Map<String, Object> frameAnswers = new LinkedHashMap<>();
+            frameAnswers.put("visibleVariableByName", null);
+            frameAnswers.put("thisObject", null);
+            frameAnswers.put("location", location);
+            com.sun.jdi.StackFrame frame = fake(com.sun.jdi.StackFrame.class, frameAnswers);
+            List<com.sun.jdi.StackFrame> frames = new ArrayList<>();
+            frames.add(frame);
+            com.sun.jdi.ThreadReference slowThread = (com.sun.jdi.ThreadReference) Proxy.newProxyInstance(
+                    M5JavaCheck.class.getClassLoader(),
+                    new Class<?>[]{com.sun.jdi.ThreadReference.class},
+                    (proxy, m, args) -> {
+                        if (m.getName().equals("toString")) return "slow-fake";
+                        if (m.getName().equals("hashCode")) return 0;
+                        if (m.getName().equals("equals")) return proxy == args[0];
+                        if (m.getName().equals("frames")) {
+                            try { Thread.sleep(300); } catch (InterruptedException ignored) {}
+                            return frames;
+                        }
+                        return null;
+                    });
+            final List<String> linesOut = new ArrayList<>();
+            final boolean[] condOut = new boolean[]{true};
+            final Throwable[] err = new Throwable[1];
+            Thread worker = new Thread(() -> {
+                try {
+                    List<String> lines =
+                            BridgeSession.renderLogLines(cfg, slowThread, location);
+                    if (lines != null) linesOut.addAll(lines);
+                    condOut[0] = BridgeEval.checkCond(slowThread, location, "x == 1");
+                } catch (Throwable t) {
+                    err[0] = t;
+                }
+            });
+            worker.setDaemon(true);
+            synchronized (st.sessionLock) {
+                long t0 = System.nanoTime();
+                worker.start();
+                try {
+                    worker.join(5000);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
+                long ms = (System.nanoTime() - t0) / 1_000_000;
+                check(!worker.isAlive(),
+                        "evaluation completes while sessionLock is held (" + ms + "ms)");
+                check(ms < 5000, "delayed evaluator stays bounded (" + ms + "ms)");
+            }
+            check(err[0] == null, "evaluation worker raised nothing (" + err[0] + ")");
+            check(linesOut.size() == 1 && linesOut.get(0).startsWith("[logpoint error:"),
+                    "slow logpoint render degrades to an error line: " + linesOut);
+            check(!condOut[0], "unknown name in condition counts as false");
+        }
+
+        // 12. Post-timeout parked recheck: a parked stop exposes its snapshot
+        // instead of a spurious timeout; a running session rechecks to null.
+        {
+            SessionState st = freshState(tmp);
+            st.cfg.mode = "attach";
+            com.sun.jdi.ReferenceType rt =
+                    fake(com.sun.jdi.ReferenceType.class, Map.of("name", "com.Foo"));
+            Map<String, Object> vmAnswers = new LinkedHashMap<>();
+            vmAnswers.put("allThreads", new ArrayList<>());
+            com.sun.jdi.VirtualMachine vm =
+                    fake(com.sun.jdi.VirtualMachine.class, vmAnswers);
+            Map<String, Object> threadAnswers = new LinkedHashMap<>();
+            threadAnswers.put("uniqueID", 11L);
+            threadAnswers.put("name", "main");
+            threadAnswers.put("status", 1);
+            threadAnswers.put("isSuspended", Boolean.FALSE);
+            threadAnswers.put("frames", new ArrayList<>());
+            com.sun.jdi.ThreadReference thread =
+                    fake(com.sun.jdi.ThreadReference.class, threadAnswers);
+            st.vm = vm;
+            st.thread = thread;
+            st.location = loc("com.Foo", 54, "bill");
+            synchronized (st.sessionLock) {
+                st.suspended = true;
+            }
+            String parked = BridgeSession.parkedRecheck(st);
+            check(parked != null && parked.contains("com.Foo") && parked.contains("bill"),
+                    "parked recheck exposes the stop snapshot: " + parked);
+            synchronized (st.sessionLock) {
+                st.suspended = false;
+            }
+            check(BridgeSession.parkedRecheck(st) == null,
+                    "running session rechecks to null (timeout stands)");
         }
 
         if (failures > 0) {

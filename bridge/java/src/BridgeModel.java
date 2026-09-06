@@ -15,6 +15,14 @@ class UsageException extends Exception {
     }
 class BridgeException extends Exception {
         BridgeException(String m) { super(m); }
+        // Additive structured context for wait/capture timeouts (the honest
+        // trigger-unknown report); pre-rendered JSON object or null. The
+        // message keeps the exact frozen timeout prefix either way.
+        String waitContextJson = null;
+        BridgeException(String m, String waitContextJson) {
+            super(m);
+            this.waitContextJson = waitContextJson;
+        }
     }
 class Config {
         String mode; // "attach" | "launch"
@@ -31,6 +39,8 @@ class Config {
         Map<String, String> breakRaws = new LinkedHashMap<>(); // "cls:line|cond" -> stored raw (remove/clear echo)
         String observedTargetJson = null; // redacted CLI-observed identity (verbatim JSON)
         String observedHint = ""; // one-line redacted diagnostic hint
+        String targetIdentityJson = null; // layered {debuggee,endpoint,adapter} (verbatim JSON, redacted+capped)
+        String identityHint = ""; // debuggee-first one-liner for timeouts
         List<Logpoint> logpoints = new ArrayList<>();
         List<Watchpoint> watchpoints = new ArrayList<>();
         Map<String, List<String>> exitMethods = new LinkedHashMap<>(); // cls -> methods
@@ -64,11 +74,22 @@ class SessionState {
         ServerSocket server;
         ThreadReference thread;
         Location location;
-        // M5: sessionLock serializes ALL session-state access and every JDI
-        // call (JDI objects are touched only while holding it). It is NEVER
-        // held across blocking waits (eventQueue.remove, accept, socket IO),
-        // so live reads stay prompt while a resume is outstanding.
+        // M5: sessionLock serializes session-state access and JDI *mutation*
+        // (break plants/removes, suspend/resume, step/delete requests). It is
+        // NEVER held across blocking waits (eventQueue.remove, accept,
+        // socket IO, sleep). Read-only evaluation (condition checks and
+        // logpoint renders, which may invokeMethod with a 10s join) runs
+        // OUTSIDE sessionLock — per-set reconciliation under the lock stays
+        // bounded and fast, so live reads stay prompt.
         final Object sessionLock = new Object();
+        // HIGH: pumpLock serializes EventQueue.remove — exactly one consumer.
+        // The dispatch pump (continue/step/wait/capture) holds it for its
+        // whole wait; the serveLoop idle pump only tryLocks and skips when a
+        // dispatch pump owns delivery. Lock order is pumpLock -> sessionLock,
+        // and no path blocks on pumpLock while holding sessionLock (idle uses
+        // tryLock only), so this cannot deadlock.
+        final java.util.concurrent.locks.ReentrantLock pumpLock =
+                new java.util.concurrent.locks.ReentrantLock();
         // All session state below is owned by sessionLock holders.
         boolean suspended;
         boolean exited;
@@ -106,5 +127,9 @@ class SessionState {
         String captureCls = null;
         int captureLine = -1;
         String captureCond = null;
+        // Last full thread dump (served as the roster while a resume owns
+        // the pump — the pump owns the event queue, so no fresh JDI dump is
+        // taken; running:true stays honest). Null until the first dump.
+        String cachedThreads = null;
     }
 class CloseSession extends Exception {}

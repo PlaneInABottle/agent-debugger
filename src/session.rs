@@ -93,7 +93,7 @@ pub fn cmd_breaks_add(
 ) -> anyhow::Result<Value> {
     check_name(name)?;
     let dir = checked_session_dir(name)?;
-    let target = normalize_target_for_lang(&session_lang_in(&dir), target)?;
+    let target = normalize_target_for_lang_opt(session_lang_opt(&dir).as_deref(), target)?;
     let port = session_port(name)?;
     let secs = std::cmp::min(10 + 5 * breaks.len() as u64, 65);
     let mut body = serde_json::json!({"cmd": "breaksAdd", "breaks": breaks});
@@ -107,11 +107,7 @@ pub fn cmd_breaks_add(
         )
     })?;
     if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-        let msg = resp
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown bridge error");
-        anyhow::bail!("{msg}");
+        return Err(bridge_failure(&resp));
     }
     if target.is_some() {
         return Ok(stamp_main(resp));
@@ -126,7 +122,7 @@ pub fn cmd_breaks_add(
         })
         .unwrap_or_default();
     if !confirmed.is_empty() {
-        append_confirmed_breaks(name, &confirmed)?;
+        append_confirmed_breaks(name, &confirmed).map_err(|e| applied_live_err("add", e))?;
     }
     Ok(stamp_main(resp))
 }
@@ -144,7 +140,7 @@ pub fn cmd_breaks_remove(
 ) -> anyhow::Result<Value> {
     check_name(name)?;
     let dir = checked_session_dir(name)?;
-    let target = normalize_target_for_lang(&session_lang_in(&dir), target)?;
+    let target = normalize_target_for_lang_opt(session_lang_opt(&dir).as_deref(), target)?;
     let port = session_port(name)?;
     let secs = std::cmp::min(10 + 5 * breaks.len() as u64, 65);
     let mut body = serde_json::json!({"cmd": "breaksRemove", "breaks": breaks});
@@ -158,18 +154,14 @@ pub fn cmd_breaks_remove(
         )
     })?;
     if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-        let msg = resp
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown bridge error");
-        anyhow::bail!("{msg}");
+        return Err(bridge_failure(&resp));
     }
     if target.is_some() {
         return Ok(stamp_main(resp));
     }
     let removed = confirmed_removed(&resp);
     if !removed.is_empty() {
-        remove_confirmed_breaks(name, &removed)?;
+        remove_confirmed_breaks(name, &removed).map_err(|e| applied_live_err("remove", e))?;
     }
     Ok(stamp_main(resp))
 }
@@ -184,7 +176,7 @@ pub fn cmd_breaks_remove(
 pub fn cmd_breaks_clear(name: &str, target: Option<&str>) -> anyhow::Result<Value> {
     check_name(name)?;
     let dir = checked_session_dir(name)?;
-    let target = normalize_target_for_lang(&session_lang_in(&dir), target)?;
+    let target = normalize_target_for_lang_opt(session_lang_opt(&dir).as_deref(), target)?;
     let port = session_port(name)?;
     let secs = std::cmp::min(10 + 5 * persisted_line_breaks(name), 65);
     let mut body = serde_json::json!({"cmd": "breaksClear"});
@@ -198,18 +190,14 @@ pub fn cmd_breaks_clear(name: &str, target: Option<&str>) -> anyhow::Result<Valu
         )
     })?;
     if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-        let msg = resp
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown bridge error");
-        anyhow::bail!("{msg}");
+        return Err(bridge_failure(&resp));
     }
     if target.is_some() {
         return Ok(stamp_main(resp));
     }
     let removed = confirmed_removed(&resp);
     if !removed.is_empty() {
-        remove_confirmed_breaks(name, &removed)?;
+        remove_confirmed_breaks(name, &removed).map_err(|e| applied_live_err("clear", e))?;
     }
     Ok(stamp_main(resp))
 }
@@ -260,6 +248,17 @@ fn confirmed_removed(resp: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// A live break mutation applied on the bridge, then intent persistence
+/// failed: say so explicitly (bare `breaks` shows live truth; resume intent
+/// in stops.json is now stale until resynced) instead of a bare I/O error
+/// that reads as "nothing happened".
+fn applied_live_err(op: &str, e: anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "breaks {op} applied live but intent persistence failed ({e:#}) — \
+         run bare `breaks` to check live stops; resume intent is stale until stops.json is fixed"
+    )
 }
 
 /// Append confirmed raw specs to stops.json's breaks list. Atomic tmp+rename
@@ -326,6 +325,43 @@ fn remove_confirmed_breaks_in(dir: &std::path::Path, raws: &[String]) -> anyhow:
         .map_err(|e| anyhow::anyhow!("cannot persist session intent: {e}"))?;
     Ok(())
 }
+/// A bridge-reported failure. `message` is the exact bridge error string
+/// (timeout prefixes like `timeout: no stop within Ns` are preserved
+/// verbatim for compatibility); `wait_context` carries the bridge's
+/// additive `waitContext` (wait/capture timeouts only) through the CLI to
+/// the JSON/human error envelope. Display is the message alone so every
+/// existing string match keeps working.
+#[derive(Debug)]
+pub struct BridgeFailure {
+    pub message: String,
+    pub wait_context: Option<Value>,
+}
+
+impl std::fmt::Display for BridgeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for BridgeFailure {}
+
+/// Build the CLI-side error for a `{ok:false}` bridge response: the message
+/// stays the display string, a present `waitContext` object rides along as
+/// structured context (anything else reads as absent, never fabricated).
+fn bridge_failure(resp: &Value) -> anyhow::Error {
+    let message = resp
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown bridge error")
+        .to_string();
+    let wait_context = resp.get("waitContext").filter(|v| v.is_object()).cloned();
+    BridgeFailure {
+        message,
+        wait_context,
+    }
+    .into()
+}
+
 /// Forward one command to the session; map {ok:false} to Err.
 /// Both adapters speak the same session protocol, so forwarding is
 /// language-agnostic (the session's lang only selects the adapter process).
@@ -338,7 +374,12 @@ pub fn forward(name: &str, body: &Value, timeout: Duration) -> anyhow::Result<Va
 /// Normalize a target selector for one session: omitted and explicit `main`
 /// both serve main (no wire difference — legacy bridges never see the
 /// field); anything else on a main-only adapter (java/browser) fails fast
-/// instead of silently serving main.
+/// instead of silently serving main. Unknown languages pass through for
+/// bridge-side validation — never assume java (a legacy live py/node dir
+/// without lang.json must forward, not fail fast as main-only).
+/// Legacy narrow helper kept for unit tests; routing uses the `_opt`
+/// variant so missing/unknown languages forward instead of assuming java.
+#[allow(dead_code)]
 fn normalize_target_for_lang(lang: &str, target: Option<&str>) -> anyhow::Result<Option<String>> {
     match target {
         None | Some("main") => Ok(None),
@@ -346,6 +387,26 @@ fn normalize_target_for_lang(lang: &str, target: Option<&str>) -> anyhow::Result
             anyhow::bail!("unsupported target '{other}' (session is {lang}, main-only)")
         }
         Some(other) => Ok(Some(other.to_string())),
+    }
+}
+
+/// Routing variant over an optional language: `None` (missing/corrupt
+/// lang.json) and unrecognized values forward like multi-target langs.
+/// Display callers keep `session_lang_in` (java default); every routing
+/// call site uses this so unknown never misroutes as main-only.
+fn normalize_target_for_lang_opt(
+    lang: Option<&str>,
+    target: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    match (lang, target) {
+        (_, None) | (_, Some("main")) => Ok(None),
+        (Some("java") | Some("browser"), Some(other)) => {
+            anyhow::bail!(
+                "unsupported target '{other}' (session is {}, main-only)",
+                lang.unwrap()
+            )
+        }
+        (_, Some(other)) => Ok(Some(other.to_string())),
     }
 }
 
@@ -371,7 +432,7 @@ pub fn forward_target(
 ) -> anyhow::Result<Value> {
     check_name(name)?;
     let dir = checked_session_dir(name)?;
-    let target = normalize_target_for_lang(&session_lang_in(&dir), target)?;
+    let target = normalize_target_for_lang_opt(session_lang_opt(&dir).as_deref(), target)?;
     let port = session_port(name)?;
     let mut body = body.clone();
     if let Some(t) = target.as_deref() {
@@ -383,22 +444,20 @@ pub fn forward_target(
     if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
         Ok(stamp_main(resp))
     } else {
-        let msg = resp
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown bridge error");
-        anyhow::bail!("{msg}")
+        Err(bridge_failure(&resp))
     }
 }
 
-/// List debug targets in this session. Multi-target bridges (py/node) own
+/// List debug targets in this session. Multi-target bridges (py/node, plus
+/// unknown/missing langs which forward rather than assume main-only) own
 /// their roster; main-only adapters (java/browser) get a uniform main-only
 /// roster built from the bridge-maintained session.json (no new bridge
-/// protocol needed before Batch3).
+/// protocol needed before Batch3). A dead bridge still errors via forward —
+/// no fabricated roster — preserving dead-session behavior.
 pub fn cmd_targets(name: &str) -> anyhow::Result<Value> {
     check_name(name)?;
     let dir = checked_session_dir(name)?;
-    if matches!(session_lang_in(&dir).as_str(), "java" | "browser") {
+    if targets_use_local_roster(&dir) {
         return Ok(cmd_targets_in(&dir));
     }
     Ok(stamp_main(forward(
@@ -406,6 +465,16 @@ pub fn cmd_targets(name: &str) -> anyhow::Result<Value> {
         &json!({"cmd": "targets"}),
         Duration::from_secs(10),
     )?))
+}
+
+/// Routing decision for `cmd_targets` (explicit dir so unit tests exercise
+/// it without touching the real sessions dir): true = serve the local
+/// main-only roster, false = forward to the bridge.
+fn targets_use_local_roster(dir: &std::path::Path) -> bool {
+    matches!(
+        session_lang_opt(dir).as_deref(),
+        Some("java") | Some("browser")
+    )
 }
 
 /// Main-only roster from a session dir (explicit dir so unit tests exercise
@@ -434,6 +503,7 @@ fn cmd_targets_in(dir: &std::path::Path) -> Value {
         "ignored": 0,
         "droppedExited": 0,
         "target": "main",
+        "targetIdentity": parsed.get("targetIdentity").filter(|v| v.is_object()).cloned().unwrap_or(Value::Null),
     })
 }
 
@@ -462,6 +532,10 @@ pub struct SpawnSpec {
 pub const OBSERVED_FIELD_CAP: usize = 512;
 /// Total cap (chars, serialized) for one observedTarget object.
 pub const OBSERVED_TOTAL_CAP: usize = 2048;
+/// Element cap per array inside an observedTarget (argv/cmdline). High-count
+/// argv shapes (~80+ small strings) converge via this count cap plus the
+/// total loop's guaranteed shrink-or-collapse, never by re-marking forever.
+pub const OBSERVED_ARRAY_CAP: usize = 32;
 
 /// Lowercase substrings marking a flag/value as secret. Matched against the
 /// flag name (`--token`, `--password=`, `api-key:` …) case-insensitively;
@@ -482,11 +556,12 @@ fn is_secret_flag(flag: &str) -> bool {
     if SUBSTR.iter().any(|k| flat.contains(k)) {
         return true;
     }
-    // Short keys only on token boundaries (--auth, --token, --pwd — but
-    // never --author or --monkey). A token also matches as a SUFFIX
-    // (-Dtoken=, mytoken=) but never as a mere prefix (--author keeps its
-    // value: "auth" is a prefix of "author", not a suffix).
-    const TOKEN: [&str; 3] = ["token", "auth", "pwd"];
+    // Short keys only on token boundaries (--auth, --token, --pwd, --pass,
+    // --pw — but never --author or --passage). A token also matches as a
+    // SUFFIX (-Dtoken=, mytoken=, --db-pass) but never as a mere prefix
+    // (--author keeps its value: "auth" is a prefix of "author", not a
+    // suffix; --passage likewise never matches "pass").
+    const TOKEN: [&str; 5] = ["token", "auth", "pwd", "pass", "pw"];
     t.split(['-', '_', '.'])
         .any(|tok| TOKEN.iter().any(|k| tok == *k || tok.ends_with(k)))
 }
@@ -498,10 +573,17 @@ pub fn redact_argv(argv: &[String]) -> Vec<Value> {
     let mut out = Vec::with_capacity(argv.len());
     let mut skip_next = false;
     for a in argv {
+        // A pending secret value that turns out to be another flag was never
+        // a value: keep it on the flag path (its own `=`/`:` value still
+        // redacts, its own bare form still arms skip_next) instead of
+        // swallowing it as "[redacted]" and leaking the real value after it
+        // (`--token --password hunter2` must hide hunter2).
         if skip_next {
-            out.push(Value::String("[redacted]".to_string()));
             skip_next = false;
-            continue;
+            if !(a.starts_with('-') && a.len() > 1) {
+                out.push(Value::String("[redacted]".to_string()));
+                continue;
+            }
         }
         // Split head from value on the first `=` or `:` (not a bare flag).
         let split = a.find('=').or_else(|| a.find(':')).filter(|&i| i > 0);
@@ -540,10 +622,14 @@ fn trunc_chars(s: &str, limit: usize) -> String {
     format!("{kept}… (+{} more chars)", n - limit)
 }
 
-/// Cap one observedTarget object: every string field to 512 chars, then the
-/// whole object to 2KB serialized (longest string shrinks first). Only the
-/// known identity shapes are capped (process/tab); anything else passes
-/// through untouched.
+/// Cap one observedTarget object: every string field to 512 chars, every
+/// array to a bounded element count (tail marker), then the whole object to
+/// 2KB serialized. Only the known identity shapes are capped (process/tab);
+/// anything else passes through untouched. The total loop always terminates:
+/// each pass either shrinks the longest string or, when the trunc marker
+/// would not shrink it, collapses it to a 1-char marker (strictly smaller
+/// than any picked string), so ~80+ small argv entries converge by dropping
+/// rather than re-marking forever.
 fn cap_observed(mut v: Value) -> Value {
     fn cap_str(s: &mut String) {
         if s.chars().count() > OBSERVED_FIELD_CAP {
@@ -553,14 +639,30 @@ fn cap_observed(mut v: Value) -> Value {
     fn walk(v: &mut Value) {
         match v {
             Value::String(s) => cap_str(s),
-            Value::Array(a) => a.iter_mut().for_each(walk),
+            Value::Array(a) => {
+                // Deterministic count cap: keep the head, note the dropped
+                // tail. Bounds high-count argv/cmdline shapes before the
+                // total loop runs.
+                if a.len() > OBSERVED_ARRAY_CAP {
+                    let dropped = a.len() - OBSERVED_ARRAY_CAP;
+                    a.truncate(OBSERVED_ARRAY_CAP);
+                    a.push(Value::String(format!("… (+{dropped} more)")));
+                }
+                a.iter_mut().for_each(walk);
+            }
             Value::Object(m) => m.values_mut().for_each(walk),
             _ => {}
         }
     }
     walk(&mut v);
-    // Total cap: shrink the longest string until the object fits.
-    while v.to_string().chars().count() > OBSERVED_TOTAL_CAP {
+    // Total cap: shrink the longest string until the object fits. The trunc
+    // marker itself costs ~17 chars, so re-truncating an already-short
+    // marked string can grow it — in that case collapse to "…" instead.
+    // Either branch strictly reduces the serialized size, guaranteeing
+    // progress; a bounded pass count is the backstop, not the mechanism.
+    let mut passes = 0;
+    while v.to_string().chars().count() > OBSERVED_TOTAL_CAP && passes < 4096 {
+        passes += 1;
         fn longest(v: &mut Value) -> Option<&mut String> {
             match v {
                 Value::String(s) if s.chars().count() > 1 => Some(s),
@@ -572,7 +674,12 @@ fn cap_observed(mut v: Value) -> Value {
         match longest(&mut v) {
             Some(s) => {
                 let n = s.chars().count();
-                *s = trunc_chars(s, n.saturating_sub(64).max(1));
+                let cand = trunc_chars(s, n.saturating_sub(64).max(1));
+                if cand.chars().count() < n {
+                    *s = cand;
+                } else {
+                    *s = "…".to_string();
+                }
             }
             None => break,
         }
@@ -679,12 +786,38 @@ struct ProcInfo {
     warnings: Vec<String>,
 }
 
+/// Bounded subprocess capture for the macOS lookup (lsof/ps). Same
+/// spawn-and-wait-with-timeout idiom as the bridge provisioning path: ~5s
+/// hard bound, None on timeout/failure so attach degrades to structured
+/// `unavailable` instead of hanging the CLI. No new deps (std mpsc only).
 fn run_bounded(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new(cmd).args(args).output().ok()?;
-    if !out.status.success() {
-        return None;
+    const RUN_BOUNDED_TIMEOUT: Duration = Duration::from_secs(5);
+    let child = std::process::Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let child_id = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(RUN_BOUNDED_TIMEOUT) {
+        Ok(Ok(out)) if out.status.success() => String::from_utf8(out.stdout).ok(),
+        // Nonzero exit, spawn/wait failure, or undecodable bytes: no data.
+        Ok(_) => None,
+        Err(_) => {
+            // Timed out: best-effort kill (the waiter thread reaps the
+            // child whenever it actually exits); the lookup reports
+            // unavailable instead of hanging attach.
+            let _ = std::process::Command::new("kill")
+                .arg(child_id.to_string())
+                .output();
+            None
+        }
     }
-    String::from_utf8(out.stdout).ok()
 }
 
 /// Kernel-observed listener pid for a localhost port. macOS: lsof;
@@ -913,8 +1046,17 @@ fn stops_armed(stops: &Value) -> Value {
     })
 }
 
-/// Language owning a session dir (sidecar file; missing = "java").
+/// Language owning a session dir (sidecar file; missing = "java" for
+/// display/status only — routing must use `session_lang_opt` so unknown
+/// forwards to the bridge instead of assuming main-only java).
 fn session_lang_in(dir: &std::path::Path) -> String {
+    session_lang_opt(dir).unwrap_or_else(|| "java".to_string())
+}
+
+/// Routing language: `None` when lang.json is missing, corrupt, or has no
+/// `lang` string. Unknown values pass through as `Some` and still forward
+/// (only exact "java"/"browser" take the main-only path).
+fn session_lang_opt(dir: &std::path::Path) -> Option<String> {
     std::fs::read_to_string(dir.join("lang.json"))
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
@@ -923,7 +1065,6 @@ fn session_lang_in(dir: &std::path::Path) -> String {
                 .and_then(|l| l.as_str())
                 .map(|s| s.to_string())
         })
-        .unwrap_or_else(|| "java".to_string())
 }
 
 /// Write sidecars and spawn the bridge process. Called only from `spawn`,
@@ -1058,17 +1199,139 @@ fn setup_bridge(dir: &std::path::Path, spec: &SpawnSpec) -> anyhow::Result<std::
     Ok(child)
 }
 
+/// Sibling lockfile guarding one name's startup window (pre-session.json).
+/// Created atomically before the stale-dir clear; held until the wait loop
+/// resolves (success or failure) via RAII release. Only our own nonce is
+/// ever removed, and only a provably stale lock is stolen — never a live
+/// starter's — so stale dirs stay reusable and retries never wedge.
+fn startup_lock_path(sessions_root: &std::path::Path, name: &str) -> PathBuf {
+    sessions_root.join(format!("{name}.lock"))
+}
+
+/// A lock is stale only when its mtime is provably older than the bound.
+/// Unreadable clocks fail closed (treat as live) — a retry costs one wait,
+/// a wrongful steal costs a live startup its dir.
+const STARTUP_LOCK_STALE: Duration = Duration::from_secs(120);
+
+struct StartupGuard {
+    path: PathBuf,
+    nonce: String,
+}
+
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        release_startup_lock(&self.path, &self.nonce);
+    }
+}
+
+fn startup_nonce() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos}", std::process::id())
+}
+
+fn startup_lock_is_mine(path: &std::path::Path, nonce: &str) -> bool {
+    std::fs::read_to_string(path)
+        .map(|c| c == nonce)
+        .unwrap_or(false)
+}
+
+fn release_startup_lock(path: &std::path::Path, nonce: &str) {
+    if startup_lock_is_mine(path, nonce) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Atomically claim the startup lock (single steal retry for a stale lock).
+/// Live locks (fresh or undatable) bail with a retryable "starting" error.
+fn acquire_startup_lock(path: &std::path::Path) -> anyhow::Result<StartupGuard> {
+    let nonce = startup_nonce();
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut f) => {
+            use std::io::Write as _;
+            f.write_all(nonce.as_bytes())
+                .map_err(|e| anyhow::anyhow!("cannot write startup lock: {e}"))?;
+            return Ok(StartupGuard {
+                path: path.to_path_buf(),
+                nonce,
+            });
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => anyhow::bail!("cannot create startup lock: {e}"),
+    }
+    // Lock held by someone: steal only if provably stale, once.
+    let stale = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+        .map(|age| age >= STARTUP_LOCK_STALE)
+        .unwrap_or(false);
+    if !stale {
+        let holder = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        anyhow::bail!(
+            "session '{holder}' is starting (concurrent start in progress; retry shortly)"
+        );
+    }
+    std::fs::remove_file(path)
+        .map_err(|e| anyhow::anyhow!("cannot clear stale startup lock: {e}"))?;
+    let nonce2 = startup_nonce();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|_| {
+            anyhow::anyhow!("session is starting (concurrent start in progress; retry shortly)")
+        })
+        .and_then(|mut f| {
+            use std::io::Write as _;
+            f.write_all(nonce2.as_bytes())
+                .map_err(|e| anyhow::anyhow!("cannot write startup lock: {e}"))?;
+            Ok(StartupGuard {
+                path: path.to_path_buf(),
+                nonce: nonce2,
+            })
+        })
+}
+
 /// Spawn the bridge daemon and wait for the first stop.
 pub fn spawn(name: &str, spec: &SpawnSpec) -> anyhow::Result<Value> {
+    spawn_in(&sessions_dir(), name, spec)
+}
+
+/// `spawn` with an explicit sessions root (unit tests pass a tmpdir so the
+/// interlock is exercised without touching the real sessions dir).
+fn spawn_in(
+    sessions_root: &std::path::Path,
+    name: &str,
+    spec: &SpawnSpec,
+) -> anyhow::Result<Value> {
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(spec.wait_secs))
         .ok_or_else(|| anyhow::anyhow!("timeout is too large"))?;
-    let dir = checked_session_dir(name)?;
+    check_name(name)?;
+    let dir = sessions_root.join(name);
+    check_dir_real(&dir)?;
+    // Exclusive startup interlock BEFORE any stale cleanup: two concurrent
+    // starts on one name used to race pre-session.json, the loser deleting
+    // the winner's dir via the stale clear below. The lock is a sibling
+    // file created atomically (create_new); only a provably stale lock
+    // (mtime older than the bound) is stolen, so crashed starters never
+    // block the name forever and retries keep working.
+    std::fs::create_dir_all(sessions_root)
+        .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", sessions_root.display()))?;
+    let _guard = acquire_startup_lock(&startup_lock_path(sessions_root, name))?;
     if dir.join("session.json").exists() {
         anyhow::bail!("session '{name}' already exists (close it first)");
     }
-    std::fs::create_dir_all(sessions_dir())
-        .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", sessions_dir().display()))?;
     // A leftover dir without session.json is a failed attempt, not a live
     // session: clear it so the name is reusable. A live session is caught
     // by the session.json check above. Re-validate immediately before the
@@ -1145,9 +1408,12 @@ pub fn spawn(name: &str, spec: &SpawnSpec) -> anyhow::Result<Value> {
                     // requested from the CLI flags, observed from the
                     // bridge-persisted cache (browser) or our own lookup
                     // (process targets). Never invent: missing files read
-                    // as null.
+                    // as null. The layered targetIdentity (debuggee /
+                    // endpoint / adapter roles) rides along the same way —
+                    // no spawn-time fallback, the roles need bridge facts.
                     data["requestedTarget"] = spec.requested.clone();
                     data["observedTarget"] = cached_observed(&dir, spec);
+                    data["targetIdentity"] = cached_target_identity(&dir);
                     return Ok(data);
                 }
                 Err(e) => {
@@ -1177,6 +1443,7 @@ pub fn spawn(name: &str, spec: &SpawnSpec) -> anyhow::Result<Value> {
                             });
                             out["requestedTarget"] = spec.requested.clone();
                             out["observedTarget"] = cached_observed(&dir, spec);
+                            out["targetIdentity"] = cached_target_identity(&dir);
                             return Ok(out);
                         }
                     }
@@ -1224,6 +1491,21 @@ fn cached_observed(dir: &std::path::Path, spec: &SpawnSpec) -> Value {
         .unwrap_or_else(|| spec.observed.clone())
 }
 
+/// Layered target identity for a live session dir (session.json
+/// `targetIdentity`: `{debuggee, endpoint, adapter}` roles built by the
+/// bridge from protocol-confirmed + OS-corroborated sources). No spawn-time
+/// fallback: the roles need bridge-observed protocol facts the CLI never
+/// has, so a missing copy reads as null (honest "unknown"), never a
+/// fabricated role. `observedTarget` stays the compatibility view.
+fn cached_target_identity(dir: &std::path::Path) -> Value {
+    std::fs::read_to_string(dir.join("session.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.get("targetIdentity").cloned())
+        .filter(|v| v.is_object())
+        .unwrap_or(Value::Null)
+}
+
 /// Re-fetch location + threads + frames without resuming, with the cached
 /// redacted identity attached (same object as the start/attach response).
 /// An optional target selector routes to one parked target; identity stays
@@ -1247,9 +1529,16 @@ pub fn cmd_context_target(name: &str, target: Option<&str>) -> anyhow::Result<Va
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .and_then(|v| v.get("observedTarget").cloned())
         .unwrap_or(Value::Null);
+    let identity = std::fs::read_to_string(dir.join("session.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.get("targetIdentity").cloned())
+        .filter(|v| v.is_object())
+        .unwrap_or(Value::Null);
     if let Value::Object(ref mut m) = resp {
         m.insert("requestedTarget".to_string(), requested);
         m.insert("observedTarget".to_string(), observed);
+        m.insert("targetIdentity".to_string(), identity);
     }
     Ok(resp)
 }
@@ -1445,6 +1734,11 @@ fn session_entry(dir: &std::path::Path) -> Value {
         .and_then(|v| v.get("requestedTarget").cloned())
         .unwrap_or(Value::Null);
     let observed = parsed.get("observedTarget").cloned().unwrap_or(Value::Null);
+    let identity = parsed
+        .get("targetIdentity")
+        .filter(|v| v.is_object())
+        .cloned()
+        .unwrap_or(Value::Null);
     json!({
         "name": name,
         "lang": session_lang_in(dir),
@@ -1458,6 +1752,7 @@ fn session_entry(dir: &std::path::Path) -> Value {
         "target": target,
         "requestedTarget": requested,
         "observedTarget": observed,
+        "targetIdentity": identity,
     })
 }
 
@@ -1942,5 +2237,248 @@ mod tests {
         assert!(compact_hint(&tab).contains("http://h/app.js"));
         let missing = attach_observed("example.com", 9);
         assert!(compact_hint(&missing).contains("unavailable"));
+    }
+
+    #[test]
+    fn redact_adjacent_secret_flags_do_not_leak() {
+        // The value slot after --token holds another secret flag, not a
+        // value: the flag must survive and its own value must redact.
+        let argv = ["--token", "--password", "hunter2"];
+        let red = redact_argv(&argv.map(|s| s.to_string()));
+        let strs: Vec<&str> = red.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(strs, vec!["--token", "--password", "[redacted]"]);
+        assert!(!strs.join(" ").contains("hunter2"));
+        // Chained three-deep: every value still masks.
+        let argv = ["--token", "--pass", "--pw", "zzz"];
+        let red = redact_argv(&argv.map(|s| s.to_string()));
+        let strs: Vec<&str> = red.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(strs, vec!["--token", "--pass", "--pw", "[redacted]"]);
+        assert!(!strs.join(" ").contains("zzz"));
+    }
+
+    #[test]
+    fn redact_short_pass_forms_without_false_positives() {
+        for (flag, val) in [("--pass", "s1"), ("--pw", "s2"), ("--db-pass", "s3")] {
+            let argv = [flag, val];
+            let red = redact_argv(&argv.map(|s| s.to_string()));
+            let strs: Vec<&str> = red.iter().filter_map(|v| v.as_str()).collect();
+            assert_eq!(strs, vec![flag, "[redacted]"], "{flag}");
+            assert!(!strs.join(" ").contains(val));
+        }
+        // =/: forms too.
+        let red = redact_argv(&["--pass=s1".to_string(), "--pw:s2".to_string()]);
+        let strs: Vec<&str> = red.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(strs, vec!["--pass=[redacted]", "--pw:[redacted]"]);
+        // Near-misses keep their values: --passage, --author, --passed.
+        for argv in [
+            ["--passage", "Story"],
+            ["--author", "Jane"],
+            ["--passed", "yes"],
+        ] {
+            let red = redact_argv(&argv.map(|s| s.to_string()));
+            let strs: Vec<&str> = red.iter().filter_map(|v| v.as_str()).collect();
+            assert_eq!(strs, argv, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn observed_high_count_argv_terminates_bounded() {
+        // ~80+ small strings: the old longest-shrink loop re-marked without
+        // progress (attach hang); count cap + collapse must converge <=2KB.
+        let argv: Vec<Value> = (0..120)
+            .map(|i| Value::String(format!("--arg{i:03}-{}", "v".repeat(20))))
+            .collect();
+        let v = cap_observed(json!({
+            "kind": "process", "pid": 1, "executable": "/bin/x",
+            "argv": argv, "cwd": "/t",
+            "source": "s", "observedAt": 1,
+            "unavailable": [], "warnings": [],
+        }));
+        assert!(v.to_string().chars().count() <= OBSERVED_TOTAL_CAP);
+        let arr = v["argv"].as_array().unwrap();
+        assert!(arr.len() <= OBSERVED_ARRAY_CAP + 1); // head + tail marker
+        assert!(
+            arr.iter()
+                .any(|e| e.as_str().is_some_and(|s| s.contains("more"))),
+            "dropped tail must be marked"
+        );
+        // Every surviving field still fits the per-field cap (+marker slack).
+        for entry in arr {
+            assert!(
+                entry.as_str().unwrap().chars().count() <= OBSERVED_FIELD_CAP + 30,
+                "{}",
+                entry.as_str().unwrap().chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_lang_forwards_instead_of_assuming_java() {
+        // Missing/corrupt lang.json: display stays java, routing forwards.
+        let dir = tmpdir("lang-missing");
+        assert_eq!(session_lang_in(&dir), "java");
+        assert!(session_lang_opt(&dir).is_none());
+        assert!(!targets_use_local_roster(&dir));
+        assert_eq!(
+            normalize_target_for_lang_opt(session_lang_opt(&dir).as_deref(), Some("child:7"))
+                .unwrap(),
+            Some("child:7".to_string())
+        );
+        std::fs::write(dir.join("lang.json"), r#"{"lang":"py"}"#).unwrap();
+        assert!(!targets_use_local_roster(&dir));
+        std::fs::write(dir.join("lang.json"), r#"{"lang":"mystery"}"#).unwrap();
+        assert!(!targets_use_local_roster(&dir));
+        assert_eq!(
+            normalize_target_for_lang_opt(session_lang_opt(&dir).as_deref(), Some("child:7"))
+                .unwrap(),
+            Some("child:7".to_string())
+        );
+        // Known main-only langs still gate.
+        std::fs::write(dir.join("lang.json"), r#"{"lang":"java"}"#).unwrap();
+        assert!(targets_use_local_roster(&dir));
+        assert!(
+            normalize_target_for_lang_opt(session_lang_opt(&dir).as_deref(), Some("child:7"))
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_lock_exclusive_live_and_stale() {
+        let base = tmpdir("startup-lock");
+        let lock = startup_lock_path(&base, "demo");
+        // First claim wins; second sees a live lock and bails retryably.
+        let g = acquire_startup_lock(&lock).unwrap();
+        assert!(acquire_startup_lock(&lock).is_err());
+        // Foreign nonce is never removed by release.
+        release_startup_lock(&lock, "not-mine");
+        assert!(lock.exists());
+        // Drop releases ours; the name is reusable (retries keep working).
+        drop(g);
+        assert!(!lock.exists());
+        let g2 = acquire_startup_lock(&lock).unwrap();
+        drop(g2);
+        // Provably stale lock (old mtime) is stolen exactly once; a fresh
+        // lock after the steal blocks again.
+        std::fs::write(&lock, "crashed-starter").unwrap();
+        let old = std::time::SystemTime::now() - STARTUP_LOCK_STALE - Duration::from_secs(5);
+        let f = std::fs::File::options().write(true).open(&lock).unwrap();
+        f.set_modified(old).unwrap();
+        drop(f);
+        let g3 = acquire_startup_lock(&lock).unwrap();
+        assert!(startup_lock_is_mine(&lock, &g3.nonce));
+        assert!(acquire_startup_lock(&lock).is_err());
+        drop(g3);
+        assert!(!lock.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn persistence_failure_says_applied_live() {
+        for op in ["add", "remove", "clear"] {
+            let e = applied_live_err(op, anyhow::anyhow!("cannot persist session intent: boom"));
+            let msg = format!("{e:#}");
+            assert!(
+                msg.contains("applied live but intent persistence failed"),
+                "{msg}"
+            );
+            assert!(msg.contains(op), "{msg}");
+            assert!(msg.contains("boom"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn bridge_failure_carries_wait_context_with_prefix_intact() {
+        // wait/capture timeout: the message keeps the exact frozen prefix,
+        // the additive waitContext rides along structurally (unknown cause,
+        // never a fabricated trigger verdict).
+        let resp = json!({
+            "ok": false,
+            "error": "timeout: no stop within 2s; target identity: tab ?",
+            "target": "main",
+            "waitContext": {
+                "waitStartedAt": 1735689600,
+                "waitedMs": 2000,
+                "triggerStatus": "unknown",
+                "targetIdentity": {"debuggee": Value::Null},
+                "note": "external trigger execution is not observed",
+            },
+        });
+        let err = bridge_failure(&resp);
+        assert_eq!(
+            format!("{err:#}"),
+            "timeout: no stop within 2s; target identity: tab ?"
+        );
+        let bf = err.downcast_ref::<BridgeFailure>().expect("typed failure");
+        let ctx = bf.wait_context.as_ref().expect("waitContext carried");
+        assert_eq!(ctx["triggerStatus"], json!("unknown"));
+        assert_eq!(ctx["waitedMs"], json!(2000));
+        // Non-object waitContext reads as absent, never fabricated.
+        let plain = bridge_failure(&json!({"ok": false, "error": "busy: x"}));
+        assert_eq!(format!("{plain:#}"), "busy: x");
+        assert!(plain
+            .downcast_ref::<BridgeFailure>()
+            .unwrap()
+            .wait_context
+            .is_none());
+        // Missing error still maps (legacy shape), without context.
+        let missing = bridge_failure(&json!({"ok": false}));
+        assert_eq!(format!("{missing:#}"), "unknown bridge error");
+        assert!(missing
+            .downcast_ref::<BridgeFailure>()
+            .unwrap()
+            .wait_context
+            .is_none());
+    }
+
+    #[test]
+    fn cached_target_identity_needs_bridge_object() {
+        // Present object passes through; missing/non-object reads as null
+        // (no spawn-time fabrication — the roles need bridge facts).
+        let dir = tmpdir("identity-cache");
+        assert_eq!(cached_target_identity(&dir), Value::Null);
+        std::fs::write(
+            dir.join("session.json"),
+            r#"{"name":"x","observedTarget":{"kind":"process"},
+                "targetIdentity":{"debuggee":{"confidence":"protocol-confirmed"}}}"#,
+        )
+        .unwrap();
+        let v = cached_target_identity(&dir);
+        assert_eq!(v["debuggee"]["confidence"], json!("protocol-confirmed"));
+        std::fs::write(dir.join("session.json"), r#"{"targetIdentity":null}"#).unwrap();
+        assert_eq!(cached_target_identity(&dir), Value::Null);
+        std::fs::write(dir.join("session.json"), r#"{"targetIdentity":[1]}"#).unwrap();
+        assert_eq!(cached_target_identity(&dir), Value::Null);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_entry_and_roster_surface_identity_additively() {
+        // observedTarget shape untouched; targetIdentity rides alongside in
+        // both status rows and the main-only targets roster.
+        let dir = tmpdir("identity-surface");
+        std::fs::write(
+            dir.join("session.json"),
+            r#"{"name":"x","kind":"attach","port":0,"stopped":false,
+                "observedTarget":{"kind":"process","pid":7},
+                "targetIdentity":{"debuggee":{"pid":7},"endpoint":null,"adapter":null}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("lang.json"), r#"{"lang":"java"}"#).unwrap();
+        let row = session_entry(&dir);
+        assert_eq!(row["observedTarget"]["pid"], json!(7));
+        assert_eq!(row["targetIdentity"]["debuggee"]["pid"], json!(7));
+        let roster = cmd_targets_in(&dir);
+        assert_eq!(roster["targetIdentity"]["debuggee"]["pid"], json!(7));
+        assert_eq!(roster["targets"][0]["observed"]["pid"], json!(7));
+        // Legacy file without the key: honest nulls, same as before.
+        std::fs::write(
+            dir.join("session.json"),
+            r#"{"name":"x","kind":"attach","port":0,"stopped":false}"#,
+        )
+        .unwrap();
+        assert_eq!(session_entry(&dir)["targetIdentity"], Value::Null);
+        assert_eq!(cmd_targets_in(&dir)["targetIdentity"], Value::Null);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

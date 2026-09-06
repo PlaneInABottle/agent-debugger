@@ -227,6 +227,56 @@ class WaitCaptureTests(unittest.TestCase):
             third = st._last_diag
             self.assertFalse(third["sameLocation"])
 
+    def test_capture_truncated_vars_propagated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.realpath(str(Path(tmp) / "a.py"))
+            Path(path).write_text("".join(f"line {n}\n" for n in range(12)))
+            st = _session(tmp)
+            many = [{"name": f"v{n}", "type": "int", "value": str(n),
+                     "variablesReference": 0} for n in range(10)]
+
+            def fake(command, args=None, timeout=30):
+                if command == "stackTrace":
+                    return {"stackFrames": [{"id": 11, "name": "handler",
+                                             "source": {"path": path},
+                                             "line": 5}]}
+                if command == "threads":
+                    return {"threads": [{"id": 1, "name": "main"}]}
+                if command == "scopes":
+                    return {"scopes": [{"name": "Locals",
+                                        "variablesReference": 1}]}
+                if command == "variables":
+                    return {"variables": many}
+                raise AssertionError(f"unexpected DAP: {command}")
+            st.thread_id = None
+            st.suspended = False
+            st.dap_request.side_effect = fake
+            st._park_stop("breakpoint", 1)
+            capped = st.cmd_capture({"frames": 2, "vars": 3}, 5)
+            self.assertTrue(capped["truncated"]["vars"])
+            locs = capped["snapshot"]["frames"][0]["locals"]
+            self.assertEqual(locs[-1]["name"], "…")
+            # Uncapped fits: stays false.
+            roomy = st.cmd_capture({"frames": 2, "vars": 20}, 5)
+            self.assertFalse(roomy["truncated"]["vars"])
+
+    def test_capture_exit_preserves_original_error_with_remove_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.realpath(str(Path(tmp) / "a.py"))
+            Path(path).write_text("".join(f"line {n}\n" for n in range(12)))
+            st = _session(tmp)
+            st.dap_request.side_effect = _live_dap(path)
+
+            def fake_pump(timeout):
+                raise _bridge.BridgeErr("target exited")
+            st.pump = fake_pump
+            st._capture_unplant = Mock(side_effect=RuntimeError("remove boom"))
+            with self.assertRaises(_bridge.BridgeErr) as cm:
+                st.cmd_capture({"break": f"{path}:5"}, 5)
+            msg = str(cm.exception)
+            self.assertIn("target exited", msg)  # original never masked
+            self.assertIn("remove boom", msg)  # removal failure attached
+
     def test_diag_attribution_matches_bound_line(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.realpath(str(Path(tmp) / "a.py"))

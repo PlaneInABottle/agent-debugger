@@ -64,6 +64,10 @@ class BridgeSession {
             } else {
                 throw new UsageException("--kind must be attach or launch");
             }
+            // Layered identity before the first user-visible completion:
+            // JDI VM properties (protocol-confirmed debuggee) + the CLI OS
+            // listener observation (os-corroborated endpoint). Never throws.
+            buildTargetIdentity(st);
             armBreakpoints(st.vm, cfg);
             st.vm.resume();
             st.suspended = false;
@@ -315,11 +319,68 @@ class BridgeSession {
      */
 
     static String awaitStop(SessionState st, long timeoutMs) throws Exception {
-        return awaitStopInner(st, timeoutMs);
+        return awaitStop(st, timeoutMs, null, false);
+    }
+
+    /** Wait/capture entry: attaches the honest trigger-unknown context to
+     *  the timeout (expectedBreak only when the capture planted one).
+     *  Continue/step/handshake/idle waits pass withContext=false — their
+     *  timeouts carry no waitContext. */
+    static String awaitStop(SessionState st, long timeoutMs, String expectedBreak,
+            boolean withContext) throws Exception {
+        return awaitStopInner(st, timeoutMs, false, expectedBreak, withContext);
+    }
+
+    /**
+     * Idle pump: harvest a pending stop while nobody waits (keeps a parked
+     * VM's session.json honest). Never steals from a dispatch pump: the
+     * outstanding/suspended/exited precheck and the pumpLock tryLock both
+     * fail fast, so at most one EventQueue.remove consumer exists. Returns
+     * null when there is nothing to do (a genuine stop still returns its
+     * snapshot; a quiet window raises StopTimeout like any other wait).
+     */
+    static String awaitStopIdle(SessionState st, long timeoutMs) throws Exception {
+        synchronized (st.sessionLock) {
+            if (st.exited || st.suspended || st.outstanding != null) return null;
+        }
+        // A dispatch pump owns delivery for its whole wait: skip this idle
+        // window instead of queueing a rival remove behind it.
+        if (!st.pumpLock.tryLock()) return null;
+        try {
+            return awaitStopInner(st, timeoutMs, true);
+        } finally {
+            st.pumpLock.unlock();
+        }
     }
 
     static String awaitStopInner(SessionState st, long timeoutMs) throws Exception {
-        VirtualMachine vm = st.vm;
+        return awaitStopInner(st, timeoutMs, false);
+    }
+
+    static String awaitStopInner(SessionState st, long timeoutMs, boolean idle) throws Exception {
+        return awaitStopInner(st, timeoutMs, idle, null, false);
+    }
+
+    static String awaitStopInner(SessionState st, long timeoutMs, boolean idle,
+            String expectedBreak, boolean withContext) throws Exception {
+        final long waitStartMs = System.currentTimeMillis();
+        // LOW closure: snapshot vm/closing under sessionLock (visibility) —
+        // cleanupVm nulls vm under the same lock, so the pump observes either
+        // the live VM or null, never a half-closed transport. The blocking
+        // remove and evaluation below stay outside the lock (live reads
+        // prompt); only this snapshot and the per-set reconciliation take it.
+        final VirtualMachine vm;
+        synchronized (st.sessionLock) {
+            vm = st.vm;
+        }
+        // HIGH: strict pump serialization — exactly one EventQueue.remove
+        // consumer. The dispatch pump holds pumpLock for the WHOLE wait
+        // (remove windows plus per-set evaluation); the idle pump only
+        // tryLocks (see awaitStopIdle) and skips. The blocking remove — and
+        // the unbounded condition/logpoint evaluation in preEvaluate — never
+        // hold sessionLock, so live reads stay prompt.
+        if (!idle) st.pumpLock.lock();
+        try {
         long deadline = System.nanoTime() + timeoutMs * 1_000_000;
         while (true) {
             // Same abandonment guard as serveLoop (1s event windows bound it).
@@ -329,18 +390,36 @@ class BridgeSession {
             }
             long remaining = (deadline - System.nanoTime()) / 1_000_000;
             if (remaining <= 0) {
-                throw new StopTimeout(timeoutText(st, timeoutMs));
+                if (!idle) {
+                    // Defense in depth (never the sole fix — pumpLock above
+                    // is the serialization): a stop parked between our last
+                    // remove and this timeout still exposes the park instead
+                    // of a spurious timeout.
+                    String parked = parkedRecheck(st);
+                    if (parked != null) return parked;
+                }
+                String ctx = withContext
+                        ? waitContextJson(st, timeoutMs, waitStartMs, expectedBreak) : null;
+                throw new StopTimeout(timeoutText(st, timeoutMs), ctx);
             }
             EventSet set;
             try {
                 // M5: the single pump consumer owns eventQueue.remove; the
                 // blocking wait itself never holds sessionLock (live reads
-                // stay prompt). Per-set processing below takes the lock.
+                // stay prompt). Per-set processing below takes the lock only
+                // for the bounded reconciliation (Phase B).
                 set = vm.eventQueue().remove(Math.min(remaining, 1000));
             } catch (InterruptedException ie) {
                 // Pool shutdown (close): never spin — a closing session
-                // aborts the wait instead of looping forever.
-                if (st.closing) throw new BridgeException("session closing");
+                // aborts the wait instead of looping forever. Read under
+                // sessionLock like every other st.closing read (same LOW
+                // visibility closure as the vm snapshot above; closing is
+                // also volatile, so either read is safe).
+                final boolean closingCopy;
+                synchronized (st.sessionLock) {
+                    closingCopy = st.closing;
+                }
+                if (closingCopy) throw new BridgeException("session closing");
                 continue;
             } catch (Exception e) {
                 synchronized (st.sessionLock) {
@@ -350,18 +429,24 @@ class BridgeSession {
                 throw new BridgeException("lost connection to target VM: " + JdiBridge.shortMsg(e));
             }
             if (set == null) continue;
+            // Phase A: unbounded evaluation OUTSIDE sessionLock (condition
+            // checks and logpoint renders may invokeMethod with a 10s join
+            // — live reads must never wait on it). Pure per-event decisions;
+            // no st.* mutation happens here.
+            List<PreEval> pre = preEvaluate(st, set);
             synchronized (st.sessionLock) {
             String stop = null;
             String parkReason = null;
-            for (Event event : set) {
+            for (PreEval pe : pre) {
+                Event event = pe.event;
                 if (event instanceof BreakpointEvent) {
                     BreakpointEvent bp = (BreakpointEvent) event;
-                    fireLogpoints(st, null, st.dir, st.cfg, bp.thread(), bp.location());
+                    applyLogFire(st, pe.logLines, bp.location());
                     if (!hasStoppingBreak(st.cfg, bp.location())
                             && !isCaptureBreak(st, bp.location())) continue;
-                    String cond = BridgeEval.lookupCond(st.cfg, bp.location());
-                    if (cond == null) cond = captureCond(st, bp.location());
-                    if (cond != null && !BridgeEval.checkCond(bp.thread(), bp.location(), cond)) continue;
+                    // Condition verdicts come from Phase A (evaluated outside
+                    // sessionLock); the lock only reconciles them here.
+                    if (pe.cond != null && !pe.condPass) continue;
                     countBreakHit(st, bp.location());
                     // First stopping event in the set wins the exposed
                     // stop (deterministic); every matching event still
@@ -386,10 +471,9 @@ class BridgeSession {
                     stop = BridgeSnapshot.snapshot(vm, st.cfg, st.thread, st.location, st.out, st.err);
                 } else if (event instanceof com.sun.jdi.event.ExceptionEvent) {
                     com.sun.jdi.event.ExceptionEvent ee = (com.sun.jdi.event.ExceptionEvent) event;
-                    if (!matchesExcFilter(st.cfg, ee)) continue;
-                    fireLogpoints(st, null, st.dir, st.cfg, ee.thread(), ee.location());
-                    String cond = BridgeEval.lookupCond(st.cfg, ee.location());
-                    if (cond != null && !BridgeEval.checkCond(ee.thread(), ee.location(), cond)) continue;
+                    if (!pe.wanted) continue;
+                    applyLogFire(st, pe.logLines, ee.location());
+                    if (pe.cond != null && !pe.condPass) continue;
                     countExcHits(st, ee);
                     if (stop != null) continue;
                     parkReason = "exception";
@@ -461,24 +545,412 @@ class BridgeSession {
             }
             set.resume();
             } // synchronized (st.sessionLock): one pump's set is fully
-              // reconciled (flags, JDI reads, hit counts) before any rival
-              // dispatch observes it; the blocking remove() above stays out.
+              // reconciled (flags, bounded JDI reads, hit counts) before any
+              // rival dispatch observes it; the blocking remove and the
+              // unbounded evaluation above stay out.
+        }
+        } finally {
+            if (!idle) st.pumpLock.unlock();
+        }
+    }
+
+    /** Per-event evaluation verdict, computed OUTSIDE sessionLock. */
+    static class PreEval {
+        Event event;
+        String cond; // condition found for this event (null = none)
+        boolean condPass = true; // false only when a found cond failed
+        List<String> logLines; // null = no logpoint fire for this event
+        boolean wanted = true; // exception-filter match (other events: true)
+    }
+
+    /**
+     * Phase A of event-set processing: unbounded evaluation without holding
+     * sessionLock. Condition checks and logpoint template renders may call
+     * invokeMethod (worker join up to 10s) — that must never block live
+     * reads. No st.* field is read or written here except via the narrow,
+     * exception-safe consults below (cfg maps are append-only while a pump
+     * runs: rivals busy-reject, so the worst case is a benign stale read).
+     */
+    static List<PreEval> preEvaluate(SessionState st, EventSet set) {
+        List<PreEval> out = new ArrayList<>(set.size());
+        for (Event event : set) {
+            PreEval pe = new PreEval();
+            pe.event = event;
+            try {
+                if (event instanceof BreakpointEvent) {
+                    BreakpointEvent bp = (BreakpointEvent) event;
+                    String cond = BridgeEval.lookupCond(st.cfg, bp.location());
+                    if (cond == null) cond = captureCond(st, bp.location());
+                    pe.cond = cond;
+                    if (cond != null) {
+                        try {
+                            pe.condPass = BridgeEval.checkCond(bp.thread(), bp.location(), cond);
+                        } catch (Exception e) {
+                            pe.condPass = false;
+                        }
+                    }
+                    pe.logLines = renderLogLines(st.cfg, bp.thread(), bp.location());
+                } else if (event instanceof com.sun.jdi.event.ExceptionEvent) {
+                    com.sun.jdi.event.ExceptionEvent ee =
+                            (com.sun.jdi.event.ExceptionEvent) event;
+                    pe.wanted = matchesExcFilter(st.cfg, ee);
+                    if (pe.wanted) {
+                        String cond = BridgeEval.lookupCond(st.cfg, ee.location());
+                        pe.cond = cond;
+                        if (cond != null) {
+                            try {
+                                pe.condPass = BridgeEval.checkCond(ee.thread(), ee.location(), cond);
+                            } catch (Exception e) {
+                                pe.condPass = false;
+                            }
+                        }
+                        pe.logLines = renderLogLines(st.cfg, ee.thread(), ee.location());
+                    }
+                }
+            } catch (Exception e) {
+                // Evaluation-time race or JDI hiccup: reconcile
+                // conservatively (a found-but-unevaluated cond never stops;
+                // a half-rendered fire is dropped, never half-appended).
+                if (pe.cond != null) pe.condPass = false;
+                pe.logLines = null;
+            }
+            out.add(pe);
+        }
+        return out;
+    }
+
+    /**
+     * Render logpoint templates for one event OUTSIDE sessionLock (holes use
+     * the read-only call allowlist but may still invoke, e.g. get()). Null
+     * when nothing fires (no templates or no frames). The caller bumps hit
+     * counts and appends under the lock via applyLogFire.
+     */
+    static List<String> renderLogLines(Config cfg, ThreadReference thread, Location loc) {
+        try {
+            List<String> templates = BridgeEval.matchingTemplates(cfg, loc);
+            if (templates.isEmpty()) return null;
+            List<StackFrame> frames = BridgeSnapshot.safeFrames(thread);
+            if (frames.isEmpty()) return null;
+            List<String> out = new ArrayList<>(templates.size());
+            for (String t : templates) {
+                try {
+                    out.add(BridgeEval.renderTemplate(thread, frames.get(0), t));
+                } catch (Exception e) {
+                    out.add("[logpoint error: " + JdiBridge.shortMsg(e) + "]");
+                }
+            }
+            return out;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Phase B logpoint commit (caller holds sessionLock): hit counts plus
+     *  the pre-rendered lines. Mirrors fireLogpoints minus the evaluation. */
+    static void applyLogFire(SessionState st, List<String> lines, Location loc) {
+        if (lines == null) return;
+        String cls = "?";
+        int line = -1;
+        try { cls = loc.declaringType().name(); } catch (Exception ignored) {}
+        try { line = loc.lineNumber(); } catch (Exception ignored) {}
+        bump(st, "logpoint|" + cls + "|" + line);
+        for (String l : lines) appendSessionLog(st, st.dir, l);
+    }
+
+    /**
+     * Post-timeout parked recheck: if a stop parked between our last remove
+     * and this timeout (e.g. a racing consumer that no longer exists), expose
+     * the park instead of a spurious timeout. Null when nothing parked.
+     */
+    static String parkedRecheck(SessionState st) {
+        synchronized (st.sessionLock) {
+            try {
+                if (st.suspended && st.thread != null && st.location != null && st.vm != null) {
+                    return BridgeSnapshot.snapshot(st.vm, st.cfg, st.thread,
+                            st.location, st.out, st.err);
+                }
+            } catch (Exception ignored) {}
+            return null;
         }
     }
 
     static class StopTimeout extends BridgeException {
         StopTimeout(String message) { super(message); }
+        StopTimeout(String message, String waitContextJson) {
+            super(message, waitContextJson);
+        }
     }
 
-    /** Timeout message with the compact observed-identity hint (names the
-     *  target, never claims root cause). */
+    /** Timeout message with the compact identity hint (debuggee-first,
+     *  names the target, never claims root cause). */
     static String timeoutText(SessionState st, long timeoutMs) {
         String msg = "timeout: no stop within " + (timeoutMs / 1000) + "s";
-        if (st != null && st.cfg != null && st.cfg.observedHint != null
-                && !st.cfg.observedHint.isEmpty()) {
-            msg += "; " + st.cfg.observedHint;
+        String hint = (st != null && st.cfg != null && st.cfg.identityHint != null
+                && !st.cfg.identityHint.isEmpty()) ? st.cfg.identityHint
+                : (st != null && st.cfg != null ? st.cfg.observedHint : null);
+        if (hint != null && !hint.isEmpty()) {
+            msg += "; " + hint;
         }
         return msg;
+    }
+
+    /** Honest timeout context (pre-rendered JSON): the debugger never
+     *  observes the external trigger, so triggerStatus is always unknown;
+     *  success paths never fabricate sent/failed. expectedBreak rides only
+     *  when the capture planted one. The layered targetIdentity is the
+     *  redacted + capped handshake copy (never rebuilt per command). */
+    static String waitContextJson(SessionState st, long timeoutMs, long waitStartMs,
+            String expectedBreak) {
+        long waitedMs = Math.max(0, System.currentTimeMillis() - waitStartMs);
+        StringBuilder sb = new StringBuilder("{\"waitStartedAt\":");
+        sb.append(waitStartMs / 1000).append(",\"waitedMs\":").append(waitedMs)
+                .append(",\"triggerStatus\":\"unknown\"");
+        if (expectedBreak != null) {
+            sb.append(",\"expectedBreak\":").append(JdiBridge.quote(expectedBreak));
+        }
+        String ident = (st != null && st.cfg != null && st.cfg.targetIdentityJson != null)
+                ? st.cfg.targetIdentityJson : "null";
+        sb.append(",\"targetIdentity\":").append(ident);
+        sb.append(",\"note\":").append(JdiBridge.quote(
+                "external trigger execution is not observed by the debugger; "
+                + "this timeout means no stop was observed, "
+                + "not that the code is unreachable"));
+        return sb.append('}').toString();
+    }
+
+    // -- layered target identity (M-ID): additive {debuggee, endpoint,
+    // adapter} roles beside the untouched observedTarget. Confidence is
+    // strict: protocol-confirmed only from JDI VM properties (attach) plus
+    // the launch pid when this runtime exposes it; os-corroborated only for
+    // the OS-observed listener owner; attach pids stay honestly unavailable
+    // (JDI SocketAttach exposes none). No target-code eval anywhere.
+
+    static final int IDENT_FIELD_CAP = 512;
+    static final int IDENT_TOTAL_CAP = 4096;
+
+    static String truncField(String s) {
+        if (s == null) return null;
+        if (s.length() <= IDENT_FIELD_CAP) return s;
+        return s.substring(0, IDENT_FIELD_CAP)
+                + "… (+" + (s.length() - IDENT_FIELD_CAP) + " more chars)";
+    }
+
+    /** First `"key": <int|null>` match in a flat JSON object, or null. */
+    static Long jsonLong(String raw, String key) {
+        if (raw == null) return null;
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "\"" + java.util.regex.Pattern.quote(key) + "\"\\s*:\\s*(-?\\d+)")
+                .matcher(raw);
+        if (!m.find()) return null;
+        try {
+            return Long.parseLong(m.group(1));
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /** First `"key": "<string>"` match (no nesting inside), or null. */
+    static String jsonString(String raw, String key) {
+        if (raw == null) return null;
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "\"" + java.util.regex.Pattern.quote(key) + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
+                .matcher(raw);
+        if (!m.find()) return null;
+        try {
+            // Unescape only what the CLI writer emits (quote/backslash).
+            return m.group(1).replace("\\\\", "\\").replace("\\\"", "\"");
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** First `"key": [<flat strings>|null]` match, verbatim (the CLI already
+     *  redacted + capped it), or null. Elements hold no nested arrays, so a
+     *  string-aware bracket scan suffices. */
+    static String jsonStringArray(String raw, String key) {
+        if (raw == null) return null;
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "\"" + java.util.regex.Pattern.quote(key) + "\"\\s*:\\s*\\[").matcher(raw);
+        if (!m.find()) return null;
+        int i = m.end();
+        boolean inStr = false;
+        boolean esc = false;
+        while (i < raw.length()) {
+            char c = raw.charAt(i);
+            if (inStr) {
+                if (esc) esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"') inStr = false;
+            } else if (c == '"') {
+                inStr = true;
+            } else if (c == ']') {
+                return raw.substring(m.end() - 1, i + 1);
+            } else if (c == '{' || c == '}') {
+                return null; // not a flat string array
+            }
+            i++;
+        }
+        return null;
+    }
+
+    static String unavailableEntry(String field, String reason) {
+        return "{\"field\":" + JdiBridge.quote(field)
+                + ",\"reason\":" + JdiBridge.quote(reason) + "}";
+    }
+
+    /** Build the layered identity once the VM handle exists (handshake, both
+     *  kinds). Never throws: every unknown reads as structured unavailable,
+     *  never a fabricated role. Redacted + capped before return. */
+    static void buildTargetIdentity(SessionState st) {
+        try {
+            buildTargetIdentityInner(st);
+        } catch (Exception e) {
+            st.cfg.targetIdentityJson = null;
+            st.cfg.identityHint = st.cfg.observedHint == null ? "" : st.cfg.observedHint;
+        }
+    }
+
+    static void buildTargetIdentityInner(SessionState st) {
+        long now = System.currentTimeMillis() / 1000;
+        String obs = st.cfg.observedTargetJson;
+        Long ownerPid = jsonLong(obs, "pid");
+        String ownerSource = jsonString(obs, "source");
+        // -- debuggee: JDI VM properties confirm it (safe metadata calls,
+        // never target eval). Attach exposes no pid; launch adds the child
+        // pid only when this runtime offers it (host JDK 9+; guarded).
+        String vmName = null;
+        String vmVersion = null;
+        try {
+            if (st.vm != null) {
+                vmName = st.vm.name();
+                vmVersion = st.vm.version();
+            }
+        } catch (Exception ignored) {
+            vmName = null;
+            vmVersion = null;
+        }
+        StringBuilder dg = new StringBuilder("{\"kind\":\"process\"");
+        Long launchPid = null;
+        if ("launch".equals(st.cfg.sessionKind) && st.vm != null) {
+            try {
+                Process proc = st.vm.process();
+                if (proc != null) launchPid = proc.pid();
+            } catch (Exception ignored) {
+                launchPid = null;
+            }
+        }
+        if (vmName != null) {
+            dg.append(",\"name\":").append(JdiBridge.quote(truncField(vmName)));
+        } else {
+            dg.append(",\"name\":null");
+        }
+        if (vmVersion != null) {
+            dg.append(",\"version\":").append(JdiBridge.quote(truncField(vmVersion)));
+        }
+        if (launchPid != null) {
+            dg.append(",\"pid\":").append(launchPid);
+        }
+        // Strict confidence: protocol-confirmed only when the VM actually
+        // exposed its properties; otherwise the whole role is unavailable
+        // (never a confirmed-looking shell).
+        if (vmName != null) {
+            dg.append(",\"source\":\"jdi-vm-props\",\"confidence\":\"protocol-confirmed\"");
+        } else {
+            dg.append(",\"source\":null,\"confidence\":\"unavailable\"");
+        }
+        dg.append(",\"observedAt\":").append(now).append(",\"unavailable\":[");
+        boolean needComma = false;
+        if (vmName == null) {
+            dg.append(unavailableEntry("name", "JDI VM properties not readable"));
+            needComma = true;
+        }
+        if (launchPid == null && !"attach".equals(st.cfg.sessionKind)) {
+            if (needComma) dg.append(',');
+            dg.append(unavailableEntry("pid", "launch pid not available from this runtime"));
+            needComma = true;
+        }
+        if ("attach".equals(st.cfg.sessionKind)) {
+            if (needComma) dg.append(',');
+            dg.append(unavailableEntry("pid", "JDI SocketAttach exposes no pid"));
+        }
+        dg.append("]}");
+        // -- endpoint: the JDWP listener the CLI attached to (attach) or the
+        // launcher args (launch, from the CLI observation). The JDWP port is
+        // held by the target JVM itself (in-process), so the OS owner
+        // corroborates at most, never confirms.
+        StringBuilder ep = new StringBuilder("{\"host\":")
+                .append(JdiBridge.quote(st.cfg.host))
+                .append(",\"port\":").append(st.cfg.port);
+        String ownerArgv = jsonStringArray(obs, "argv");
+        String ownerExe = jsonString(obs, "executable");
+        String ownerCwd = jsonString(obs, "cwd");
+        if (ownerPid != null) ep.append(",\"ownerPid\":").append(ownerPid);
+        if (ownerExe != null) {
+            ep.append(",\"executable\":").append(JdiBridge.quote(truncField(ownerExe)));
+        }
+        if (ownerArgv != null) ep.append(",\"ownerArgv\":").append(ownerArgv);
+        if (ownerCwd != null) {
+            ep.append(",\"cwd\":").append(JdiBridge.quote(truncField(ownerCwd)));
+        }
+        ep.append(",\"role\":").append(JdiBridge.quote(
+                "attach".equals(st.cfg.sessionKind)
+                        ? "listener-owner (the target JVM holds its own JDWP port)"
+                        : "launcher-observed (the target JVM holds its own JDWP port)"));
+        if (ownerSource != null) {
+            ep.append(",\"source\":").append(JdiBridge.quote(truncField(ownerSource)));
+        } else {
+            ep.append(",\"source\":null");
+        }
+        ep.append(",\"confidence\":")
+                .append(JdiBridge.quote(ownerPid != null ? "os-corroborated" : "unavailable"))
+                .append(",\"observedAt\":").append(now).append(",\"unavailable\":[");
+        if (ownerPid == null) {
+            ep.append(unavailableEntry("ownerPid", "no independent pid source"));
+        }
+        ep.append("]}");
+        // -- adapter: JDWP runs in-process — no separate adapter by design.
+        String ad = "{\"inProcess\":true,\"confidence\":\"unavailable\""
+                + ",\"reason\":" + JdiBridge.quote(
+                        "JDWP agent runs in-process; no separate adapter process")
+                + ",\"observedAt\":" + now + ",\"unavailable\":[]}";
+        String ident = "{\"debuggee\":" + dg + ",\"endpoint\":" + ep + ",\"adapter\":" + ad + "}";
+        if (ident.length() > IDENT_TOTAL_CAP) {
+            // Over budget only via the embedded CLI argv: drop it (marked)
+            // and rebuild; the CLI copy in observedTarget is untouched.
+            ep = new StringBuilder("{\"host\":")
+                    .append(JdiBridge.quote(st.cfg.host))
+                    .append(",\"port\":").append(st.cfg.port);
+            if (ownerPid != null) ep.append(",\"ownerPid\":").append(ownerPid);
+            if (ownerExe != null) {
+                ep.append(",\"executable\":").append(JdiBridge.quote(truncField(ownerExe)));
+            }
+            if (ownerCwd != null) {
+                ep.append(",\"cwd\":").append(JdiBridge.quote(truncField(ownerCwd)));
+            }
+            ep.append(",\"role\":").append(JdiBridge.quote("listener-owner"))
+                    .append(",\"source\":")
+                    .append(ownerSource == null ? "null"
+                            : JdiBridge.quote(truncField(ownerSource)))
+                    .append(",\"confidence\":")
+                    .append(JdiBridge.quote(ownerPid != null ? "os-corroborated" : "unavailable"))
+                    .append(",\"observedAt\":").append(now).append(",\"unavailable\":[");
+            if (ownerPid == null) {
+                ep.append(unavailableEntry("ownerPid", "no independent pid source")).append(',');
+            }
+            ep.append(unavailableEntry("ownerArgv", "dropped: over budget")).append("]}");
+            ident = "{\"debuggee\":" + dg + ",\"endpoint\":" + ep + ",\"adapter\":" + ad + "}";
+        }
+        st.cfg.targetIdentityJson = ident;
+        // Debuggee-first one-liner (concise, no root-cause claim).
+        String hint;
+        if (vmName != null && launchPid != null) {
+            hint = "debuggee: " + vmName + " (pid " + launchPid + ", protocol-confirmed)";
+        } else if (vmName != null) {
+            hint = "debuggee: " + vmName + " (protocol-confirmed)";
+        } else {
+            hint = st.cfg.observedHint == null ? "" : st.cfg.observedHint;
+        }
+        st.cfg.identityHint = hint.length() <= 200 ? hint : hint.substring(0, 200);
     }
 
     static boolean amOwner(SessionState st) {
@@ -513,26 +985,31 @@ class BridgeSession {
                 cleanup(st);
                 return;
             }
+            boolean closing;
             synchronized (st.sessionLock) {
-                if (st.closing) {
-                    // Bounded grace for in-flight handlers to flush their
-                    // aborts, then unconditional exit — no joining a handler
-                    // that itself awaits a stop.
-                    try { Thread.sleep(500); } catch (InterruptedException ignored) {}
-                    return;
-                }
+                closing = st.closing;
+            }
+            if (closing) {
+                // Bounded grace for in-flight handlers to flush their
+                // aborts, then unconditional exit — no joining a handler
+                // that itself awaits a stop. The sleep stays OUTSIDE
+                // sessionLock so live reads never stall on it.
+                try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                return;
             }
             // Use the same event handler between commands, without a second
             // consumer or shared mutable stop state. A parked VM is not resumed.
             // M5: only while NO resume is outstanding — the outstanding
             // resume's pump owns eventQueue consumption (a second consumer
-            // would steal its stop).
+            // would steal its stop). awaitStopIdle rechecks this atomically
+            // and tryLocks the pump, so the check-then-pump here is only a
+            // fast path, never the serialization.
             boolean idlePump;
             synchronized (st.sessionLock) {
                 idlePump = !st.exited && !st.suspended && st.outstanding == null;
             }
             if (idlePump) {
-                try { awaitStopInner(st, 10); }
+                try { awaitStopIdle(st, 10); }
                 catch (StopTimeout idle) { /* no pending stop */ }
                 catch (Exception e) { System.err.println("event: " + JdiBridge.shortMsg(e)); }
             }
@@ -604,9 +1081,15 @@ class BridgeSession {
                 }
                 cleanup(st);
             } catch (Exception e) {
+                String errBody = "{\"ok\":false,\"error\":"
+                        + JdiBridge.quote(JdiBridge.shortMsg(e));
+                if (e instanceof BridgeException
+                        && ((BridgeException) e).waitContextJson != null) {
+                    errBody += ",\"waitContext\":" + ((BridgeException) e).waitContextJson;
+                }
+                errBody += "}";
                 try {
-                    BridgeProto.writeFrame(sock.getOutputStream(),
-                            "{\"ok\":false,\"error\":" + JdiBridge.quote(JdiBridge.shortMsg(e)) + "}");
+                    BridgeProto.writeFrame(sock.getOutputStream(), errBody);
                 } catch (Exception ignored) {}
             }
         } catch (Exception ignored) {
@@ -634,7 +1117,12 @@ class BridgeSession {
                 try { st.vm.dispose(); } catch (Exception ignored) {}
             }
         } finally {
-            st.vm = null;
+            // Null under the lock: every other st.vm read takes it, so a
+            // torn-down transport is observed atomically (a racing pump sees
+            // either the live VM or null, never a half-closed one).
+            synchronized (st.sessionLock) {
+                st.vm = null;
+            }
         }
     }
 
@@ -733,7 +1221,13 @@ class BridgeSession {
                 synchronized (st.sessionLock) {
                 if (st.exited) throw new BridgeException("target VM has exited — close this session");
                 if (st.outstanding != null) {
-                    return "{\"ok\":true,\"running\":true,\"threads\":[]}";
+                    // The pump owns the event queue: no fresh JDI dump.
+                    // Serve the last-known roster (null until the first full
+                    // dump) with an honest running:true — prompt, never
+                    // stale-shaped, never blocking delivery.
+                    String cached = st.cachedThreads;
+                    return "{\"ok\":true,\"running\":true,\"threads\":"
+                            + (cached == null ? "[]" : cached) + "}";
                 }
                 boolean wasSuspended = st.suspended;
                 if (!wasSuspended) {
@@ -753,6 +1247,7 @@ class BridgeSession {
                         try { st.vm.resume(); } catch (Exception ignored) {}
                     }
                 }
+                st.cachedThreads = dump;
                 return "{\"ok\":true,\"running\":" + (!wasSuspended) + ",\"threads\":" + dump + "}";
                 }
             }
@@ -855,6 +1350,9 @@ class BridgeSession {
                 // (it just waits for the next stop).
                 requireStopped(st);
                 String mode = req.getOrDefault("mode", "over");
+                if (!mode.equals("over") && !mode.equals("into") && !mode.equals("out")) {
+                    throw new BridgeException("unknown step mode: " + mode + " (want over|into|out)");
+                }
                 try {
                     sr = st.vm.eventRequestManager().createStepRequest(
                             st.thread,
@@ -902,7 +1400,7 @@ class BridgeSession {
                         return waitJson(st, snap, false);
                     }
                 }
-                String snap = awaitStop(st, timeout);
+                String snap = awaitStop(st, timeout, null, true);
                 synchronized (st.sessionLock) {
                     return waitJson(st, snap, true);
                 }
@@ -987,7 +1485,7 @@ class BridgeSession {
                 }
                 String snap;
                 try {
-                    snap = awaitStop(st, timeout);
+                    snap = awaitStop(st, timeout, specOut[0], true);
                 } catch (Exception e) {
                     // Timeout/exit: nothing parked by us — no resume — but
                     // the ephemeral must not leak.
@@ -995,9 +1493,11 @@ class BridgeSession {
                         try {
                             unplantCaptureBreak(st);
                         } catch (Exception ue) {
+                            String ctx = (e instanceof BridgeException)
+                                    ? ((BridgeException) e).waitContextJson : null;
                             throw new BridgeException(e.getMessage()
                                     + "; capture ephemeral may still be planted"
-                                    + " (breaks remove to clear)");
+                                    + " (breaks remove to clear)", ctx);
                         }
                     }
                     throw e;
@@ -1236,6 +1736,15 @@ class BridgeSession {
      *  or inheritance. Caller holds sessionLock. */
     static boolean plantCaptureBreak(SessionState st, AddedLine p) throws Exception {
         if (p == null) return false;
+        if (st.captureCls != null) {
+            // A capture ephemeral is already pending (dispatch serializes
+            // captures, so this is purely defensive): same spec is
+            // idempotent, anything else conflicts.
+            if (st.captureCls.equals(p.cls) && st.captureLine == p.line
+                    && condEqual(st.captureCond, p.cond)) return false;
+            throw new BridgeException("capture already pending for "
+                    + st.captureCls + ":" + st.captureLine);
+        }
         String loc = p.cls + ":" + p.line;
         List<Integer> have = st.cfg.breakpoints.get(p.cls);
         String haveCond = st.cfg.condByLoc.get(loc);
@@ -1272,7 +1781,14 @@ class BridgeSession {
                 plantCaptureForClass(st, rt);
             }
         } else {
-            watchClass(st.vm, p.cls); // deferred: ClassPrepare plants it
+            // Deferred: our OWN tagged ClassPrepareRequest (never the shared
+            // watchClass one), so the timeout path deletes exactly the
+            // ephemeral's request and nothing armed leaks.
+            ClassPrepareRequest req = st.vm.eventRequestManager().createClassPrepareRequest();
+            req.addClassFilter(p.cls);
+            req.setSuspendPolicy(EventRequest.SUSPEND_ALL);
+            req.putProperty(CAPTURE_TAG, p.cls + ":" + p.line);
+            req.enable();
         }
         return true;
     }
@@ -1301,8 +1817,10 @@ class BridgeSession {
 
     /** Remove a capture ephemeral BEFORE resume. Always clears the fields
      *  (orphaned JDI requests are benign: later pumps skip and resume them,
-     *  close drops them). Throws on backend failure — the caller still
-     *  resumes, then reports removeError. Caller holds sessionLock. */
+     *  close drops them). Deletes the tagged breakpoint AND ClassPrepare
+     *  requests, so a timed-out deferred capture leaks nothing. Throws on
+     *  backend failure — the caller still resumes, then reports removeError.
+     *  Caller holds sessionLock. */
     static void unplantCaptureBreak(SessionState st) throws Exception {
         try {
             List<BreakpointRequest> doomed = new ArrayList<>();
@@ -1312,6 +1830,15 @@ class BridgeSession {
                 if (tag != null) doomed.add(req);
             }
             for (BreakpointRequest req : doomed) {
+                st.vm.eventRequestManager().deleteEventRequest(req);
+            }
+            List<ClassPrepareRequest> doomedCp = new ArrayList<>();
+            for (ClassPrepareRequest req : st.vm.eventRequestManager().classPrepareRequests()) {
+                Object tag = null;
+                try { tag = req.getProperty(CAPTURE_TAG); } catch (Exception ignored) {}
+                if (tag != null) doomedCp.add(req);
+            }
+            for (ClassPrepareRequest req : doomedCp) {
                 st.vm.eventRequestManager().deleteEventRequest(req);
             }
         } finally {
@@ -1343,6 +1870,7 @@ class BridgeSession {
         String name = "?";
         try { name = st.dir.getFileName().toString(); } catch (Exception ignored) {}
         String observed = st.cfg.observedTargetJson == null ? "null" : st.cfg.observedTargetJson;
+        String identity = st.cfg.targetIdentityJson == null ? "null" : st.cfg.targetIdentityJson;
         BridgeProto.writeFile(st.dir.resolve("session.json"),
                 "{\"name\":" + JdiBridge.quote(name)
                 + ",\"kind\":" + JdiBridge.quote(st.cfg.sessionKind)
@@ -1350,7 +1878,8 @@ class BridgeSession {
                 + ",\"stopped\":" + stopped
                 + ",\"lastStop\":" + (st.lastStopJson == null ? "null" : st.lastStopJson)
                 + ",\"updatedAt\":" + now
-                + ",\"observedTarget\":" + observed + "}");
+                + ",\"observedTarget\":" + observed
+                + ",\"targetIdentity\":" + identity + "}");
     }
 
     /** Trimmed stop locator (no snippet — file reads stay in snapshots). */

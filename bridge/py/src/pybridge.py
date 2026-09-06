@@ -53,8 +53,13 @@ class BridgeErr(Exception):
 
 class StopTimeout(BridgeErr):
     """First-stop wait timed out. Typed so attach can fall back to a live
-    running session while launch still fails — never match by message."""
-    pass
+    running session while launch still fails — never match by message.
+    Wait/capture timeouts may carry an additive `wait_context` dict
+    (triggerStatus unknown, never a fabricated verdict); the message keeps
+    the exact frozen `timeout: no stop within Ns` prefix."""
+    def __init__(self, message="", wait_context=None):
+        super().__init__(message)
+        self.wait_context = wait_context
 
 
 # ---------------------------------------------------------------- framing
@@ -489,6 +494,20 @@ def parse_args(argv):
     pending_stops = []  # (kind, spec) in flag order
     i = 1
     dashdash = False
+
+    def _need(flag):
+        """Next argv value or a Usage (never IndexError->traceback/internal).
+
+        Every value flag shares this path so a missing value is always a
+        clean `session needs a value for --flag` Usage, matching --port /
+        --timeout. `--` program args never reach here (dashdash branch)."""
+        nonlocal i
+        i += 1
+        try:
+            return argv[i]
+        except IndexError:
+            raise Usage(f"session needs a value for {flag}")
+
     while i < len(argv):
         a = argv[i]
         if dashdash:
@@ -498,56 +517,52 @@ def parse_args(argv):
         if a == "--":
             dashdash = True
         elif a == "--kind":
-            i += 1
-            cfg.kind = argv[i]
+            cfg.kind = _need(a)
         elif a == "--dir":
-            i += 1
-            cfg.dir = argv[i]
+            cfg.dir = _need(a)
         elif a == "--program":
-            i += 1
-            cfg.program = os.path.abspath(argv[i])
+            cfg.program = os.path.abspath(_need(a))
         elif a == "--module":
-            i += 1
-            cfg.module = argv[i]
+            cfg.module = _need(a)
         elif a == "--python":
-            i += 1
-            cfg.python = argv[i]
+            cfg.python = _need(a)
         elif a == "--host":
-            i += 1
-            cfg.host = argv[i]
+            cfg.host = _need(a)
         elif a == "--port":
-            i += 1
-            cfg.port = int(argv[i])
+            raw_port = _need(a)
+            try:
+                cfg.port = int(raw_port)
+            except ValueError:
+                raise Usage(f"bad --port {raw_port!r} (want an integer)")
         elif a == "--src":
-            i += 1
-            cfg.src_dirs.append(os.path.abspath(argv[i]))
+            cfg.src_dirs.append(os.path.abspath(_need(a)))
         elif a == "--break":
-            i += 1
-            pending_stops.append(("break", argv[i]))
+            pending_stops.append(("break", _need(a)))
         elif a == "--logpoint":
-            i += 1
-            pending_stops.append(("logpoint", argv[i]))
+            pending_stops.append(("logpoint", _need(a)))
         elif a == "--watch":
             raise Usage("--watch has no debugpy equivalent yet (Python)")
         elif a == "--exit":
             raise Usage("--exit has no debugpy equivalent yet (Python)")
         elif a == "--timeout":
-            i += 1
-            cfg.timeout = float(argv[i])
+            raw_timeout = _need(a)
+            try:
+                cfg.timeout = float(raw_timeout)
+            except ValueError:
+                raise Usage(f"bad --timeout {raw_timeout!r} "
+                            f"(want seconds between 0 and 3600)")
             if not math.isfinite(cfg.timeout) or not 0 < cfg.timeout <= 3600:
                 raise Usage("timeout must be between 0 and 3600 seconds")
         elif a == "--subprocess":
             cfg.subprocess = True
         elif a == "--observed-target":
-            i += 1
             try:
-                parsed = json.loads(argv[i])
+                parsed = json.loads(_need(a))
                 cfg.observed_target = parsed if isinstance(parsed, dict) else None
             except ValueError:
                 cfg.observed_target = None
         elif a == "--observed-hint":
-            i += 1
-            cfg.observed_hint = argv[i]
+            cfg.observed_hint = _need(a)
         else:
             raise Usage(f"unknown arg: {a}")
         i += 1
@@ -587,6 +602,152 @@ def trunc_str(s, limit=MAX_STRING):
     return f"{s[:limit]}… (+{len(s) - limit} more chars)"
 
 
+# ---------------------------------------------------------------- layered target identity (M-ID)
+# Additive `{debuggee, endpoint, adapter}` roles beside the untouched
+# `observedTarget`. Confidence is strict: protocol-confirmed only from the
+# DAP `process` event; os-corroborated only for the OS-observed listener
+# owner; everything else is unavailable (never guessed, no parent-tree
+# inference). Every new string is redacted + capped before persistence or
+# output; env is never collected.
+IDENT_FIELD_CAP = 512   # per-field chars (matches the CLI observedTarget cap)
+IDENT_ROLE_CAP = 2048   # per-role serialized chars
+IDENT_TOTAL_CAP = 4096  # aggregate chars over the three roles
+IDENT_ARRAY_CAP = 32    # elements per array (head kept, dropped tail marked)
+
+_SECRET_SUBSTR = ("password", "passwd", "secret", "apikey",
+                  "authorization", "authtoken", "accesstoken")
+_SECRET_TOKEN = ("token", "auth", "pwd", "pass", "pw")
+
+WAIT_NOTE = ("external trigger execution is not observed by the debugger; "
+             "this timeout means no stop was observed, "
+             "not that the code is unreachable")
+
+
+def _is_secret_flag(flag):
+    # Mirrors the CLI redactor: substring keys on the flattened name, short
+    # keys only on token boundaries (suffix match — a mere prefix like
+    # --author or --passage never matches).
+    t = flag.lstrip("-").lower()
+    flat = "".join(c for c in t if c not in "-_")
+    if any(k in flat for k in _SECRET_SUBSTR):
+        return True
+    toks = t.replace("_", "-").replace(".", "-").split("-")
+    return any(tok == k or tok.endswith(k) for tok in toks for k in _SECRET_TOKEN)
+
+
+def redact_identity_argv(argv):
+    """Redact secret values from an argv (mirrors the CLI redactor):
+    `--token <v>` drops the value, `--password=<v>`/`key:<v>` mask it."""
+    out = []
+    skip_next = False
+    for a in argv or []:
+        if not isinstance(a, str):
+            continue
+        if skip_next:
+            skip_next = False
+            if not (a.startswith("-") and len(a) > 1):
+                out.append("[redacted]")
+                continue
+        split = -1
+        for sep in ("=", ":"):
+            i = a.find(sep)
+            if i > 0 and (split < 0 or i < split):
+                split = i
+        if split > 0:
+            head = a[:split]
+            if _is_secret_flag(head):
+                out.append(f"{head}{a[split]}[redacted]")
+            else:
+                out.append(a)
+        else:
+            out.append(a)
+            if _is_secret_flag(a):
+                skip_next = True
+    return out
+
+
+def _cap_str(s, limit=IDENT_FIELD_CAP):
+    if not isinstance(s, str):
+        return s
+    if len(s) <= limit:
+        return s
+    return f"{s[:limit]}… (+{len(s) - limit} more chars)"
+
+
+def _cap_walk(v):
+    if isinstance(v, str):
+        return _cap_str(v)
+    if isinstance(v, list):
+        if len(v) > IDENT_ARRAY_CAP:
+            dropped = len(v) - IDENT_ARRAY_CAP
+            v = v[:IDENT_ARRAY_CAP] + [f"… (+{dropped} more)"]
+        return [_cap_walk(e) for e in v]
+    if isinstance(v, dict):
+        return {k: _cap_walk(e) for k, e in v.items()}
+    return v
+
+
+def _shrink_to_total(obj, total_cap):
+    """Shrink the longest string until the object fits total_cap. Each pass
+    either truncates the longest string (marker is shorter) or collapses it
+    to a 1-char marker (strictly smaller than any picked string, which has
+    length > 1), so the loop always terminates."""
+
+    def longest_loc(v, path):
+        """(path, length) of the longest shrinkable string under v."""
+        best = (None, 1)
+        if isinstance(v, str) and len(v) > 1:
+            best = (path, len(v))
+        elif isinstance(v, list):
+            for i, e in enumerate(v):
+                cand = longest_loc(e, path + [i])
+                if cand[1] > best[1]:
+                    best = cand
+        elif isinstance(v, dict):
+            for k, e in v.items():
+                cand = longest_loc(e, path + [k])
+                if cand[1] > best[1]:
+                    best = cand
+        return best
+
+    def get_at(root, path):
+        for p in path:
+            root = root[p]
+        return root
+
+    def set_at(root, path, val):
+        for p in path[:-1]:
+            root = root[p]
+        root[path[-1]] = val
+
+    passes = 0
+    while len(json.dumps(obj)) > total_cap and passes < 4096:
+        passes += 1
+        path, n = longest_loc(obj, [])
+        if path is None:
+            break
+        cur = get_at(obj, path)
+        cand = _cap_str(cur, max(1, n - 64))
+        set_at(obj, path, cand if len(cand) < n else "…")
+    return obj
+
+
+def _cap_role(role):
+    return _shrink_to_total(_cap_walk(role), IDENT_ROLE_CAP)
+
+
+def _cap_identity(ident):
+    capped = {k: (_cap_role(v) if isinstance(v, dict) else v)
+              for k, v in ident.items()}
+    return _shrink_to_total(capped, IDENT_TOTAL_CAP)
+
+
+def _is_process_event(msg):
+    return (isinstance(msg, dict) and msg.get("type") == "event"
+            and msg.get("event") == "process"
+            and isinstance(msg.get("body"), dict))
+
+
 # Multi-target bounds (frozen M-T contract): at most 8 live non-main
 # targets; 16 entries of exited history (evictions count droppedExited).
 MAX_ACTIVE_NONMAIN = 8
@@ -601,6 +762,11 @@ MAX_IGNORED_RETAINED = 16
 # BEFORE any socket opens, so socket ownership stays bounded truthfully
 # (in-flight ≤1 sequential + tracked ≤8 + retired ≤16).
 MAX_RETIRED_SOCKETS = 16
+# Deferred child admission: debugpyAttach events stage here (bounded) while
+# the single in-flight handshake runs outside Session._gate, so M5 live
+# reads stay prompt. Overflow marks the child ignored pre-connect (no
+# socket, no budget), exactly like the retired-full path.
+MAX_PENDING_ATTACH = 16
 
 # M5 concurrency (frozen): serve accepts connections concurrently on a small
 # fixed pool of handler threads (one response per connection); a second
@@ -706,6 +872,12 @@ class Session:
         self._serving = "main"   # target id of the in-flight command
         self._pending_target = None  # resume-wait owner for error attribution
         self._retired_sockets = []  # (tid, sock) failed handshakes, kept OPEN
+        # -- deferred child admission: staged debugpyAttach events (bounded)
+        # plus the single in-flight handshake flag. The drainer is whichever
+        # pump staged/claimed (no new threads); the handshake runs with the
+        # gate released so live reads stay prompt.
+        self._attach_pending = []
+        self._attach_busy = False
         # -- M5 concurrency: _gate serializes swapped-field sections and
         # event-dispatch mutations (never held across select/pump waits, so
         # live snapshot reads stay prompt). Per-connection DAP IO serializes
@@ -723,6 +895,13 @@ class Session:
         self._stop_reason = None   # reason of the current park
         self._parked_at_ms = 0     # wall clock ms of the current park
         self._last_diag = None     # {target,stopId,sameLocation,sameThread,elapsedMs}
+        # -- layered target identity (M-ID): DAP `process` event (debuggee,
+        # protocol-confirmed) + OS-observed listener owner (endpoint/adapter,
+        # os-corroborated). Built at handshake, refreshed if the event lands
+        # late; published redacted + capped in session.json.
+        self._process_event = None   # {"pid","name","startMethod","isLocal"} or None
+        self._target_identity = None  # {"debuggee","endpoint","adapter"} or None
+        self._identity_hint = ""     # debuggee-first one-liner for timeouts
 
     # -- multi-target helpers
 
@@ -828,7 +1007,7 @@ class Session:
         """One roster entry {id,kind,pid,state,lastStop,observed,scope}."""
         if tid == "main":
             return {"id": "main", "kind": "main", "pid": None,
-                    "state": "exited" if self.exited
+                    "state": "exited" if self.main_exited
                     else ("stopped" if self.suspended else "running"),
                     "lastStop": self.last_stop,
                     "observed": self.cfg.observed_target,
@@ -850,7 +1029,10 @@ class Session:
                     "selected": self._resolve_target_inner({}),
                     "ignored": self.ignored,
                     "helpersReleased": self.helpers_released,
-                    "droppedExited": self.dropped_exited}
+                    "droppedExited": self.dropped_exited,
+                    "targetIdentity": (self._target_identity
+                                       if isinstance(self._target_identity, dict)
+                                       else None)}
             return self.stamp(resp, "main")
 
     def _note_exit(self, tid, last_stop=None):
@@ -863,6 +1045,10 @@ class Session:
         t = self.targets.pop(tid, None)
         if t is None:
             return
+        try:
+            self.target_order.remove(tid)
+        except ValueError:
+            pass
         try:
             if t.sock is not None:
                 t.sock.close()
@@ -1141,11 +1327,12 @@ class Session:
                 rec["hits"] += 1
 
     def timeout_text(self, timeout):
-        """Timeout message with the compact observed-identity hint (names
-        the target, never claims root cause)."""
+        """Timeout message with the compact identity hint (debuggee-first,
+        names the target, never claims root cause)."""
         msg = f"timeout: no stop within {timeout:g}s"
-        if self.cfg.observed_hint:
-            msg += f"; {self.cfg.observed_hint}"
+        hint = self._identity_hint or self.cfg.observed_hint
+        if hint:
+            msg += f"; {hint}"
         return msg
 
     def unresolved_summary(self):
@@ -1178,9 +1365,11 @@ class Session:
         """Rewrite session.json so `status` shows live truth (parked stop +
         time) with zero prior memory. lastStop survives resume/exit — it
         answers 'where was I last', not 'where am I now'. The redacted
-        observedTarget rides along verbatim (CLI-computed, atomic write).
-        Child target parks/resumes never rewrite the main-focused file: the
-        per-target last stop lives in the roster served by `targets`."""
+        observedTarget rides along verbatim (CLI-computed, atomic write),
+        plus the layered targetIdentity (debuggee/endpoint/adapter, null
+        until the handshake builds it). Child target parks/resumes never
+        rewrite the main-focused file: the per-target last stop lives in
+        the roster served by `targets`."""
         eff = target if target is not None else self._serving
         if eff != "main":
             if stopped and self.frames:
@@ -1206,7 +1395,274 @@ class Session:
             {"name": os.path.basename(self.cfg.dir), "kind": self.cfg.kind,
              "port": self.session_port, "stopped": stopped,
              "lastStop": self.last_stop, "updatedAt": int(time.time()),
-             "observedTarget": self.cfg.observed_target}))
+             "observedTarget": self.cfg.observed_target,
+             "targetIdentity": self._target_identity}))
+
+    # -- layered target identity (M-ID)
+
+    def _note_process_event(self, body):
+        """Adopt one DAP `process` event as the debuggee identity (first
+        wins — the attach-time event names this session's debuggee). Never
+        raises; a nameless/pid-less event is ignored (stays unavailable).
+        Late arrivals rebuild + republish the identity (bounded enrichment,
+        never an attach failure)."""
+        try:
+            if self._process_event is not None or not isinstance(body, dict):
+                return
+            pid = body.get("systemProcessId")
+            name = body.get("name")
+            if not isinstance(pid, int) and not isinstance(name, str):
+                return
+            self._process_event = {
+                "pid": pid if isinstance(pid, int) else None,
+                "name": name if isinstance(name, str) else None,
+                "startMethod": body.get("startMethod") if isinstance(
+                    body.get("startMethod"), str) else None,
+                "isLocal": body.get("isLocalProcess"),
+            }
+            self._build_target_identity()
+            self._store_target_identity()
+        except Exception:
+            pass
+
+    def _consume_process_event(self, timeout=2.0):
+        """Adopt the DAP `process` event around the handshake without losing
+        anything: stash scan first, then a bounded read that re-stashes every
+        non-process message for the pump. Never raises and never delays the
+        first stop beyond the small bound; absence reads as unavailable."""
+        try:
+            for i, m in enumerate(list(self.dap.stash)):
+                if _is_process_event(m):
+                    del self.dap.stash[i]
+                    self._note_process_event(m.get("body", {}))
+                    return True
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                self.dap.sock.settimeout(max(0.05, deadline - time.time()))
+                try:
+                    msg = self.dap._read_msg()
+                except (socket.timeout, TimeoutError, BridgeErr):
+                    return self._process_event is not None
+                if _is_process_event(msg):
+                    self._note_process_event(msg.get("body", {}))
+                    return True
+                self.dap.stash.append(msg)
+            return self._process_event is not None
+        except Exception:
+            return self._process_event is not None
+
+    def _debuggee_os_details(self, pid):
+        """Best-effort OS argv/cwd/exe for a protocol-confirmed debuggee pid.
+        The read itself is the liveness check (dead/reused-away pids fail
+        here); failures return None. Redacted + capped; nested under
+        os-corroborated source — the pid confidence is never upgraded."""
+        if not isinstance(pid, int) or pid <= 0:
+            return None
+        argv, cwd, exe = None, None, None
+        os_source = None
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                parts = [b.decode("utf-8", "replace")
+                         for b in f.read().split(b"\0") if b]
+            argv = parts or None
+            try:
+                cwd = os.readlink(f"/proc/{pid}/cwd")
+            except OSError:
+                cwd = None
+            try:
+                exe = os.readlink(f"/proc/{pid}/exe")
+            except OSError:
+                exe = None
+            os_source = "os-proc"
+        except OSError:
+            pass
+        if argv is None:
+            try:
+                out = subprocess.run(
+                    ["ps", "-p", str(pid), "-o", "args="],
+                    capture_output=True, text=True, timeout=5).stdout.strip()
+                if out:
+                    argv = out.split()
+                    os_source = "os-ps"
+            except Exception:
+                argv = None
+        if argv is None and cwd is None and exe is None:
+            return None
+        details = {"source": os_source or "os-proc",
+                   "confidence": "os-corroborated",
+                   "observedAt": int(time.time())}
+        if argv is not None:
+            details["argv"] = redact_identity_argv(argv)
+        else:
+            details["unavailable"] = [{"field": "argv",
+                                       "reason": "unreadable process command line"}]
+        if cwd is not None:
+            details["cwd"] = cwd
+        if exe is not None:
+            details["executable"] = exe
+        return details
+
+    def _role_unavailable(self, reason):
+        return {"confidence": "unavailable", "reason": reason,
+                "observedAt": int(time.time()), "unavailable": []}
+
+    def _build_target_identity(self):
+        """Build the layered {debuggee, endpoint, adapter} identity from the
+        DAP process event (protocol-confirmed debuggee) plus the CLI-supplied
+        OS listener observation (os-corroborated endpoint/adapter). The
+        `observedTarget` compatibility view is untouched. Everything is
+        redacted + capped here, before any publish."""
+        now = int(time.time())
+        obs = (self.cfg.observed_target
+               if isinstance(self.cfg.observed_target, dict) else {})
+        pid = obs.get("pid") if isinstance(obs.get("pid"), int) else None
+        source = obs.get("source") if isinstance(obs.get("source"), str) else None
+        # Re-redact here (idempotent over the CLI's copy): the bridge never
+        # publishes a value it did not redact itself — a raw argv must never
+        # leak via the endpoint role (e.g. --server-access-token).
+        raw_argv = obs.get("argv") if isinstance(obs.get("argv"), list) else None
+        obs_argv = redact_identity_argv(raw_argv) if raw_argv is not None else None
+        # -- debuggee: only the DAP process event confirms it.
+        pe = self._process_event
+        if pe is not None and (pe.get("pid") is not None or pe.get("name") is not None):
+            debuggee = {"kind": "process", "pid": pe.get("pid"),
+                        "name": pe.get("name"),
+                        "startMethod": pe.get("startMethod"),
+                        "source": "dap-process-event",
+                        "confidence": "protocol-confirmed",
+                        "observedAt": now, "unavailable": []}
+            if pe.get("pid") is None:
+                debuggee["unavailable"] = [
+                    {"field": "pid", "reason": "process event carries no systemProcessId"}]
+            details = self._debuggee_os_details(pe.get("pid"))
+            if details is not None:
+                debuggee["osDetails"] = details
+            else:
+                debuggee["unavailable"].append(
+                    {"field": "osDetails",
+                     "reason": "debuggee pid not readable from this host"})
+        else:
+            debuggee = {"kind": "process", "pid": None, "name": None,
+                        "startMethod": None, "source": None,
+                        "confidence": "unavailable",
+                        "observedAt": now,
+                        "unavailable": [
+                            {"field": "pid",
+                             "reason": "no DAP process event observed yet"}]}
+        # -- endpoint: the OS-observed listener owner (an adapter in attach,
+        # the bridge-spawned adapter endpoint in launch) — never the debuggee.
+        if self.cfg.kind == "launch":
+            aport = getattr(self, "adapter_port", 0) or None
+            apid = None
+            try:
+                apid = self.adapter.pid if self.adapter is not None else None
+            except Exception:
+                apid = None
+            if not isinstance(apid, int):
+                apid = None
+            endpoint = {"host": "127.0.0.1", "port": aport,
+                        "ownerPid": apid,
+                        "role": "listener-owner (not necessarily the debuggee)",
+                        "source": "bridge-spawn",
+                        "confidence": "os-corroborated" if apid is not None
+                                      else "unavailable",
+                        "observedAt": now,
+                        "unavailable": ([] if apid is not None else [
+                            {"field": "ownerPid",
+                             "reason": "adapter pid not reported"}])}
+        else:
+            endpoint = {"host": self.cfg.host, "port": self.cfg.port,
+                        "ownerPid": pid,
+                        "executable": obs.get("executable"),
+                        "argv": obs_argv,
+                        "cwd": obs.get("cwd"),
+                        "role": "listener-owner (not necessarily the debuggee)",
+                        "source": source,
+                        "confidence": "os-corroborated" if pid is not None
+                                      else "unavailable",
+                        "observedAt": now,
+                        "unavailable": ([] if pid is not None else [
+                            {"field": "ownerPid",
+                             "reason": "no independent pid source"}])}
+        # -- adapter: the debugpy adapter process, recognized from the
+        # redacted listener argv (attach) or our own spawn (launch).
+        if self.cfg.kind == "launch":
+            try:
+                apid = self.adapter.pid if self.adapter is not None else None
+            except Exception:
+                apid = None
+            if isinstance(apid, int):
+                adapter = {"name": "debugpy-adapter", "pid": apid,
+                           "source": "bridge-spawn",
+                           "confidence": "os-corroborated",
+                           "observedAt": now, "unavailable": []}
+            else:
+                adapter = self._role_unavailable("adapter pid not reported")
+                adapter["name"] = "debugpy-adapter"
+        else:
+            recognized = any(isinstance(a, str) and "debugpy" in a
+                             for a in (obs_argv or []))
+            if recognized:
+                adapter = {"name": "debugpy-adapter", "pid": pid,
+                           "source": source,
+                           "confidence": "os-corroborated" if pid is not None
+                                         else "unavailable",
+                           "observedAt": now,
+                           "unavailable": ([] if pid is not None else [
+                               {"field": "pid",
+                                "reason": "no independent pid source"}])}
+            else:
+                adapter = self._role_unavailable(
+                    "adapter not recognized from listener argv")
+        ident = _cap_identity({"debuggee": debuggee, "endpoint": endpoint,
+                               "adapter": adapter})
+        self._target_identity = ident
+        # Debuggee-first one-liner for timeout diagnostics (concise, no
+        # root-cause claim); falls back to the CLI hint when unknown.
+        hint = ""
+        if isinstance(debuggee, dict) and debuggee.get("confidence") == "protocol-confirmed":
+            nm = debuggee.get("name") or "?"
+            if debuggee.get("pid") is not None:
+                hint = f"debuggee: {nm} (pid {debuggee['pid']}, protocol-confirmed)"
+            else:
+                hint = f"debuggee: {nm} (protocol-confirmed)"
+        if not hint:
+            hint = self.cfg.observed_hint or ""
+        self._identity_hint = hint[:200]
+        return ident
+
+    def _store_target_identity(self):
+        """Republish session.json with the current layered identity (late
+        process-event enrichment), preserving every other field. Atomic,
+        best-effort: a missing/unparseable file simply skips."""
+        try:
+            path = os.path.join(self.cfg.dir, "session.json")
+            try:
+                with open(path) as f:
+                    cur = json.load(f)
+            except (OSError, ValueError):
+                return
+            if not isinstance(cur, dict):
+                return
+            cur["targetIdentity"] = self._target_identity
+            write_file(path, json.dumps(cur))
+        except Exception:
+            pass
+
+    def _wait_context(self, timeout, started_at, expected_break=None):
+        """Honest timeout context: the debugger never observes the external
+        trigger, so triggerStatus is always unknown; success paths never
+        fabricate sent/failed. expectedBreak rides only when the capture
+        planted one."""
+        ctx = {"waitStartedAt": int(started_at),
+               "waitedMs": max(0, int((time.time() - started_at) * 1000)),
+               "triggerStatus": "unknown"}
+        if expected_break is not None:
+            ctx["expectedBreak"] = expected_break
+        ctx["targetIdentity"] = (self._target_identity
+                                 if isinstance(self._target_identity, dict) else None)
+        ctx["note"] = WAIT_NOTE
+        return ctx
 
     # -- lifecycle
 
@@ -1265,6 +1721,11 @@ class Session:
         # launch response arrives after configurationDone; drain it lazily
         # (wait_response inside next request would mismatch — consume now).
         self._drain_launch_response()
+        # Adopt the DAP process event when the adapter reports one (bounded,
+        # nonfatal — absence never fails the launch), then build the layered
+        # identity before the first user-visible completion.
+        self._consume_process_event()
+        self._build_target_identity()
         self.configured = True
         _ = prog_args
 
@@ -1310,6 +1771,12 @@ class Session:
         self.arm_breakpoints()
         self.dap_request("configurationDone", {})
         self._drain_response("attach")
+        # The process event lands right after the attach response: adopt it
+        # (bounded, nonfatal) so the debuggee role is protocol-confirmed
+        # before the first user-visible attach completion. A delayed event
+        # still enriches later via the pump path; absence stays unavailable.
+        self._consume_process_event()
+        self._build_target_identity()
         self.configured = True
 
     # -- child targets (M3: debugpyAttach + one DAP session per child)
@@ -1379,7 +1846,18 @@ class Session:
         breaks) plus an established-session close, so they are configured
         (a never-configured server suspends forever) with zero breakpoints
         and can never park. Failed handshakes retire OPEN in bounded
-        ownership, closed only at overall cleanup."""
+        ownership, closed only at overall cleanup.
+        The gate is held only for staging/claim/commit; the blocking
+        private child handshake runs outside it (see _drain_attach_chain),
+        so M5 live reads stay prompt through a ~70s handshake."""
+        with self._gate:
+            self._stage_attach(body)
+        self._drain_attach_chain()
+
+    def _stage_attach(self, body):
+        """Fast admission under _gate: dedup + bounded enqueue, never IO.
+        Queue overflow marks the child ignored BEFORE any socket opens
+        (same bounded-ownership law as the retired-full path)."""
         if not self.cfg.subprocess or self.cfg.kind != "launch":
             return
         if not isinstance(body, dict):
@@ -1391,31 +1869,144 @@ class Session:
         if tid in self._seen_ids:
             return  # ids are never reused within a session
         self._seen_ids.add(tid)
-        if self._is_resource_tracker(pid):
-            # Short-lived daemon, no user code: skip (no socket, no
-            # budget). Its server connects before any session matches, so
-            # it is never suspended pending configuration — it runs free
-            # and exits on its own (every mp run verifies this).
-            self.helpers_released += 1
-            sys.stderr.write(
-                f"warn: released spawn helper for {tid} (no budget used)\n")
+        if len(self._attach_pending) >= MAX_PENDING_ATTACH:
+            self._mark_ignored(tid, pid, "attach queue full")
             return
-        if len(self.active_nonmain()) >= MAX_ACTIVE_NONMAIN:
-            # Over budget: minimal handshake (initialize → verbatim attach
-            # → NO breaks → configurationDone → drained), then raw close of
-            # the ESTABLISHED session (adapter-contained) and release. The
-            # child is configured with zero breakpoints so it can never
-            # park — skipping the handshake instead would hang it (its
-            # server suspends until configured). Counted, never parked.
-            self._release_minimal(tid, pid, body)
-            return
-        if len(self._retired_sockets) >= MAX_RETIRED_SOCKETS:
-            # Retired (failed-handshake) ownership is full and nothing may
-            # be closed mid-session: mark ignored BEFORE opening. Only
-            # reachable after 16 consecutive handshake failures (adapter
-            # failure mode); documented residual hang risk there.
-            self._mark_ignored(tid, pid, "retired ownership full")
-            return
+        self._attach_pending.append((tid, pid, dict(body)))
+
+    def _drain_attach_chain(self):
+        """Run staged handshakes with the gate RELEASED (single in-flight
+        drainer: whichever pump staged/claimed — no new threads, no queues
+        beyond the bounded staging list). Each claim/commit is a short gate
+        section; the blocking private handshake between them is not. One
+        reader per private DapConn holds: the drainer owns it until commit,
+        since uncommitted sessions are invisible to _live_conns."""
+        with self._gate:
+            if self._attach_busy or not self._attach_pending:
+                return
+            self._attach_busy = True
+        try:
+            while True:
+                with self._gate:
+                    if not self._attach_pending:
+                        return
+                    tid, pid, body = self._attach_pending.pop(0)
+                    if len(self._retired_sockets) >= MAX_RETIRED_SOCKETS:
+                        # Retired (failed-handshake) ownership is full and
+                        # nothing may be closed mid-session: mark ignored
+                        # BEFORE opening. Only reachable after 16
+                        # consecutive handshake failures (adapter failure
+                        # mode); documented residual hang risk there.
+                        self._mark_ignored(tid, pid, "retired ownership full")
+                        continue
+                    over = len(self.active_nonmain()) >= MAX_ACTIVE_NONMAIN
+                    # Phase snapshot under lock: the arm below runs outside
+                    # the gate against the private connection only, so it
+                    # must not touch shared config/state afterwards.
+                    snap = (list(self.cfg.breaks), list(self.cfg.logpoints),
+                            list(self.cfg.methods), self.cfg.want_exc,
+                            set(self.cfg.break_raws))
+                self._run_attach("minimal" if over else "full",
+                                 tid, pid, body, snap)
+        finally:
+            with self._gate:
+                self._attach_busy = False
+
+    def _run_attach(self, kind, tid, pid, body, snap):
+        """One child handshake outside _gate. Never raises (a backstop warn
+        guards the pump); expected failures retire bounded history inside
+        the kind-specific runners below."""
+        try:
+            if self._is_resource_tracker(pid):
+                # Short-lived daemon, no user code: skip (no socket, no
+                # budget). Its server connects before any session matches,
+                # so it is never suspended pending configuration — it runs
+                # free and exits on its own (every mp run verifies this).
+                with self._gate:
+                    self.helpers_released += 1
+                sys.stderr.write(
+                    f"warn: released spawn helper for {tid} (no budget used)\n")
+                return
+            if kind == "minimal":
+                self._run_minimal_attach(tid, pid, body)
+            else:
+                self._run_full_attach(tid, pid, body, snap)
+        except Exception as e:
+            sys.stderr.write(f"warn: child {tid} admission failed: {e}\n")
+
+    def _arm_child_from_snap(self, dap, child, snap):
+        """Plant the global intent as inherited copies on a private child
+        connection OUTSIDE the gate: `snap` is the claim-time phase
+        snapshot, so no shared roster/config/state is touched — only the
+        private `dap` and the not-yet-shared `child` records. Same
+        replace-per-file semantics as _arm_global."""
+        breaks, logpoints, methods, want_exc, raw_keys = snap
+        try:
+            by_file = {}
+            for path, line, cond in breaks:
+                bp = {"line": line}
+                if cond:
+                    bp["condition"] = cond
+                by_file.setdefault(path, []).append(
+                    {"line": line, "bp": bp, "kind": "break", "cond": cond})
+            for path, line, template in logpoints:
+                by_file.setdefault(path, []).append(
+                    {"line": line, "bp": {"line": line, "logMessage": template},
+                     "kind": "logpoint", "template": template})
+            for path, items in by_file.items():
+                body = dap.request(
+                    "setBreakpoints",
+                    {"source": {"path": path},
+                     "breakpoints": [it["bp"] for it in items]})
+                got_list = body.get("breakpoints", [])
+                for idx, item in enumerate(items):
+                    got = got_list[idx] if idx < len(got_list) else {}
+                    spec = f"{self.rel_file(path)}:{item['line']}"
+                    if item["kind"] == "break" and item.get("cond"):
+                        spec += f"|{item['cond']}"
+                    rec = {"spec": spec, "kind": item["kind"],
+                           "hits": 0 if item["kind"] == "break" else None}
+                    if item["kind"] == "logpoint":
+                        rec["detail"] = item["template"]
+                    bound = self._apply_verification(
+                        rec, got, item["line"], item["kind"] == "logpoint")
+                    child.stop_states.append(rec)
+                    child._hitkeys.append(
+                        (item["kind"], path, item["line"], bound))
+            if methods:
+                body = dap.request(
+                    "setFunctionBreakpoints",
+                    {"breakpoints": [{"name": func} for func in methods]})
+                got_list = body.get("breakpoints", [])
+                for idx, func in enumerate(methods):
+                    got = got_list[idx] if idx < len(got_list) else {}
+                    if not isinstance(got, dict):
+                        got = {}
+                    rec = {"spec": f"method:{func}", "kind": "method",
+                           "hits": 0}
+                    if bool(got.get("verified", False)):
+                        rec["state"] = "verified"
+                    else:
+                        rec["state"] = "pending"
+                        rec["detail"] = got.get("message", "pending")
+                    child.stop_states.append(rec)
+                    child._hitkeys.append(("method", func))
+            if want_exc:
+                dap.request("setExceptionBreakpoints", {"filters": ["uncaught"]})
+                child.stop_states.append(
+                    {"spec": "exc", "kind": "exc", "state": "armed", "hits": 0})
+                child._hitkeys.append(("exc",))
+        except (socket.timeout, TimeoutError) as e:
+            # DapConn lets raw timeouts escape (deadline semantics); outside
+            # dap_request there is no wrapper, so convert here.
+            raise BridgeErr(f"DAP child arm timed out: {e}")
+        child.inherited_keys = set(raw_keys)
+
+    def _run_full_attach(self, tid, pid, body, snap):
+        """Full child handshake on a private connection (gate released):
+        initialize → verbatim attach → inherited global copies →
+        configurationDone → drained attach response. Commit (or bounded
+        retire) happens under the gate; the socket is never closed here."""
         try:
             sock = socket.create_connection(
                 ("127.0.0.1", self.adapter_port), timeout=10)
@@ -1425,7 +2016,7 @@ class Session:
         dap = DapConn(sock)
         child = ChildTarget(tid, pid, dap, sock,
                             {"pid": pid, "source": "debugpy-subProcessId"})
-        child.logpoints = list(self.cfg.logpoints)
+        child.logpoints = list(snap[1])
         configured = False
         try:
             dap.request("initialize", {"adapterID": "agent-debugger",
@@ -1433,52 +2024,59 @@ class Session:
             # The attach response arrives only after configurationDone:
             # send without waiting (waiting here deadlocks, per M0).
             dap.send_only("attach", dict(body))
-            # Plant the global intent as inherited copies on the child
-            # connection (same replace-per-file semantics as main).
-            self._swap_fields(self, child)
-            try:
-                self._arm_global()
-            finally:
-                self._swap_fields(self, child)
-            child.inherited_keys = set(self.cfg.break_raws)
+            self._arm_child_from_snap(dap, child, snap)
             dap.request("configurationDone", {}, timeout=30)
             configured = True
             self._drain_child_response(dap, "attach")
-            child.state = "running"
-            self.targets[tid] = child
-            self.target_order.append(tid)
-            sys.stderr.write(f"target: {tid} attached (pid {pid})\n")
-        except BridgeErr as e:
+        except Exception as e:
             # Never strand a pre-configurationDone child (it would wait
             # forever): one configurationDone, then RETIRE the socket OPEN
             # (closing a half-built session kills the adapter process) and
-            # record bounded history. Ownership is bounded: the pre-connect
-            # gate above stops new opens once the retired list is full.
+            # record bounded history. The claim-time retired-full gate plus
+            # the single drainer keeps a slot reserved for this commit.
             if not configured:
                 try:
                     dap.request("configurationDone", {}, timeout=5)
                 except Exception:
                     pass
-            self._retired_sockets.append((tid, sock))
+            with self._gate:
+                self._retired_sockets.append((tid, sock))
             sys.stderr.write(f"warn: child {tid} handshake failed: {e}\n")
-            child.exited = True
-            child.state = "exited"
-            self.exited_targets.append(
-                {"id": tid, "kind": "child", "pid": pid,
-                 "state": "exited", "lastStop": None,
-                 "observed": child.observed, "scope": "inherited"})
-            while len(self.exited_targets) > MAX_EXITED_HISTORY:
-                del self.exited_targets[0]
-                self.dropped_exited += 1
+            with self._gate:
+                self.exited_targets.append(
+                    {"id": tid, "kind": "child", "pid": pid,
+                     "state": "exited", "lastStop": None,
+                     "observed": child.observed, "scope": "inherited"})
+                while len(self.exited_targets) > MAX_EXITED_HISTORY:
+                    del self.exited_targets[0]
+                    self.dropped_exited += 1
+            return
+        with self._gate:
+            if (tid in self.targets
+                    or len(self.active_nonmain()) >= MAX_ACTIVE_NONMAIN):
+                # Defensive: the claim-time budget should still hold (only
+                # this drainer commits), but if it does not, the session is
+                # established, so an adapter-contained close + release keeps
+                # every bound exact.
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                self._mark_ignored(tid, pid, "over budget")
+                return
+            child.state = "running"
+            self.targets[tid] = child
+            self.target_order.append(tid)
+        sys.stderr.write(f"target: {tid} attached (pid {pid})\n")
 
-    def _release_minimal(self, tid, pid, body):
-        """Over-budget release: full minimal handshake (initialize →
-        verbatim attach → NO setBreakpoints → configurationDone → drained
-        attach response) then raw close of the ESTABLISHED session and a
-        socket-less ignored record. Established closes are
-        adapter-contained (Session[2] precedent); half-built closes are
-        not, so ANY failure retires the socket OPEN instead (bounded).
-        The child runs free with zero breakpoints and can never park."""
+    def _run_minimal_attach(self, tid, pid, body):
+        """Over-budget release outside _gate: full minimal handshake
+        (initialize → verbatim attach → NO setBreakpoints →
+        configurationDone → drained) on the private connection, then the
+        established-session close plus a socket-less ignored record. The
+        child is configured with zero breakpoints so it can never park —
+        skipping the handshake instead would hang it (its server suspends
+        until configured). ANY failure retires the socket OPEN (bounded)."""
         try:
             sock = socket.create_connection(
                 ("127.0.0.1", self.adapter_port), timeout=10)
@@ -1494,27 +2092,31 @@ class Session:
             dap.request("configurationDone", {}, timeout=30)
             configured = True
             self._drain_child_response(dap, "attach")
-            try:
-                sock.close()
-            except Exception:
-                pass
-            self._mark_ignored(tid, pid, "over budget")
-        except BridgeErr as e:
+        except Exception as e:
             if not configured:
                 try:
                     dap.request("configurationDone", {}, timeout=5)
                 except Exception:
                     pass
-            self._retired_sockets.append((tid, sock))
+            with self._gate:
+                self._retired_sockets.append((tid, sock))
             sys.stderr.write(f"warn: child {tid} release failed: {e}\n")
-            self.exited_targets.append(
-                {"id": tid, "kind": "child", "pid": pid,
-                 "state": "exited", "lastStop": None,
-                 "observed": {"pid": pid, "source": "debugpy-subProcessId"},
-                 "scope": "inherited"})
-            while len(self.exited_targets) > MAX_EXITED_HISTORY:
-                del self.exited_targets[0]
-                self.dropped_exited += 1
+            with self._gate:
+                self.exited_targets.append(
+                    {"id": tid, "kind": "child", "pid": pid,
+                     "state": "exited", "lastStop": None,
+                     "observed": {"pid": pid, "source": "debugpy-subProcessId"},
+                     "scope": "inherited"})
+                while len(self.exited_targets) > MAX_EXITED_HISTORY:
+                    del self.exited_targets[0]
+                    self.dropped_exited += 1
+            return
+        try:
+            sock.close()
+        except Exception:
+            pass
+        with self._gate:
+            self._mark_ignored(tid, pid, "over budget")
 
     def _mark_ignored(self, tid, pid, why):
         """Release without a connection: socket-less roster record (never
@@ -1721,11 +2323,19 @@ class Session:
         single-argument call shape; children pass their id. Serialized on
         _gate (M5): concurrent pumps must never interleave park mutations
         or _TargetScope swaps. The wire (mu) is always released before
-        entering here — lock order _gate -> mu."""
+        entering here — lock order _gate -> mu. A debugpyAttach only
+        STAGES here (bounded enqueue under gate); the drain below runs the
+        blocking private child handshake with the gate RELEASED, so M5
+        live reads never wait behind it."""
         with self._gate:
             if tid == "main":
-                return self._handle_pumped(msg)
-            return self._handle_pumped(msg, tid)
+                handled = self._handle_pumped(msg)
+            else:
+                handled = self._handle_pumped(msg, tid)
+        # Gate released: run any staged child admission (fast no-op when
+        # the staging list is empty).
+        self._drain_attach_chain()
+        return handled
 
     def _pop_stash(self, conn):
         """Mu-protected stash pop (real DapConns) with a plain-list fallback
@@ -1801,7 +2411,10 @@ class Session:
         resumes on different targets) share every connection: stash pops
         and wire reads are mu-protected, dispatch is gate-protected, and
         each message is consumed exactly once — but only the pump that
-        consumes a stop parks it, so a rival pump keeps waiting."""
+        consumes a stop parks it, so a rival pump keeps waiting.
+        Timeouts carry no context here: wait/capture attach their honest
+        trigger-unknown context at their own call sites (continue/step
+        timeouts stay bare)."""
         deadline = time.time() + timeout
         for tid, conn, _sock in self._conn_entries():
             while True:
@@ -2040,9 +2653,10 @@ class Session:
         if ev == "debugpyAttach":
             # A second concurrent DAP session for one child (M0: same
             # adapter port, attach = this body verbatim). Launch-only and
-            # opt-in; attach sessions stay single-target.
+            # opt-in; attach sessions stay single-target. Staged only —
+            # the dispatcher drains the blocking handshake outside _gate.
             if target == "main":
-                self._accept_child(body)
+                self._stage_attach(body)
             return None
         if target != "main":
             if ev in ("exited", "terminated"):
@@ -2060,6 +2674,12 @@ class Session:
         if not isinstance(body, dict):
             return None
         if ev == "debugpyAttach":
+            return None
+        if ev == "process":
+            # Debuggee identity (DAP ProcessEvent): adopt protocol-confirmed
+            # name/pid, never park, never disturb the pump or the child
+            # debugpyAttach flow.
+            self._note_process_event(body)
             return None
         if ev == "stopped":
             reason = body.get("reason", "")
@@ -2433,9 +3053,18 @@ class Session:
             self.require_live()
             if self._parked_now():
                 return self._wait_snapshot(tid, False)
-        # Not parked: wait without issuing any resume.
+        # Not parked: wait without issuing any resume. The honest timeout
+        # context attaches here (wait only — continue/step timeouts stay
+        # bare); a stubbed pump's bare StopTimeout is enriched, never
+        # replaced, so the typed prefix is unchanged either way.
         self._park_local.parked = None
-        self.pump(timeout)
+        started = time.time()
+        try:
+            self.pump(timeout)
+        except StopTimeout as e:
+            if e.wait_context is None:
+                e.wait_context = self._wait_context(timeout, started)
+            raise
         parked = getattr(self._park_local, "parked", None)
         if not (isinstance(parked, str)
                 and (parked == "main" or parked in self.targets)):
@@ -2588,6 +3217,18 @@ class Session:
                 "frames": frames,
                 "output": self.output_tail[-MAX_OUTPUT:]}
 
+    def _snap_vars_truncated(self, snap):
+        """True when the capture snapshot capped frame-0 vars: frame_locals
+        marks the cap with a trailing {"name": "…", "note": "+N more"}
+        sentinel (never a real variable name)."""
+        try:
+            frames = snap.get("frames") or []
+            locs = frames[0].get("locals", []) if frames else []
+        except (AttributeError, IndexError):
+            return False
+        return any(isinstance(v, dict) and v.get("name") == "…"
+                   and "note" in v for v in locs)
+
     def cmd_capture(self, req, timeout):
         """One-shot bounded stop. Pre-parked target: collect WITHOUT
         resuming. Fresh park: collect, REMOVE EPHEMERAL BEFORE RESUME,
@@ -2607,7 +3248,7 @@ class Session:
                         "pauseDurationMs": 0, "pauseBudgetMs": budget,
                         "ephemeralPlanted": False,
                         "truncated": {"frames": len(self.frames) > frames_n,
-                                      "vars": False},
+                                      "vars": self._snap_vars_truncated(snap)},
                         "snapshot": snap,
                         "diag": self._stop_diag(tid, snap.get("threads")),
                         "warning": PARK_WARNING}
@@ -2617,17 +3258,38 @@ class Session:
         token = None
         if spec is not None:
             token = self._capture_plant(tid, spec)
+        started = time.time()
         try:
             self._park_local.parked = None
             self.pump(timeout)
-        except Exception:
+        except Exception as orig:
             # Timeout/exit: nothing parked by us — no resume — but the
-            # ephemeral must not leak: remove best-effort, then re-raise.
+            # ephemeral must not leak: remove best-effort, then re-raise
+            # the ORIGINAL error with the removal failure attached (never
+            # masked by it).
             try:
                 self._capture_unplant(token)
             except Exception as e:
-                raise BridgeErr(f"{e}; capture ephemeral may still be planted "
-                                f"(breaks remove --target {tid} to clear)")
+                raise BridgeErr(
+                    f"{orig}; capture ephemeral remove failed: {e} "
+                    f"(breaks remove --target {tid} to clear)") from e
+            if isinstance(orig, StopTimeout):
+                # Honest timeout context (canonical field order, planted
+                # spec only): enrich a bare pump timeout, or rebuild an
+                # attached one with the expectedBreak. Other errors pass
+                # through untouched.
+                old = orig.wait_context if isinstance(
+                    getattr(orig, "wait_context", None), dict) else None
+                if old is None:
+                    orig.wait_context = self._wait_context(timeout, started, spec)
+                elif spec is not None:
+                    orig.wait_context = {
+                        "waitStartedAt": old.get("waitStartedAt"),
+                        "waitedMs": old.get("waitedMs"),
+                        "triggerStatus": "unknown",
+                        "expectedBreak": spec,
+                        "targetIdentity": old.get("targetIdentity"),
+                        "note": old.get("note", WAIT_NOTE)}
             raise
         parked = getattr(self._park_local, "parked", None)
         if not (isinstance(parked, str)
@@ -2676,7 +3338,7 @@ class Session:
                     "ephemeralPlanted": token is not None and token[0] not in (
                         "main-dup", "child-dup"),
                     "truncated": {"frames": len(self.frames) > frames_n,
-                                  "vars": False},
+                                  "vars": self._snap_vars_truncated(snap)},
                     "snapshot": snap, "diag": diag,
                     "warning": PARK_WARNING}
             if snap_err is not None:
@@ -3949,7 +4611,11 @@ def _handle_one(st, conn):
                 pass
         except BridgeErr as e:
             target = getattr(st, "_pending_target", None) or getattr(st, "_serving", "main")
-            try_write_frame(conn, {"ok": False, "error": str(e), "target": target})
+            resp = {"ok": False, "error": str(e), "target": target}
+            wc = getattr(e, "wait_context", None)
+            if isinstance(wc, dict):
+                resp["waitContext"] = wc
+            try_write_frame(conn, resp)
         except Exception as e:
             target = getattr(st, "_pending_target", None) or getattr(st, "_serving", "main")
             try_write_frame(conn, {"ok": False, "error": f"internal: {e}",
@@ -4066,7 +4732,8 @@ def main(argv):
                  "stopped": bool(st.suspended or any(
                      t.suspended for t in st.live_targets())),
                  "lastStop": st.last_stop, "updatedAt": int(time.time()),
-                 "observedTarget": cfg.observed_target}))
+                 "observedTarget": cfg.observed_target,
+                 "targetIdentity": st._target_identity}))
             serve(st, server, nonce)
         except (Usage, BridgeErr) as e:
             # Failed setup must not leak the spawned adapter/target:

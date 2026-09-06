@@ -112,8 +112,20 @@ agent-debugger --session cart context  # where it is parked (if stopped)
   capped before it is ever persisted or shown — raw command lines never
   land in `session.json`/`stops.json`/logs/errors. Same file attached on
   the wrong port is visible here: compare the observed pid/argv before
-  concluding the code is unreachable. `verified` still means "planted",
-  never "this code ran".
+   concluding the code is unreachable. `verified` still means "planted",
+   never "this code ran".
+- Layered identity (`targetIdentity`, beside the unchanged
+  `observedTarget`): three roles with strict confidence. `debuggee` is the
+  program under test and is `protocol-confirmed` ONLY from protocol data
+  (Python: the DAP `process` event name/pid; Node: the kept `/json/list`
+  title/url; Java: the JDI VM name; browser: the attached tab). `endpoint`
+  is the OS-observed listener owner (`os-corroborated` at most — on Python
+  attach that is the debugpy *adapter*, not your code) and `adapter` names
+  the adapter process when one exists (debugpy) or `inProcess:true` when
+  the inspector lives inside the debuggee (Node/Java/browser). Anything
+  unobserved is `unavailable` with a reason, never guessed — there is no
+  parent-process inference. Timeout/unhit hints lead with the debuggee;
+  all fields are redacted and capped before they persist or print.
 - Delayed recipe: Java/Python/Node `attach --break` first waits up to
   `--timeout` for an immediate stop. If the line is not reached, it then
   returns a live running session with the breakpoint still armed (the
@@ -237,6 +249,24 @@ bridges long-poll for you:
   preserved) → inspect/`continue` promptly. A parked HTTP handler keeps
   its connection open until you `continue`, a capture auto-resumes, or
   you `close` (detach) — every parked response carries this `warning`.
+- A timeout NEVER means "unreachable code": the debugger cannot see your
+  external trigger (an HTTP helper that crashed before sending looks
+  identical to a quiet target), so every wait/capture timeout carries
+  `waitContext` with `triggerStatus: "unknown"`, the waited time, the
+  `expectedBreak` (capture only), and the redacted `targetIdentity`. On a
+  timeout, verify the trigger path separately (did the helper actually
+  send? did the request reach the handler?) instead of re-arming blindly.
+  A `verified-but-unhit` break plus `unknown` trigger means "nothing was
+  observed", not "this line cannot run".
+- Wrapped servers need the layered view, not the endpoint argv. With
+  `uv run --with debugpy python -m debugpy --listen 127.0.0.1:5678 -m
+  uvicorn app.main:app`, the listener owner is the debugpy adapter
+  (site-packages), NOT your app: read `targetIdentity.debuggee`
+  (`protocol-confirmed` name/pid from the DAP `process` event) to confirm
+  you attached the app, and treat `endpoint`/`adapter` as "where the
+  debugger plugged in". Same rule for any launcher wrap (`uv`, `gunicorn`,
+  `npm run`, `gradle bootRun`): the debuggee role is the truth, the
+  endpoint argv is plumbing.
 - `continue` resumes and then waits for the NEXT stop: after it wakes a
   parked handler, the request completes, and the command itself reports
   `timeout: no stop within Ns` when nothing else hits. That timeout

@@ -463,6 +463,26 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(cfg.breaks,
                              [(os.path.realpath(str(target)), 1, None)])
 
+    def test_parse_args_missing_value_is_usage_for_all_value_flags(self):
+        # Every value flag shares the _need path: a missing value is a
+        # clean Usage naming the flag, never IndexError->traceback/internal.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = ["session", "--kind", "launch", "--dir", tmp,
+                    "--module", "m"]
+            for flag in ["--kind", "--dir", "--program", "--module",
+                         "--python", "--host", "--port", "--src",
+                         "--break", "--logpoint", "--timeout",
+                         "--observed-target", "--observed-hint"]:
+                with self.subTest(flag=flag):
+                    with self.assertRaises(bridge.Usage) as cm:
+                        bridge.parse_args(base + [flag])
+                    self.assertIn("needs a value", str(cm.exception))
+                    self.assertIn(flag, str(cm.exception))
+            # `--` program args are preserved verbatim, never parsed.
+            cfg = bridge.parse_args(
+                base + ["--", "--kind", "--dir", "--break"])
+            self.assertEqual(cfg.prog_args, ["--kind", "--dir", "--break"])
+
     def test_breaks_add_uses_live_src_dirs(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "root" / "sub" / "live.py"
@@ -1257,6 +1277,111 @@ class BridgeTests(unittest.TestCase):
             ids = [e["id"] for e in st.exited_targets]
             self.assertNotIn("child:0", ids)  # oldest evicted first
 
+    def test_exited_targets_bound_all_lists_consistent(self):
+        # >16 exits: dead ids leave no trace in the live roster, so pump
+        # loops (live_targets/active_nonmain/target_order scans) never walk
+        # unbounded dead ids — only live + bounded ignored entries remain.
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            for pid in range(20):
+                self.fake_child(st, pid)
+                st._note_exit(f"child:{pid}")
+            self.assertEqual(len(st.exited_targets), bridge.MAX_EXITED_HISTORY)
+            self.assertEqual(st.dropped_exited, 20 - bridge.MAX_EXITED_HISTORY)
+            self.assertEqual(st.target_order, [])
+            self.assertEqual(st.live_targets(), [])
+            self.assertEqual(st.active_nonmain(), [])
+            self.assertEqual(st.targets, {})
+            resp = st.cmd_targets()
+            ids = [t["id"] for t in resp["targets"]]
+            self.assertEqual(ids[0], "main")
+            self.assertEqual(len(ids), 1 + bridge.MAX_EXITED_HISTORY)
+            self.assertEqual(len(set(ids)), len(ids))  # no dupes, no ghosts
+
+    def test_target_entry_main_uses_main_exited(self):
+        # Main DAP session over but children live on: the roster must show
+        # main exited (not running) while the session itself is not done.
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            self.fake_child(st, 5)
+            st.main_exited = True
+            self.assertFalse(st.exited)
+            entry = st.target_entry("main")
+            self.assertEqual(entry["state"], "exited")
+
+    def test_parse_port_timeout_malformed_is_usage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prog = str(Path(tmp) / "app.py")
+            Path(prog).write_text("print('hi')\n")
+            base = ["session", "--kind", "launch", "--dir", tmp,
+                    "--program", prog]
+            for argv in [base + ["--timeout", "fast"],
+                         base + ["--timeout"],
+                         base + ["--timeout", "nan"],
+                         base + ["--timeout", "0"]]:
+                with self.assertRaises(bridge.Usage):
+                    bridge.parse_args(argv)
+            attach = ["session", "--kind", "attach", "--dir", tmp,
+                      "--host", "127.0.0.1"]
+            with self.assertRaises(bridge.Usage):
+                bridge.parse_args(attach + ["--port", "fast"])
+            with self.assertRaises(bridge.Usage):
+                bridge.parse_args(attach + ["--port"])
+            # Valid values still parse.
+            cfg = bridge.parse_args(base + ["--timeout", "5"])
+            self.assertEqual(cfg.timeout, 5.0)
+            cfg = bridge.parse_args(attach + ["--port", "1234"])
+            self.assertEqual(cfg.port, 1234)
+
+    def test_delayed_handshake_keeps_live_reads_prompt(self):
+        # A ~blocked private child handshake must never hold Session._gate:
+        # while one pump thread sits in the child handshake, a concurrent
+        # breaks prompt is served promptly, and the child commits after.
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            st._child_cmdline = Mock(return_value="/usr/bin/python3 /app/w.py")
+            entered = threading.Event()
+            release = threading.Event()
+
+            class SlowDap:
+                def __init__(self, sock):
+                    self.sock = sock
+                    self.stash = [{"type": "response", "command": "attach",
+                                   "request_seq": 1, "success": True,
+                                   "body": {}}]
+                def request(self, cmd, args=None, timeout=30):
+                    if cmd == "initialize":
+                        entered.set()
+                        self._release_ok = release.wait(timeout=10)
+                    return {}
+                def send_only(self, cmd, args=None):
+                    pass
+
+            with patch.object(bridge.socket, "create_connection",
+                              return_value=Mock()):
+                with patch.object(bridge, "DapConn", SlowDap):
+                    msg = {"type": "event", "event": "debugpyAttach",
+                           "body": {"subProcessId": 4242, "connect": {}}}
+                    worker = threading.Thread(
+                        target=st._dispatch_pumped, args=(msg, "main"))
+                    worker.start()
+                    try:
+                        self.assertTrue(entered.wait(timeout=10),
+                                        "handshake never started")
+                        t0 = time.monotonic()
+                        resp = st.cmd_breaks({})
+                        dt = time.monotonic() - t0
+                        self.assertTrue(resp["ok"])
+                        self.assertLess(dt, 2.0)
+                    finally:
+                        release.set()
+                        worker.join(timeout=10)
+                    self.assertFalse(worker.is_alive())
+            self.assertIn("child:4242", st.targets)
+            self.assertEqual(st.targets["child:4242"].state, "running")
+            self.assertIn("child:4242", st.target_order)
+
     def test_ephemeral_add_remove_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.realpath(str(Path(tmp) / "w.py"))
@@ -1788,6 +1913,199 @@ class BridgeTests(unittest.TestCase):
             self.assertFalse(t.is_alive())
             with st._gate:
                 self.assertEqual(st._active, 0)
+
+
+class TargetIdentityTests(unittest.TestCase):
+    """Layered endpoint/adapter/debuggee identity + honest waitContext."""
+
+    def session(self, kind="attach"):
+        cfg = bridge.Config()
+        cfg.kind = kind
+        cfg.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(cfg.dir, ignore_errors=True))
+        cfg.host = "127.0.0.1"
+        cfg.port = 5678
+        return bridge.Session(cfg)
+
+    def test_process_event_from_stash_builds_protocol_debuggee(self):
+        st = self.session()
+        st.cfg.observed_target = {
+            "kind": "process", "pid": 15298,
+            "executable": ".../site-packages/debugpy/adapter",
+            "argv": [".../site-packages/debugpy/adapter", "--for-server",
+                     "--server-access-token", "SECRET",
+                     "--host", "127.0.0.1", "--port", "5678"],
+            "cwd": None, "source": "os-lsof-ps", "observedAt": 1,
+            "unavailable": [], "warnings": [],
+        }
+        proc = {"type": "event", "event": "process",
+                "body": {"name": "/srv/srv.py", "systemProcessId": 15292,
+                         "isLocalProcess": True, "startMethod": "attach"}}
+        st.dap = SimpleNamespace(stash=[proc], sock=Mock(), _read_msg=Mock(
+            side_effect=socket.timeout("no more")))
+        before = json.dumps(st.cfg.observed_target, sort_keys=True)
+        self.assertTrue(st._consume_process_event(timeout=0.2))
+        self.assertEqual(json.dumps(st.cfg.observed_target, sort_keys=True), before)
+        self.assertEqual(st._process_event["pid"], 15292)
+        ident = st._target_identity
+        # Debuggee is protocol-confirmed and differs from the endpoint owner.
+        self.assertEqual(ident["debuggee"]["confidence"], "protocol-confirmed")
+        self.assertEqual(ident["debuggee"]["pid"], 15292)
+        self.assertEqual(ident["debuggee"]["source"], "dap-process-event")
+        self.assertEqual(ident["endpoint"]["ownerPid"], 15298)
+        self.assertEqual(ident["endpoint"]["confidence"], "os-corroborated")
+        # Adapter recognized from the redacted argv; the raw token is gone.
+        self.assertEqual(ident["adapter"]["name"], "debugpy-adapter")
+        self.assertEqual(ident["adapter"]["pid"], 15298)
+        blob = json.dumps(ident)
+        self.assertNotIn("SECRET", blob)
+        self.assertIn("[redacted]", blob)
+        # observedTarget compatibility view untouched (still None here).
+        self.assertLessEqual(len(blob), bridge.IDENT_TOTAL_CAP)
+        # Debuggee-first hint names the program, not the adapter.
+        self.assertIn("/srv/srv.py", st._identity_hint)
+        self.assertIn("protocol-confirmed", st._identity_hint)
+        self.assertTrue(st.timeout_text(2).startswith("timeout: no stop within 2s"))
+
+    def test_process_event_absent_is_unavailable_not_failure(self):
+        st = self.session()
+        st.dap = SimpleNamespace(stash=[], sock=Mock(),
+                                 _read_msg=Mock(side_effect=socket.timeout("quiet")))
+        self.assertFalse(st._consume_process_event(timeout=0.1))
+        st.cfg.observed_target = None
+        ident = st._build_target_identity()
+        self.assertEqual(ident["debuggee"]["confidence"], "unavailable")
+        self.assertTrue(any(u["field"] == "pid"
+                            for u in ident["debuggee"]["unavailable"]))
+        self.assertEqual(ident["endpoint"]["confidence"], "unavailable")
+        self.assertEqual(st._identity_hint, "")
+
+    def test_handle_main_event_process_never_parks_or_disturbs_child(self):
+        st = self.session()
+        st.cfg.observed_target = {"kind": "process", "pid": 9,
+                                  "argv": ["python", "-m", "debugpy", "--listen", "5678"],
+                                  "source": "os-proc"}
+        proc = {"type": "event", "event": "process",
+                "body": {"name": "srv.py", "systemProcessId": 7,
+                         "startMethod": "attach"}}
+        self.assertIsNone(st._handle_main_event(proc))
+        self.assertFalse(st.suspended)
+        self.assertEqual(st._process_event["pid"], 7)
+        # debugpyAttach flow untouched by the process branch.
+        st._process_event = None
+        self.assertIsNone(st._handle_main_event(
+            {"type": "event", "event": "debugpyAttach", "body": {}}))
+        self.assertIsNone(st._process_event)
+        # Malformed bodies stay contained.
+        self.assertIsNone(st._handle_main_event(
+            {"type": "event", "event": "process", "body": None}))
+
+    def test_launch_roles_use_own_adapter_pid(self):
+        st = self.session(kind="launch")
+        st.adapter = SimpleNamespace(pid=4242)
+        st.adapter_port = 5555
+        st.cfg.observed_target = {"kind": "process", "pid": None,
+                                  "source": "launcher-args"}
+        ident = st._build_target_identity()
+        self.assertEqual(ident["endpoint"]["ownerPid"], 4242)
+        self.assertEqual(ident["adapter"]["pid"], 4242)
+        self.assertEqual(ident["adapter"]["confidence"], "os-corroborated")
+        self.assertEqual(ident["debuggee"]["confidence"], "unavailable")
+
+    def test_redact_and_caps_bound_identity(self):
+        long = "x" * 900
+        argv = ["prog", "--server-access-token", "HEXSECRET",
+                "--password=hunter2", long]
+        red = bridge.redact_identity_argv(argv)
+        joined = " ".join(red)
+        self.assertNotIn("HEXSECRET", joined)
+        self.assertNotIn("hunter2", joined)
+        self.assertIn("[redacted]", joined)
+        role = bridge._cap_role({"argv": red, "name": long})
+        self.assertLessEqual(len(json.dumps(role)), bridge.IDENT_ROLE_CAP)
+        many = [f"--arg{i}" for i in range(120)]
+        ident = bridge._cap_identity({"debuggee": {"argv": many},
+                                      "endpoint": {}, "adapter": {}})
+        self.assertLessEqual(len(json.dumps(ident)), bridge.IDENT_TOTAL_CAP)
+
+    def test_wait_context_is_honest_and_additive(self):
+        st = self.session()
+        st.cfg.observed_target = {"kind": "process", "pid": 11,
+                                  "argv": ["python", "srv.py"], "source": "os-proc"}
+        st._note_process_event({"name": "srv.py", "systemProcessId": 12,
+                                "startMethod": "attach"})
+        started = time.time() - 2.0
+        ctx = st._wait_context(2, started)
+        self.assertEqual(ctx["triggerStatus"], "unknown")
+        self.assertNotIn("expectedBreak", ctx)
+        self.assertGreaterEqual(ctx["waitedMs"], 1500)
+        self.assertIn("not observed", ctx["note"])
+        self.assertNotIn("unreachable code", ctx["note"])
+        self.assertEqual(ctx["targetIdentity"]["debuggee"]["pid"], 12)
+        ctx2 = st._wait_context(2, started, expected_break="srv.py:9")
+        self.assertEqual(ctx2["expectedBreak"], "srv.py:9")
+
+    def test_cmd_wait_timeout_carries_wait_context(self):
+        st = self.session()
+        st.cfg.observed_target = {"kind": "process", "pid": 11,
+                                  "argv": ["python", "srv.py"], "source": "os-proc"}
+        st._build_target_identity()
+        ctx = st._wait_context(7, time.time())
+        st.pump = Mock(side_effect=bridge.StopTimeout(st.timeout_text(7), ctx))
+        with self.assertRaises(bridge.StopTimeout) as cm:
+            st.cmd_wait({}, 7)
+        self.assertTrue(str(cm.exception).startswith("timeout: no stop within 7s"))
+        self.assertEqual(cm.exception.wait_context["triggerStatus"], "unknown")
+        self.assertFalse(st.suspended)
+
+    def test_cmd_capture_timeout_carries_expected_break(self):
+        st = self.session()
+        path = os.path.realpath(os.path.join(st.cfg.dir, "a.py"))
+        Path(path).write_text("".join(f"line {n}\n" for n in range(12)))
+        st.cfg.observed_target = {"kind": "process", "pid": 11,
+                                  "argv": ["python", "a.py"], "source": "os-proc"}
+        st._build_target_identity()
+        st.dap_request = Mock(side_effect=lambda *a, **k: {"breakpoints": [{"verified": True}]})
+        ctx = st._wait_context(5, time.time())
+        st.pump = Mock(side_effect=bridge.StopTimeout(st.timeout_text(5), ctx))
+        spec = f"{path}:5"
+        with self.assertRaises(bridge.StopTimeout) as cm:
+            st.cmd_capture({"break": spec}, 5)
+        wc = cm.exception.wait_context
+        self.assertTrue(str(cm.exception).startswith("timeout: no stop within 5s"))
+        self.assertEqual(wc["expectedBreak"], spec)
+        self.assertEqual(wc["triggerStatus"], "unknown")
+        calls = [c[0][0] for c in st.dap_request.call_args_list]
+        self.assertNotIn("continue", calls)
+        self.assertEqual(st.cfg.breaks, [])
+
+    def test_handle_one_frames_wait_context(self):
+        st = self.session()
+        left, right = socket.socketpair()
+        self.addCleanup(left.close)
+        self.addCleanup(right.close)
+        ctx = {"waitStartedAt": 1, "waitedMs": 2, "triggerStatus": "unknown",
+               "targetIdentity": None, "note": bridge.WAIT_NOTE}
+        st.dispatch = Mock(side_effect=bridge.StopTimeout("timeout: no stop within 2s", ctx))
+        st._active = 1
+        t = threading.Thread(target=bridge._handle_one, args=(st, left), daemon=True)
+        t.start()
+        bridge.write_frame(right, {"cmd": "wait", "timeout": 2})
+        right.settimeout(5)
+        resp = bridge.read_frame(right)
+        t.join(5)
+        self.assertFalse(resp["ok"])
+        self.assertTrue(resp["error"].startswith("timeout: no stop within 2s"))
+        self.assertEqual(resp["waitContext"]["triggerStatus"], "unknown")
+
+    def test_debuggee_os_enrichment_is_best_effort(self):
+        st = self.session()
+        self.assertIsNone(st._debuggee_os_details(999999999))
+        self.assertIsNone(st._debuggee_os_details(None))
+        det = st._debuggee_os_details(os.getpid())
+        self.assertIsNotNone(det)
+        self.assertEqual(det["confidence"], "os-corroborated")
+        self.assertNotIn("environ", json.dumps(det))
 
 
 if __name__ == "__main__":

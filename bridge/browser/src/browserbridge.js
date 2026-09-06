@@ -48,6 +48,7 @@ class Usage extends Error {}
 const { BridgeErr, CdpConn } = require('./cdp_conn.js');
 const { readFrame, writeFrame } = require('./framing.js');
 class CloseSession extends Error {}
+class StopTimeout extends BridgeErr {}
 
 const MAX_TABS_LISTED = 10;
 const MAX_STRING = 200;
@@ -116,7 +117,9 @@ function parseBreak(spec, cfg) {
   if (colon <= 0) throw new Usage('--break must look like frag:line, exc');
   const lineno = parseInt(head.slice(colon + 1), 10);
   if (Number.isNaN(lineno)) throw new Usage(`bad line in --break: ${spec}`);
-  cfg.breaks.push({ frag: head.slice(0, colon), line: lineno, cond });
+  const frag = normFrag(head.slice(0, colon));
+  if (!frag) throw new Usage(`--break must look like frag:line, exc (got '${spec}')`);
+  cfg.breaks.push({ frag, line: lineno, cond });
 }
 
 function parseLogpoint(spec, cfg) {
@@ -125,8 +128,10 @@ function parseLogpoint(spec, cfg) {
   if (first <= 0 || second <= 0) throw new Usage('--logpoint must look like frag:line:template');
   const lineno = parseInt(spec.slice(first + 1, second), 10);
   if (Number.isNaN(lineno)) throw new Usage(`bad line in --logpoint: ${spec}`);
+  const lfrag = normFrag(spec.slice(0, first));
+  if (!lfrag) throw new Usage(`--logpoint must look like frag:line:template (got '${spec}')`);
   cfg.logpoints.push({
-    frag: spec.slice(0, first),
+    frag: lfrag,
     line: lineno,
     template: spec.slice(second + 1),
   });
@@ -204,16 +209,60 @@ function truncField(s) {
   return truncStr(String(s), OBSERVED_FIELD_CAP);
 }
 
+// ---------------------------------------------------------------- layered target identity (M-ID)
+// Additive `{debuggee, endpoint, adapter}` roles beside the untouched
+// `observedTarget`. The attached tab IS the debuggee (protocol-confirmed
+// via /json/list); the endpoint is the debugger listener; there is no
+// adapter process and no process claim anywhere. Tab fields reuse the
+// redacted + capped tab identity above; the aggregate is bounded here.
+const IDENT_TOTAL_CAP = 4096;
+
+const WAIT_NOTE = 'external trigger execution is not observed by the debugger; ' +
+  'this timeout means no stop was observed, not that the code is unreachable';
+
+function identShrinkToTotal(obj, totalCap) {
+  let passes = 0;
+  const longestPath = (v, prefix) => {
+    let best = null;
+    if (typeof v === 'string' && v.length > 1) best = { path: prefix, len: v.length };
+    const kids = Array.isArray(v) ? v.map((e, i) => [e, prefix.concat([i])])
+      : (v && typeof v === 'object') ? Object.keys(v).map((k) => [v[k], prefix.concat([k])]) : [];
+    for (const [e, p] of kids) {
+      const cand = longestPath(e, p);
+      if (cand && (!best || cand.len > best.len)) best = cand;
+    }
+    return best;
+  };
+  const getAt = (root, path) => path.reduce((o, p) => o[p], root);
+  const setAt = (root, path, val) => {
+    const parent = getAt(root, path.slice(0, -1));
+    parent[path[path.length - 1]] = val;
+  };
+  while (JSON.stringify(obj).length > totalCap && passes < 4096) {
+    passes += 1;
+    const hit = longestPath(obj, []);
+    if (!hit) break;
+    const cur = getAt(obj, hit.path);
+    const cand = truncStr(cur, Math.max(1, hit.len - 64));
+    setAt(obj, hit.path, cand.length < hit.len ? cand : '…');
+  }
+  return obj;
+}
+
 /** Secret query keys (mirrors the CLI argv redaction): whole/substring
  *  long keys plus boundary/suffix short keys — never a mere prefix, so
- *  `?author=` keeps its value while `?token=` and `?apiToken=` redact. */
+ *  `?author=` keeps its value while `?token=` and `?apiToken=` redact.
+ *  Short-key set matches Rust is_secret_flag exactly (token/auth/pwd/pass
+ *  /pw as whole tokens or suffixes); `?passage=`, `?author=` and `?passed=`
+ *  never redact. */
 function isSecretQueryKey(key) {
   const flat = key.toLowerCase().replace(/[-_]/g, '');
   const SUBSTR = ['password', 'passwd', 'secret', 'apikey', 'authorization', 'authtoken', 'accesstoken'];
   if (SUBSTR.some((k) => flat.includes(k))) return true;
+  const TOKEN = ['token', 'auth', 'pwd', 'pass', 'pw'];
   return key.toLowerCase().split(/[-_.]/).some((tok) => {
-    if (tok === 'token' || tok === 'auth' || tok === 'pwd') return true;
-    return tok.endsWith('token') || tok.endsWith('auth') || tok.endsWith('pwd');
+    if (tok.length === 0) return false;
+    return TOKEN.some((k) => tok === k || tok.endsWith(k));
   });
 }
 
@@ -247,8 +296,8 @@ function buildObservedTab(tab, host, port, nowSec) {
   const obs = {
     kind: 'tab',
     url: truncField(redactUrl(t.url || null)),
-    title: truncField(t.title || null),
-    targetId: truncField(t.id || null),
+    title: truncField(redactUrl(t.title || null)),
+    targetId: truncField(redactUrl(t.id || null)),
     debugEndpoint: truncField(`${host}:${port}`),
     cwd: null,
     argv: null,
@@ -287,6 +336,23 @@ function fragRegex(frag) {
   return `(^|/)${escapeRegex(frag)}([?#]|$)`;
 }
 
+/** Normalize a URL frag: strip leading slashes so '/app.js' matches like
+ *  'app.js' (a leading slash would otherwise demand a '//' in the URL and
+ *  never match). A frag of only slashes fails fast at the call site. */
+function normFrag(frag) {
+  return frag.replace(/^\/+/, '');
+}
+
+/** Slide target: the line V8 actually bound, or null when the record must
+ *  NOT read slid — no locations (pending) or ANY location on the requested
+ *  line (multi-location replies where one leg hit home). Only when every
+ *  returned location differs did the breakpoint truly move. */
+function slidLine(locs, line) {
+  if (!locs || locs.length === 0) return null;
+  if (locs.some((l) => l.lineNumber + 1 === line)) return null;
+  return locs[0].lineNumber + 1;
+}
+
 /** Display form of a script URL: origin + path, no query/hash noise. */
 function displayUrl(url) {
   if (!url) return '?';
@@ -299,7 +365,12 @@ function displayUrl(url) {
 }
 
 function tabSummary(t) {
-  return `${truncStr(t.title || '(no title)', 60)} <${truncStr(t.url || '', 100)}>`;
+  // Display-only (pick errors, CDP connect errors): secret query values
+  // redacted, then capped — raw matching in pickTab still sees the real
+  // URL/title, but nothing raw ever prints or persists.
+  const tab = t || {};
+  return `${truncStr(String(redactUrl(tab.title || '(no title)')), 60)} ` +
+    `<${truncStr(String(redactUrl(tab.url || '')), 100)}>`;
 }
 
 /** Fold startup specs before any CDP traffic (mirrors nodebridge + the live
@@ -395,10 +466,14 @@ function pickTab(targets, want) {
   const hits = pages.filter((t) => (t.url || '').includes(want) || (t.title || '').includes(want));
   if (hits.length === 1) return hits[0];
   const listed = pages.slice(0, MAX_TABS_LISTED).map((t) => `  - ${tabSummary(t)}`).join('\n');
+  // The selector is our own caller-supplied text, but it can still carry a
+  // pasted URL with a secret query — redact it like every other display
+  // string. Matching above stays raw on purpose.
+  const safeWant = String(redactUrl(want));
   if (hits.length === 0) {
-    throw new BridgeErr(`attach failed: no tab matches '${want}'. Open tabs:\n${listed}`);
+    throw new BridgeErr(`attach failed: no tab matches '${safeWant}'. Open tabs:\n${listed}`);
   }
-  throw new BridgeErr(`attach failed: '${want}' matches ${hits.length} tabs, be specific:\n` +
+  throw new BridgeErr(`attach failed: '${safeWant}' matches ${hits.length} tabs, be specific:\n` +
     hits.slice(0, MAX_TABS_LISTED).map((t) => `  - ${tabSummary(t)}`).join('\n'));
 }
 
@@ -518,6 +593,11 @@ class Session {
     // 'main': one tab per session); live reads bypass it entirely.
     this.outstanding = new Map(); // tid -> resume cmd in flight
     this.activeConns = 0;         // live connection handlers (bounded)
+    // -- layered target identity (M-ID): the attached tab (debuggee,
+    // protocol-confirmed) plus the debugger listener (endpoint). Built at
+    // handshake; published redacted + capped in session.json.
+    this.targetIdentity = null;   // {debuggee,endpoint,adapter} or null
+    this.identityHint = '';       // debuggee-first one-liner for timeouts
   }
 
   /** M5 immediate busy rejection (single target): a second resume or any
@@ -555,6 +635,7 @@ class Session {
     this.cfg.observedTarget = buildObservedTab(
       this.tab, this.cfg.host, this.cfg.port, Math.floor(Date.now() / 1000));
     this.cfg.observedHint = tabHint(this.cfg.observedTarget);
+    this.buildTargetIdentity();
     const WebSocket = loadWs();
     const ws = new WebSocket(this.tab.webSocketDebuggerUrl, { maxPayload: 256 * 1024 * 1024 });
     await new Promise((resolve, reject) => {
@@ -668,8 +749,7 @@ class Session {
       if (locs.length === 0) {
         process.stderr.write(`warn: breakpoint unverified (pending): ${spec.frag}:${spec.line}\n`);
       }
-      const slidLoc = (locs.map((l) => l.lineNumber + 1).find((n) => n !== spec.line));
-      const slidTo = (slidLoc === undefined) ? null : slidLoc;
+      const slidTo = slidLine(locs, spec.line);
       if (slidTo !== null) {
         // V8 slides breakpoints off non-executable lines to the next
         // statement — say so loudly instead of debugging the wrong line.
@@ -724,8 +804,87 @@ class Session {
   }
 
   tabJson() {
+    // Served in `threads` (and snapshots via threadsJson): redacted and
+    // capped like the persisted observed identity — never raw tab text.
     const t = this.tab || {};
-    return { id: t.id || '?', title: t.title || '?', url: t.url || '?' };
+    const safe = (v) => (v === null || v === undefined) ? '?' : truncField(redactUrl(v));
+    return { id: safe(t.id), title: safe(t.title), url: safe(t.url) };
+  }
+
+  /** Build the layered {debuggee, endpoint, adapter} identity from the
+   *  attached tab (protocol-confirmed debuggee) plus the debugger listener
+   *  (endpoint). The tab fields reuse the redacted + capped tab identity;
+   *  the aggregate is bounded here. The `observedTarget` view is untouched. */
+  buildTargetIdentity() {
+    const now = Math.floor(Date.now() / 1000);
+    const obs = (this.cfg && this.cfg.observedTarget) || {};
+    // -- debuggee: the attached tab itself (no process claim, ever).
+    const debuggee = {
+      kind: 'tab',
+      url: (typeof obs.url === 'string') ? obs.url : null,
+      title: (typeof obs.title === 'string') ? obs.title : null,
+      targetId: (typeof obs.targetId === 'string') ? obs.targetId : null,
+      source: 'cdp-target-list',
+      confidence: 'protocol-confirmed',
+      observedAt: now,
+      unavailable: [],
+      notApplicable: ['cwd', 'argv', 'pid', 'executable'],
+    };
+    if (debuggee.url === null && debuggee.title === null && debuggee.targetId === null) {
+      debuggee.confidence = 'unavailable';
+      debuggee.source = null;
+      debuggee.unavailable.push({ field: 'url', reason: 'no /json/list entry observed' });
+    }
+    // -- endpoint: the debugger listener (host/port the CLI attached to).
+    // No OS listener observation exists for browser targets, so the owner
+    // stays honestly unavailable.
+    const endpoint = {
+      host: this.cfg.host || 'localhost',
+      port: (Number.isInteger(this.cfg.port)) ? this.cfg.port : null,
+      debugEndpoint: (typeof obs.debugEndpoint === 'string') ? obs.debugEndpoint : null,
+      role: 'debugger listener (Chrome remote-debugging port)',
+      source: null,
+      confidence: 'unavailable',
+      observedAt: now,
+      unavailable: [{ field: 'ownerPid', reason: 'no OS listener observation for browser targets' }],
+    };
+    // -- adapter: CDP attaches directly to the tab — no adapter process.
+    const adapter = {
+      confidence: 'unavailable',
+      reason: 'no adapter process; CDP attaches directly to the tab',
+      observedAt: now,
+      unavailable: [],
+      notApplicable: ['pid', 'argv', 'cwd', 'executable'],
+    };
+    this.targetIdentity = identShrinkToTotal({ debuggee, endpoint, adapter }, IDENT_TOTAL_CAP);
+    // Debuggee-first one-liner for timeout diagnostics (concise, no
+    // root-cause claim); falls back to the CLI hint when unknown.
+    let hint = '';
+    if (debuggee.confidence === 'protocol-confirmed') {
+      hint = `debuggee: tab ${debuggee.url || debuggee.title || '?'} (protocol-confirmed)`;
+    }
+    if (!hint) hint = this.cfg.observedHint || '';
+    this.identityHint = hint.slice(0, 200);
+    return this.targetIdentity;
+  }
+
+  /** Honest timeout context: the debugger never observes the external
+   *  trigger, so triggerStatus is always unknown; success paths never
+   *  fabricate sent/failed. expectedBreak rides only when the capture
+   *  planted one. */
+  waitContext(timeout, startedAt, expectedBreak) {
+    const ctx = {
+      waitStartedAt: Math.floor(startedAt / 1000),
+      waitedMs: Math.max(0, Date.now() - startedAt),
+      triggerStatus: 'unknown',
+    };
+    if (expectedBreak !== undefined && expectedBreak !== null) {
+      ctx.expectedBreak = expectedBreak;
+    }
+    ctx.targetIdentity = (this.targetIdentity && typeof this.targetIdentity === 'object')
+      ? this.targetIdentity : null;
+    ctx.note = WAIT_NOTE;
+    return ctx;
   }
 
   // -- events (always live: logpoints auto-fire even between commands)
@@ -1018,15 +1177,17 @@ class Session {
   // -- pump: wait for the next stop (events arrive on their own)
 
   timeoutText(timeout) {
-    // Timeout message with the compact observed-identity hint (names the
+    // Timeout message with the compact identity hint (debuggee-first: the
     // tab, never claims root cause).
     let msg = `timeout: no stop within ${fmtTimeout(timeout)}`;
-    if (this.cfg.observedHint) msg += `; ${this.cfg.observedHint}`;
+    const hint = this.identityHint || this.cfg.observedHint;
+    if (hint) msg += `; ${hint}`;
     return msg;
   }
 
-  async pump(timeout) {
-    const deadline = Date.now() + timeout * 1000;
+  async pump(timeout, withWaitContext = false) {
+    const startedAt = Date.now();
+    const deadline = startedAt + timeout * 1000;
     for (;;) {
       if (!amOwner(this.cfg.dir)) {
         await this.cleanup().catch(() => {});
@@ -1035,7 +1196,11 @@ class Session {
       if (this.paused) return 'stopped';
       if (this.exited) throw new BridgeErr(EXITED_MSG);
       if (Date.now() > deadline) {
-        throw new BridgeErr(this.timeoutText(timeout));
+        const err = new StopTimeout(this.timeoutText(timeout));
+        // wait/capture only (never continue/step/reload): the honest
+        // trigger-unknown context rides structurally; prefix unchanged.
+        if (withWaitContext) err.waitContext = this.waitContext(timeout, startedAt);
+        throw err;
       }
       await sleep(50);
     }
@@ -1069,6 +1234,7 @@ class Session {
       port: this.sessionPort, stopped,
       lastStop: this.lastStop, updatedAt: Math.floor(Date.now() / 1000),
       observedTarget: this.cfg.observedTarget || null,
+      targetIdentity: this.targetIdentity || null,
     }));
   }
 
@@ -1143,7 +1309,11 @@ class Session {
 
   threadsJson() {
     const t = this.tab || {};
-    return [{ id: 1, name: t.title || 'tab', current: true }];
+    return [{
+      id: 1,
+      name: truncStr(String(redactUrl(t.title || 'tab')), 60),
+      current: true,
+    }];
   }
 
   async framesJson(withLocals) {
@@ -1413,7 +1583,7 @@ class Session {
   async cmdWait(req, timeout) {
     this.requireLive();
     if (this.paused) return this.waitSnapshot(false);
-    await this.pump(timeout);
+    await this.pump(timeout, true);
     return this.waitSnapshot(true);
   }
 
@@ -1557,7 +1727,7 @@ class Session {
     let token = null;
     if (spec !== null) token = await this.capturePlant(spec);
     try {
-      await this.pump(timeout);
+      await this.pump(timeout, true);
     } catch (e) {
       // Timeout/exit/reload: nothing parked by us — no resume — but the
       // ephemeral must not leak.
@@ -1565,6 +1735,19 @@ class Session {
         await this.captureUnplant(token);
       } catch (ue) {
         throw new BridgeErr(`${(e && e.message) || e}; capture ephemeral may still be planted (breaks remove to clear)`);
+      }
+      // The planted spec rides the honest timeout context (in canonical
+      // field order); other errors pass through untouched.
+      if (e instanceof StopTimeout && spec !== null && e.waitContext && typeof e.waitContext === 'object') {
+        const old = e.waitContext;
+        e.waitContext = {
+          waitStartedAt: old.waitStartedAt,
+          waitedMs: old.waitedMs,
+          triggerStatus: 'unknown',
+          expectedBreak: spec,
+          targetIdentity: old.targetIdentity,
+          note: old.note || WAIT_NOTE,
+        };
       }
       throw e;
     }
@@ -1737,7 +1920,7 @@ class Session {
     const out = {
       ok: true,
       running: !this.paused,
-      threads: [{ id: 1, name: (this.tab && this.tab.title) || 'tab', status: this.paused ? 'paused' : 'running', frames, tab: this.tabJson() }],
+      threads: [{ id: 1, name: truncStr(String(redactUrl((this.tab && this.tab.title) || 'tab')), 60), status: this.paused ? 'paused' : 'running', frames, tab: this.tabJson() }],
     };
     // Idle-but-armed sessions would otherwise leave agents guessing why
     // nothing stops: report what's armed (breaks + logpoints + exc flag).
@@ -1864,10 +2047,10 @@ class Session {
       this.breakIdToRec.set(bpId, { rec, line: f.line });
       this.breakRecByKey.set(`${f.frag}:${f.line}|${f.cond || ''}`, rec);
       const locs = res.locations || [];
-      const slidLoc = (locs.map((l) => l.lineNumber + 1).find((n) => n !== f.line));
-      if (slidLoc !== undefined) {
+      const slidTo = slidLine(locs, f.line);
+      if (slidTo !== null) {
         rec.state = 'slid';
-        rec.detail = `slid to line ${slidLoc}`;
+        rec.detail = `slid to line ${slidTo}`;
       } else {
         rec.state = locs.length > 0 ? 'verified' : 'pending';
         if (rec.state === 'pending') rec.detail = 'no locations yet (script not parsed or line not executable)';
@@ -1914,7 +2097,9 @@ class Session {
     if (Number.isNaN(lineno) || lineno < 1) {
       throw new BridgeErr(`bad break spec: ${JSON.stringify(raw)}`);
     }
-    return { frag: head.slice(0, colon), line: lineno, cond };
+    const frag = normFrag(head.slice(0, colon));
+    if (!frag) throw new BridgeErr(`bad break spec: ${JSON.stringify(raw)}`);
+    return { frag, line: lineno, cond };
   }
 
   breakKeyOf(b) {
@@ -2175,8 +2360,12 @@ async function serve(st, server, queue) {
           return;
         }
         const msg = e instanceof BridgeErr ? e.message : `internal: ${(e && e.message) || e}`;
+        const resp = { ok: false, error: msg, target: 'main' };
+        if (e && e.waitContext && typeof e.waitContext === 'object') {
+          resp.waitContext = e.waitContext;
+        }
         try {
-          await writeFrame(conn, { ok: false, error: msg, target: 'main' });
+          await writeFrame(conn, resp);
         } catch (_) { /* client already gone */ }
       }
     } finally {
@@ -2225,11 +2414,14 @@ async function serve(st, server, queue) {
   }
 }
 
-function writeSessionFile(dir, obj, cfg) {
-  // Main-path session.json writes carry the tab observed identity;
-  // explicit null keeps legacy readers honest.
+function writeSessionFile(dir, obj, cfg, st) {
+  // Main-path session.json writes carry the tab observed identity plus the
+  // layered targetIdentity; explicit null keeps legacy readers honest.
   if (obj && typeof obj === 'object' && !('observedTarget' in obj)) {
     obj = { ...obj, observedTarget: (cfg && cfg.observedTarget) || null };
+  }
+  if (obj && typeof obj === 'object' && !('targetIdentity' in obj)) {
+    obj = { ...obj, targetIdentity: (st && st.targetIdentity) || null };
   }
   writeFile(path.join(dir, 'session.json'), JSON.stringify(obj));
 }
@@ -2308,7 +2500,7 @@ async function main(argv) {
     writeSessionFile(cfg.dir, {
       name: path.basename(cfg.dir), kind: cfg.kind, port, stopped: false,
       lastStop: st.lastStop, updatedAt: Math.floor(Date.now() / 1000),
-    }, cfg);
+    }, cfg, st);
     try {
       await serve(st, server, queue);
     } finally {

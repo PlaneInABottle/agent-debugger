@@ -345,6 +345,25 @@ class UxLiveTests(unittest.TestCase):
         cerr = self.cli(name, "capture", "--break", never, "--timeout", "2",
                         timeout=15, ok=False)
         self.assertIn("timeout: no stop within 2s", cerr["error"])
+        # Honest timeout context: the external trigger is never observed,
+        # so triggerStatus stays unknown (never sent/failed); expectedBreak
+        # rides only the capture; the layered identity rides both.
+        for e, want_break in ((err, None), (cerr, never)):
+            wc = e.get("waitContext")
+            self.assertIsNotNone(wc, f"waitContext rides the timeout: {e}")
+            self.assertEqual(wc.get("triggerStatus"), "unknown")
+            self.assertIn("not observed", wc.get("note", ""))
+            ti = wc.get("targetIdentity")
+            self.assertIsInstance(ti, dict, f"identity rides the timeout: {wc}")
+            self.assertIn("debuggee", ti)
+            self.assertIn("endpoint", ti)
+            self.assertIn("adapter", ti)
+            if want_break is None:
+                self.assertNotIn("expectedBreak", wc)
+            else:
+                self.assertEqual(wc.get("expectedBreak"), want_break)
+        alive = self.cli(name, "threads", timeout=20)
+        self.assertTrue(alive["running"], "session remains armed after timeouts")
         stops = self.cli(name, "breaks", timeout=20)["stops"]
         self.assertEqual(len(stops), 1, stops)
         never_line = never.rsplit(":", 1)[1]
@@ -542,8 +561,26 @@ class UxLiveTests(unittest.TestCase):
         self.assertEqual(stops, [], "ephemeral removed despite disconnect")
         # No lingering park from the killed capture: with nothing armed the
         # next wait is a clean typed timeout, never a stale suspended reuse.
-        live = self.cli(name, "wait", "--timeout", "2", timeout=15, ok=False)
-        self.assertIn("timeout", live.get("error", ""), live)
+        # Latent race: `threads` above is synthetic-running while the killed
+        # capture's outstanding cleanup tail remains, so this wait may
+        # correctly busy-reject. Bounded retry on the exact outstanding
+        # verdict only (never a stopped/wait success); a persisting busy
+        # still fails.
+        deadline = time.monotonic() + 20
+        while True:
+            live = self.cli(name, "wait", "--timeout", "2", timeout=15,
+                            ok=False)
+            err = live.get("error", "")
+            if "timeout" in err:
+                break
+            # The killed op is capture, so `busy: capture outstanding ...`
+            # is the expected transient; any busy-outstanding verdict
+            # retries the same way (never a stopped/wait success).
+            self.assertIn("busy", err, live)
+            self.assertIn("outstanding", err, live)
+            if time.monotonic() > deadline:
+                self.fail(f"{lang} capture outstanding never cleared: {err}")
+            time.sleep(0.2)  # scheduler yield, bounded above
         self.close(name)
 
     def test_39_py_disconnect_resumes(self):
@@ -615,6 +652,32 @@ class UxLiveTests(unittest.TestCase):
         pre = self.cli(name, "capture", "--timeout", "10", timeout=20)
         self.assertTrue(pre["targetWasPaused"])
         self.assertFalse(pre["resumed"])
+        # Timeout honesty on the running tab: drop the persistent break,
+        # run free, then wait/capture into typed timeouts with the
+        # trigger-unknown waitContext (never a root-cause claim).
+        self.cli(name, "breaks", "remove", "--break", brk, timeout=20)
+        free = self.cli(name, "continue", "--timeout", "3", timeout=15,
+                        ok=False)
+        self.assertIn("timeout", free.get("error", ""), free)
+        werr = self.cli(name, "wait", "--timeout", "2", timeout=15, ok=False)
+        self.assertIn("timeout: no stop within 2s", werr["error"])
+        wc = werr.get("waitContext")
+        self.assertIsNotNone(wc, f"waitContext rides the timeout: {werr}")
+        self.assertEqual(wc.get("triggerStatus"), "unknown")
+        self.assertNotIn("expectedBreak", wc)
+        self.assertEqual(wc.get("targetIdentity", {}).get("debuggee", {}).get("kind"), "tab")
+        never = "missing.js:3"
+        cerr = self.cli(name, "capture", "--break", never, "--timeout", "2",
+                        timeout=15, ok=False)
+        self.assertIn("timeout: no stop within 2s", cerr["error"])
+        cwc = cerr.get("waitContext")
+        self.assertIsNotNone(cwc, f"waitContext rides the timeout: {cerr}")
+        self.assertEqual(cwc.get("triggerStatus"), "unknown")
+        self.assertEqual(cwc.get("expectedBreak"), never)
+        stops = self.cli(name, "breaks", timeout=20)["stops"]
+        self.assertEqual(stops, [], "timeout leaks no ephemeral")
+        self.assertTrue(self.cli(name, "threads", timeout=20)["running"],
+                        "session remains armed after timeouts")
         self.close(name)
 
 

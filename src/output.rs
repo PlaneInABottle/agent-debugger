@@ -34,14 +34,31 @@ pub fn emit(command: &str, result: anyhow::Result<Value>, human: bool) -> i32 {
             }
         }
         Err(e) => {
+            // A bridge failure may carry additive structured context
+            // (wait/capture timeouts carry `waitContext`); the message
+            // stays the display string, the context rides alongside.
+            let wait_context = e
+                .downcast_ref::<crate::session::BridgeFailure>()
+                .and_then(|b| b.wait_context.clone());
             if human {
                 let _ = writeln!(std::io::stderr(), "error: {e:#}");
+                if let Some(ctx) = &wait_context {
+                    match serde_json::to_string_pretty(&serde_json::json!({"waitContext": ctx})) {
+                        Ok(pretty) => {
+                            let _ = writeln!(std::io::stderr(), "{pretty}");
+                        }
+                        Err(_) => {}
+                    }
+                }
             } else {
-                let envelope = serde_json::json!({
+                let mut envelope = serde_json::json!({
                     "ok": false,
                     "command": command,
                     "error": format!("{e:#}"),
                 });
+                if let Some(ctx) = wait_context {
+                    envelope["waitContext"] = ctx;
+                }
                 let code = write_stdout(format!("{envelope}\n"), 1);
                 return code;
             }

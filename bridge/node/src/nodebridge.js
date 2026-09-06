@@ -22,10 +22,10 @@
  * an unresolvable scope, or silent misses). Prefer frame-locals in `|cond`;
  * use a plain line break + eval for anything captured.
  *
- * worker_threads: the MAIN thread only. Worker code runs on separate
- * inspector targets (CDP Target domain) which this bridge does not follow —
- * same boundary as subprocesses in the other adapters. Breakpoints on
- * worker-only lines never hit (plain timeout, not an error).
+ * worker_threads: opt-in multi-target via --workers (launch only, default
+ *  is main-only). Each worker is its own NodeWorker CDP session with the
+ *  global break intent planted as inherited copies; worker-only lines need
+ *  the flag to ever hit (plain main-only timeout otherwise, not an error).
  *
  * Two spike-proven rules shape the handshake: breakpoints go in BEFORE
  * Runtime.runIfWaitingForDebugger (else they sit pending), and scriptId->url
@@ -434,6 +434,133 @@ function truncStr(s, limit = MAX_STRING) {
   return `${s.slice(0, limit)}… (+${s.length - limit} more chars)`;
 }
 
+// ---------------------------------------------------------------- layered target identity (M-ID)
+// Additive `{debuggee, endpoint, adapter}` roles beside the untouched
+// `observedTarget`. Confidence is strict: protocol-confirmed only from the
+// `/json/list` entry; os-corroborated only for the OS-observed listener
+// owner; everything else is unavailable (never guessed, no parent-tree
+// inference). The inspector runs in-process, so the adapter role is always
+// unavailable-by-design. Every new string is redacted + capped before
+// persistence or output; env is never collected.
+const IDENT_FIELD_CAP = 512;   // per-field chars (matches the CLI cap)
+const IDENT_ROLE_CAP = 2048;   // per-role serialized chars
+const IDENT_TOTAL_CAP = 4096;  // aggregate chars over the three roles
+const IDENT_ARRAY_CAP = 32;    // elements per array (head kept, tail marked)
+
+const WAIT_NOTE = 'external trigger execution is not observed by the debugger; ' +
+  'this timeout means no stop was observed, not that the code is unreachable';
+
+const IDENT_SECRET_SUBSTR = ['password', 'passwd', 'secret', 'apikey',
+  'authorization', 'authtoken', 'accesstoken'];
+const IDENT_SECRET_TOKEN = ['token', 'auth', 'pwd', 'pass', 'pw'];
+
+function identIsSecretFlag(flag) {
+  const t = String(flag).replace(/^-+/, '').toLowerCase();
+  const flat = t.replace(/[-_]/g, '');
+  if (IDENT_SECRET_SUBSTR.some((k) => flat.includes(k))) return true;
+  return t.replace(/[_.]/g, '-').split('-')
+    .some((tok) => IDENT_SECRET_TOKEN.some((k) => tok === k || tok.endsWith(k)));
+}
+
+function redactIdentityArgv(argv) {
+  const out = [];
+  let skipNext = false;
+  for (const a of argv || []) {
+    if (typeof a !== 'string') continue;
+    if (skipNext) {
+      skipNext = false;
+      if (!(a.startsWith('-') && a.length > 1)) {
+        out.push('[redacted]');
+        continue;
+      }
+    }
+    const eq = a.indexOf('=');
+    const co = a.indexOf(':');
+    let split = -1;
+    if (eq > 0) split = eq;
+    if (co > 0 && (split < 0 || co < split)) split = co;
+    if (split > 0) {
+      const head = a.slice(0, split);
+      out.push(identIsSecretFlag(head) ? `${head}${a[split]}[redacted]` : a);
+    } else {
+      out.push(a);
+      if (identIsSecretFlag(a)) skipNext = true;
+    }
+  }
+  return out;
+}
+
+function identCapStr(s, limit = IDENT_FIELD_CAP) {
+  if (typeof s !== 'string') return s;
+  if (s.length <= limit) return s;
+  return `${s.slice(0, limit)}… (+${s.length - limit} more chars)`;
+}
+
+function identCapWalk(v) {
+  if (typeof v === 'string') return identCapStr(v);
+  if (Array.isArray(v)) {
+    let arr = v;
+    if (arr.length > IDENT_ARRAY_CAP) {
+      arr = arr.slice(0, IDENT_ARRAY_CAP).concat([`… (+${arr.length - IDENT_ARRAY_CAP} more)`]);
+    }
+    return arr.map(identCapWalk);
+  }
+  if (v && typeof v === 'object') {
+    const o = {};
+    for (const k of Object.keys(v)) o[k] = identCapWalk(v[k]);
+    return o;
+  }
+  return v;
+}
+
+function identShrinkToTotal(obj, totalCap) {
+  let passes = 0;
+  const longestPath = (v, prefix) => {
+    let best = null;
+    if (typeof v === 'string' && v.length > 1) best = { path: prefix, len: v.length };
+    const kids = Array.isArray(v) ? v.map((e, i) => [e, prefix.concat([i])])
+      : (v && typeof v === 'object') ? Object.keys(v).map((k) => [v[k], prefix.concat([k])]) : [];
+    for (const [e, p] of kids) {
+      const cand = longestPath(e, p);
+      if (cand && (!best || cand.len > best.len)) best = cand;
+    }
+    return best;
+  };
+  const getAt = (root, path) => path.reduce((o, p) => o[p], root);
+  const setAt = (root, path, val) => {
+    const parent = getAt(root, path.slice(0, -1));
+    parent[path[path.length - 1]] = val;
+  };
+  while (JSON.stringify(obj).length > totalCap && passes < 4096) {
+    passes += 1;
+    const hit = longestPath(obj, []);
+    if (!hit) break;
+    const cur = getAt(obj, hit.path);
+    const cand = identCapStr(cur, Math.max(1, hit.len - 64));
+    setAt(obj, hit.path, cand.length < hit.len ? cand : '…');
+  }
+  return obj;
+}
+
+function identCapRole(role) {
+  return identShrinkToTotal(identCapWalk(role), IDENT_ROLE_CAP);
+}
+
+function identCapIdentity(ident) {
+  const capped = {};
+  for (const k of Object.keys(ident)) {
+    capped[k] = (ident[k] && typeof ident[k] === 'object') ? identCapRole(ident[k]) : ident[k];
+  }
+  return identShrinkToTotal(capped, IDENT_TOTAL_CAP);
+}
+
+function identRoleUnavailable(reason) {
+  return {
+    confidence: 'unavailable', reason,
+    observedAt: Math.floor(Date.now() / 1000), unavailable: [],
+  };
+}
+
 // ---------------------------------------------------------------- CDP conn
 
 function loadWs() {
@@ -521,6 +648,16 @@ function escapeRegex(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/** Slide target: the line V8 actually bound, or null when the record must
+ *  NOT read slid — no locations (pending) or ANY location on the requested
+ *  line (multi-location replies where one leg hit home). Only when every
+ *  returned location differs did the breakpoint truly move. */
+function slidLine(locs, line) {
+  if (!locs || locs.length === 0) return null;
+  if (locs.some((l) => l.lineNumber + 1 === line)) return null;
+  return locs[0].lineNumber + 1;
+}
+
 class Session {
   constructor(cfg) {
     this.cfg = cfg;
@@ -572,6 +709,13 @@ class Session {
     this.lastDiag = null; // {target,stopId,sameLocation,sameThread,elapsedMs,atMs}
     this.serving = 'main';        // target id of the in-flight command
     this.pendingTarget = null;    // resume-wait owner for error attribution
+    // -- layered target identity (M-ID): the kept /json/list entry (debuggee,
+    // protocol-confirmed) plus the CLI-supplied OS listener observation
+    // (endpoint, os-corroborated). Built at handshake; published redacted +
+    // capped in session.json. No OS pid is ever claimed as the debuggee.
+    this.attachEntry = null;      // {id,title,url,type} kept from /json/list
+    this.targetIdentity = null;   // {debuggee,endpoint,adapter} or null
+    this.identityHint = '';       // debuggee-first one-liner for timeouts
     // -- M5 concurrency: outstanding resume ops by target (tid -> cmd);
     // live reads bypass everything below and serve published state.
     this.outstanding = new Map();
@@ -833,6 +977,7 @@ class Session {
       selected: this.resolveTarget({}),
       ignored: this.ignoredWorkers,
       droppedExited: this.droppedWorkerExited,
+      targetIdentity: this.targetIdentity || null,
     }, 'main');
   }
 
@@ -944,6 +1089,157 @@ class Session {
     }
   }
 
+  /** Fetch the raw `/json/list` entries for a devtools port (best-effort,
+   *  short timeout). Returns the parsed array or null — never throws, so a
+   *  missing list degrades the debuggee role to unavailable, never the
+   *  attach/launch itself. */
+  async fetchTargetList(host, port) {
+    const url = `http://${host}:${port}/json/list`;
+    const body = await new Promise((resolve) => {
+      const req = http.get(url, { timeout: 2000 }, (res) => {
+        let raw = '';
+        res.on('data', (d) => { raw += d; });
+        res.on('end', () => resolve(raw));
+      });
+      req.on('timeout', () => {
+        req.destroy();
+        resolve(null);
+      });
+      req.on('error', () => resolve(null));
+    });
+    if (typeof body !== 'string') return null;
+    try {
+      const parsed = JSON.parse(body);
+      return Array.isArray(parsed) ? parsed : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /** Pick the node inspector entry by the same rule as attach (first node
+   *  entry with a debugger URL, else first entry with one). The entry is
+   *  the protocol-confirmed debuggee identity — never discarded. */
+  pickTargetEntry(targets) {
+    return (targets || []).find((t) => t && t.type === 'node' && t.webSocketDebuggerUrl)
+      || (targets || []).find((t) => t && t.webSocketDebuggerUrl)
+      || null;
+  }
+
+  /** Adopt the launch target's /json/list entry (best-effort, bounded).
+   *  The inspector port is parsed from the ws:// URL stderr gave us; only
+   *  an entry serving that exact URL — or the sole entry on a fresh port —
+   *  is adopted, so a shared inspector is never misattributed. */
+  async adoptLaunchEntry(wsUrl) {
+    try {
+      const m = String(wsUrl || '').match(/^ws:\/\/([^/:]+):(\d+)/);
+      if (!m) return;
+      const list = await this.fetchTargetList(m[1], Number(m[2]));
+      if (!list || list.length === 0) return;
+      let node = list.find((t) => t && t.webSocketDebuggerUrl === wsUrl) || null;
+      if (!node && list.length === 1) node = this.pickTargetEntry(list);
+      if (!node) return;
+      this.attachEntry = {
+        id: node.id || null,
+        title: node.title || null,
+        url: node.url || null,
+        type: node.type || null,
+      };
+    } catch (_) { /* unavailable, never fatal */ }
+  }
+
+  /** Build the layered {debuggee, endpoint, adapter} identity from the kept
+   *  /json/list entry (protocol-confirmed debuggee) plus the CLI-supplied
+   *  OS listener observation (os-corroborated endpoint). No OS pid is ever
+   *  presented as the debuggee; the `observedTarget` view is untouched.
+   *  Everything is redacted + capped here, before any publish. */
+  buildTargetIdentity() {
+    const now = Math.floor(Date.now() / 1000);
+    const obs = (this.cfg && this.cfg.observedTarget) || {};
+    const pid = (typeof obs.pid === 'number') ? obs.pid : null;
+    const source = (typeof obs.source === 'string') ? obs.source : null;
+    const obsArgv = Array.isArray(obs.argv)
+      ? redactIdentityArgv(obs.argv.filter((a) => typeof a === 'string')) : null;
+    // -- debuggee: only the /json/list entry confirms it (it carries no
+    // pid, so none is ever claimed here).
+    const e = this.attachEntry || {};
+    let debuggee;
+    if (e.url || e.title || e.id) {
+      debuggee = {
+        kind: 'process', title: e.title || null, url: e.url || null,
+        targetId: e.id || null, source: 'cdp-target-list',
+        confidence: 'protocol-confirmed', observedAt: now, unavailable: [],
+      };
+      if (e.id == null) {
+        debuggee.unavailable.push({ field: 'targetId', reason: 'target list entry carries no id' });
+      }
+    } else {
+      debuggee = {
+        kind: 'process', title: null, url: null, targetId: null, source: null,
+        confidence: 'unavailable', observedAt: now,
+        unavailable: [{ field: 'title', reason: 'no /json/list entry observed' }],
+      };
+    }
+    // -- endpoint: host/port/ws of the inspector. The V8 inspector lives in
+    // the debuggee process itself (no adapter in between); the OS owner pid
+    // corroborates at most, never confirms.
+    let port = null;
+    if (this.cfg.kind === 'attach' && Number.isInteger(this.cfg.port)) {
+      port = this.cfg.port;
+    } else {
+      const m = String(this.mainWsUrl || '').match(/^ws:\/\/[^/:]+:(\d+)/);
+      if (m) port = Number(m[1]);
+    }
+    const endpoint = {
+      host: this.cfg.host || 'localhost', port,
+      wsUrl: this.mainWsUrl || null,
+      ownerPid: pid,
+      executable: (typeof obs.executable === 'string') ? obs.executable : null,
+      argv: obsArgv,
+      cwd: (typeof obs.cwd === 'string') ? obs.cwd : null,
+      role: 'inspector endpoint (served in-process by the debuggee)',
+      source, confidence: pid !== null ? 'os-corroborated' : 'unavailable',
+      observedAt: now,
+      unavailable: pid !== null ? []
+        : [{ field: 'ownerPid', reason: 'no independent pid source' }],
+    };
+    // -- adapter: the inspector runs in-process — there is no separate
+    // adapter process by design.
+    const adapter = {
+      inProcess: true, confidence: 'unavailable',
+      reason: 'inspector runs in-process; no separate adapter process',
+      observedAt: now, unavailable: [],
+    };
+    this.targetIdentity = identCapIdentity({ debuggee, endpoint, adapter });
+    // Debuggee-first one-liner for timeout diagnostics (concise, no
+    // root-cause claim); falls back to the CLI hint when unknown.
+    let hint = '';
+    if (debuggee.confidence === 'protocol-confirmed') {
+      hint = `debuggee: ${debuggee.title || debuggee.url || '?'} (protocol-confirmed)`;
+    }
+    if (!hint) hint = this.cfg.observedHint || '';
+    this.identityHint = hint.slice(0, 200);
+    return this.targetIdentity;
+  }
+
+  /** Honest timeout context: the debugger never observes the external
+   *  trigger, so triggerStatus is always unknown; success paths never
+   *  fabricate sent/failed. expectedBreak rides only when the capture
+   *  planted one. */
+  waitContext(timeout, startedAt, expectedBreak) {
+    const ctx = {
+      waitStartedAt: Math.floor(startedAt / 1000),
+      waitedMs: Math.max(0, Date.now() - startedAt),
+      triggerStatus: 'unknown',
+    };
+    if (expectedBreak !== undefined && expectedBreak !== null) {
+      ctx.expectedBreak = expectedBreak;
+    }
+    ctx.targetIdentity = (this.targetIdentity && typeof this.targetIdentity === 'object')
+      ? this.targetIdentity : null;
+    ctx.note = WAIT_NOTE;
+    return ctx;
+  }
+
   async discoverAttach() {
     const url = `http://${this.cfg.host}:${this.cfg.port}/json/list`;
     const body = await new Promise((resolve, reject) => {
@@ -968,9 +1264,16 @@ class Session {
     } catch (_) {
       throw new BridgeErr(`attach failed: ${url} did not return target list`);
     }
-    const node = (targets || []).find((t) => t.type === 'node' && t.webSocketDebuggerUrl)
-      || (targets || []).find((t) => t.webSocketDebuggerUrl);
+    const node = this.pickTargetEntry(targets);
     if (!node) throw new BridgeErr(`attach failed: no debuggable target at ${url}`);
+    // Keep the selected entry: title/url/id is the protocol-confirmed
+    // debuggee identity (it carries no pid — none is ever claimed).
+    this.attachEntry = {
+      id: (node && node.id) || null,
+      title: (node && node.title) || null,
+      url: (node && node.url) || null,
+      type: (node && node.type) || null,
+    };
     return node.webSocketDebuggerUrl;
   }
 
@@ -1012,10 +1315,17 @@ class Session {
     let wsUrl;
     if (this.cfg.kind === 'launch') {
       wsUrl = await this.startTarget();
+      // Best-effort debuggee entry for launch too (same /json/list source
+      // as attach): absence degrades the role, never the launch.
+      await this.adoptLaunchEntry(wsUrl);
     } else {
       wsUrl = await this.discoverAttach();
     }
     await this.connect(wsUrl);
+    // The identity needs the connected debugger URL (launch endpoint
+    // port/ws): build once mainWsUrl is known, before any user-visible
+    // completion.
+    this.buildTargetIdentity();
     await this.cdp.request('Debugger.enable');
     // Runtime.enable is not for evaluation — it arms the
     // executionContextDestroyed event, the ONLY signal that a launched
@@ -1117,8 +1427,7 @@ class Session {
         const msg = `breakpoint unverified (pending): ${spec.path}:${spec.line}`;
         process.stderr.write(`warn: ${msg}\n`);
       }
-      const slidLoc = (locs.map((l) => l.lineNumber + 1).find((n) => n !== spec.line));
-      const slidTo = (slidLoc === undefined) ? null : slidLoc;
+      const slidTo = slidLine(locs, spec.line);
       if (slidTo !== null) {
         // V8 slides breakpoints off non-executable lines (e.g. `}`) to the
         // next statement — possibly another scope where conditions/holes
@@ -1479,11 +1788,16 @@ class Session {
     } catch (e) {
       process.stderr.write(`warn: worker ${id} inherit failed: ${(e && e.message) || e}\n`);
     }
+    // Admission recheck: the worker may have detached while the plant
+    // awaits ran (detachedFromWorker retires the table entry). A stale
+    // admission must neither resume a dead session nor mark itself running.
+    if (this.workerTable.get(id) !== w) return;
     await this.workerSend(w, 'Debugger.resume', {}, 5000).catch(() => {});
     // Belt-and-braces: a worker that reached waitForDebugger before our
     // resume may also need the run gate lifted (main uses
     // Runtime.runIfWaitingForDebugger for the same purpose).
     await this.workerSend(w, 'Runtime.runIfWaitingForDebugger', {}, 5000).catch(() => {});
+    if (this.workerTable.get(id) !== w) return;
     w.state = 'running';
     process.stderr.write(`target: ${id} attached (${info.url || 'worker'})\n`);
   }
@@ -1542,12 +1856,12 @@ class Session {
       // untouched, like main).
       this.breakIdToRec.set(bpId, { rec, line: spec.line });
       const locs = res.locations || [];
-      const slidLoc = (locs.map((l) => l.lineNumber + 1).find((n) => n !== spec.line));
-      if (slidLoc !== undefined) {
+      const slidTo = slidLine(locs, spec.line);
+      if (slidTo !== null) {
         rec.state = 'slid';
         rec.detail = kind === 'logpoint'
-          ? `${spec.template} (slid to line ${slidLoc})`
-          : `slid to line ${slidLoc}`;
+          ? `${spec.template} (slid to line ${slidTo})`
+          : `slid to line ${slidTo}`;
       } else {
         rec.state = locs.length > 0 ? 'verified' : 'pending';
         if (rec.state === 'pending' && kind === 'break') {
@@ -1812,15 +2126,17 @@ class Session {
   // -- pump: wait for the next stop (events arrive on their own)
 
   timeoutText(timeout) {
-    // Timeout message with the compact observed-identity hint (names the
-    // target, never claims root cause).
+    // Timeout message with the compact identity hint (debuggee-first, names
+    // the target, never claims root cause).
     let msg = `timeout: no stop within ${fmtTimeout(timeout)}`;
-    if (this.cfg.observedHint) msg += `; ${this.cfg.observedHint}`;
+    const hint = this.identityHint || this.cfg.observedHint;
+    if (hint) msg += `; ${hint}`;
     return msg;
   }
 
-  async pump(timeout) {
-    const deadline = Date.now() + timeout * 1000;
+  async pump(timeout, withWaitContext = false) {
+    const startedAt = Date.now();
+    const deadline = startedAt + timeout * 1000;
     for (;;) {
       if (!amOwner(this.cfg.dir)) {
         await this.cleanup().catch(() => {});
@@ -1831,7 +2147,11 @@ class Session {
       if (this.paused || this.liveWorkers().some((w) => w.paused)) return 'stopped';
       if (this.exited) throw new BridgeErr('target exited');
       if (Date.now() > deadline) {
-        throw new StopTimeout(this.timeoutText(timeout));
+        const err = new StopTimeout(this.timeoutText(timeout));
+        // wait/capture only (never continue/step): the honest trigger-
+        // unknown context rides structurally; the prefix is unchanged.
+        if (withWaitContext) err.waitContext = this.waitContext(timeout, startedAt);
+        throw err;
       }
       await sleep(50);
     }
@@ -1884,6 +2204,7 @@ class Session {
       port: this.sessionPort, stopped,
       lastStop: this.lastStop, updatedAt: Math.floor(Date.now() / 1000),
       observedTarget: this.cfg.observedTarget || null,
+      targetIdentity: this.targetIdentity || null,
     }));
   }
 
@@ -2250,7 +2571,7 @@ class Session {
     if (parked) {
       return this.withTarget(tid, async () => this.waitSnapshot(tid, false));
     }
-    await this.pump(timeout);
+    await this.pump(timeout, true);
     let stopped = this.lastParkTarget || 'main';
     if (stopped !== 'main' && !this.workerTable.has(stopped)) stopped = tid;
     return this.withTarget(stopped, async () => this.waitSnapshot(stopped, true));
@@ -2408,7 +2729,7 @@ class Session {
     let token = null;
     if (spec !== null) token = await this.capturePlant(tid, spec);
     try {
-      await this.pump(timeout);
+      await this.pump(timeout, true);
     } catch (e) {
       // Timeout/exit: nothing parked by us — no resume — but the ephemeral
       // must not leak.
@@ -2416,6 +2737,19 @@ class Session {
         await this.captureUnplant(token);
       } catch (ue) {
         throw new BridgeErr(`${(e && e.message) || e}; capture ephemeral may still be planted (breaks remove --target ${tid} to clear)`);
+      }
+      // The planted spec rides the honest timeout context (in canonical
+      // field order); other errors pass through untouched.
+      if (e instanceof StopTimeout && spec !== null && e.waitContext && typeof e.waitContext === 'object') {
+        const old = e.waitContext;
+        e.waitContext = {
+          waitStartedAt: old.waitStartedAt,
+          waitedMs: old.waitedMs,
+          triggerStatus: 'unknown',
+          expectedBreak: spec,
+          targetIdentity: old.targetIdentity,
+          note: old.note || WAIT_NOTE,
+        };
       }
       throw e;
     }
@@ -2749,10 +3083,10 @@ class Session {
       this.breakIdToRec.set(bpId, { rec, line: f.line });
       this.breakRecByKey.set(`${f.path}:${f.line}|${f.cond || ''}`, rec);
       const locs = res.locations || [];
-      const slidLoc = (locs.map((l) => l.lineNumber + 1).find((n) => n !== f.line));
-      if (slidLoc !== undefined) {
+      const slidTo = slidLine(locs, f.line);
+      if (slidTo !== null) {
         rec.state = 'slid';
-        rec.detail = `slid to line ${slidLoc}`;
+        rec.detail = `slid to line ${slidTo}`;
       } else {
         rec.state = locs.length > 0 ? 'verified' : 'pending';
         if (rec.state === 'pending') rec.detail = 'no locations yet (script not parsed or line not executable)';
@@ -2822,12 +3156,11 @@ class Session {
       this.breakIdToRec.set(bpId, { rec, line: f.line });
       w.breakKeys.set(`${f.path}:${f.line}|${f.cond || ''}`, bpId);
       w.breakRecByKey.set(`${f.path}:${f.line}|${f.cond || ''}`, rec);
-      w.breakRecByKey.set(`${f.path}:${f.line}|${f.cond || ''}`, rec);
       const locs = res.locations || [];
-      const slidLoc = (locs.map((l) => l.lineNumber + 1).find((n) => n !== f.line));
-      if (slidLoc !== undefined) {
+      const slidTo = slidLine(locs, f.line);
+      if (slidTo !== null) {
         rec.state = 'slid';
-        rec.detail = `slid to line ${slidLoc}`;
+        rec.detail = `slid to line ${slidTo}`;
       } else {
         rec.state = locs.length > 0 ? 'verified' : 'pending';
         if (rec.state === 'pending') rec.detail = 'no locations yet (script not parsed or line not executable)';
@@ -3421,8 +3754,12 @@ async function serve(st, server, queue) {
         }
         const msg = e instanceof BridgeErr ? e.message : `internal: ${(e && e.message) || e}`;
         const target = (st && (st.pendingTarget || st.serving)) || 'main';
+        const resp = { ok: false, error: msg, target };
+        if (e && e.waitContext && typeof e.waitContext === 'object') {
+          resp.waitContext = e.waitContext;
+        }
         try {
-          await writeFrame(conn, { ok: false, error: msg, target });
+          await writeFrame(conn, resp);
         } catch (_) { /* client already gone */ }
       }
     } finally {
@@ -3473,11 +3810,15 @@ async function serve(st, server, queue) {
   }
 }
 
-function writeSessionFile(dir, obj, cfg) {
+function writeSessionFile(dir, obj, cfg, st) {
   // Main-path session.json writes carry the redacted observed identity
-  // (CLI-computed); explicit null keeps legacy readers honest.
+  // (CLI-computed) plus the layered targetIdentity (bridge-built); explicit
+  // nulls keep legacy readers honest.
   if (obj && typeof obj === 'object' && !('observedTarget' in obj)) {
     obj = { ...obj, observedTarget: (cfg && cfg.observedTarget) || null };
+  }
+  if (obj && typeof obj === 'object' && !('targetIdentity' in obj)) {
+    obj = { ...obj, targetIdentity: (st && st.targetIdentity) || null };
   }
   writeFile(path.join(dir, 'session.json'), JSON.stringify(obj));
 }
@@ -3577,7 +3918,7 @@ async function main(argv) {
           writeSessionFile(cfg.dir, {
             name: path.basename(cfg.dir), kind: cfg.kind, port, stopped: false,
             lastStop: st.lastStop, updatedAt: Math.floor(Date.now() / 1000),
-          }, cfg);
+          }, cfg, st);
           try {
             await serve(st, server, queue);
           } finally {
@@ -3590,7 +3931,7 @@ async function main(argv) {
           writeSessionFile(cfg.dir, {
             name: path.basename(cfg.dir), kind: cfg.kind, port, stopped: false,
             lastStop: st.lastStop, updatedAt: Math.floor(Date.now() / 1000),
-          }, cfg);
+          }, cfg, st);
           try {
             await serve(st, server, queue);
           } finally {
@@ -3605,7 +3946,7 @@ async function main(argv) {
       name: path.basename(cfg.dir), kind: cfg.kind, port,
       stopped: !!(st.paused || st.anyWorkerParked()),
       lastStop: st.lastStop, updatedAt: Math.floor(Date.now() / 1000),
-    }, cfg);
+    }, cfg, st);
     try {
       await serve(st, server, queue);
     } finally {

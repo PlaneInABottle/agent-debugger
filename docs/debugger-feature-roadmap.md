@@ -417,3 +417,114 @@ Kullanıcı niyeti: attach hangi program/process'i seçtiğini göstermiyor; ayn
   must not resume (test sequencing must free-run first); node/browser
   bridge sources are embedded at compile time (`cargo build` refreshes
   live sessions).
+
+## Tasarım Notu (BRAINSTORM — implementasyon yok): Endpoint–Adapter–Debuggee Ayrımı + Dürüst Capture-Timeout Nedenselliği
+
+> Statü: **tasarım önerisi, dondurulmadı; kod/test/skill değişikliği YOK.** Bu bölüm yalnızca analiz + önerilen MVP + ertelenenleri dondurur. M-I'in genelleştirilmiş devamıdır (M-I metni değişmez). Tetikleyici: katmanlı launch (`uv run --with debugpy python -m debugpy ... -m uvicorn` benzeri) sonrası `attach.observedTarget.argv` debugpy adapter/site-packages'i gösterdi, `uvicorn`/uygulama dosyasını değil — M-I'in "yanlış-process attach'i belli etme" niyeti sarılı launch'ta zayıflıyor. Hedef: dilden bağımsız (mümkün yerde) endpoint/adapter/debuggee ayrımı + trigger'ı göremeyen debugger'ın timeout'ta yalan söylememesi.
+
+### Kanıtlanmış Gerçekler (prob + doküman + repo)
+
+- **F1 — debugpy `--listen` portunu ADAPTER tutar, debuggee değil.** Canlı prob (provisioned venv, debugpy 1.8.21; stdlib wrapper `exec: python -m debugpy --listen 127.0.0.1:5788 --wait-for-client srv.py`): `lsof -iTCP:5788 -sTCP:LISTEN` → PID_A, argv `.../site-packages/debugpy/adapter --for-server ...` (adapter); gerçek debuggee ayrı süreç PID_S, argv `-m debugpy --listen ... srv.py`. Yani bugünkü `attach_observed` (`src/session.rs:700-753` + `port_lookup`: Linux `803-832`, macOS `891-933`; çağrı `src/spawn.rs:329-331`) endpoint-sahibini (adapter) adlandırır, debuggee'yi değil. Kullanıcının `uv`-sarılı gözlemiyle aynı kök-neden (bir katman daha wrapper ile).
+- **F2 — DAP `process` olayı attach'ta debuggee'yi söyler.** Aynı proba ham DAP istemcisiyle attach (`initialize`→`attach`→`configurationDone`): `attach` yanıtından HEMEN sonra `event/process` geldi, gövde `{name: "<...>/srv.py", systemProcessId: <PID_S>, isLocalProcess: true, startMethod: "attach"}` — `systemProcessId` adapter değil debuggee PID'idir. Spec: DAP `ProcessEvent {name, systemProcessId?, isLocalProcess?, startMethod?: launch|attach|attachForSuspendedLaunch, pointerSize?}` (Context7 `/websites/microsoft_github_io_debug-adapter-protocol`). debugpy tarafı: `debugpyAttach` gövde-verbatim attach kuralı M0'da donduruldu; adapter bağlantı-sayar, olay kök-bağlantıdan gelir (`doc/Subprocess debugging.md`, Context7 `/microsoft/debugpy`).
+- **F3 — pybridge `process` olayını bugün düşürüyor.** `_handle_main_event` (`bridge/py/src/pybridge.py:2224-2317`) dalları yalnızca `debugpyAttach`/`stopped`/`continued`/`exited`/`terminated`/`output`; `process` dalı yok → `return None`. Zenginleşme noktası: `handshake_attach` (`:1322-1338`) `attach` yanıtını `configurationDone` SONRASI drene eder; `process` olayı o sırada stash'te ya da hemen sonra gelir → ilk stop/attach yanıtından ÖNCE sınırlı bekleyişle yakalanabilir (launch tarafı simetriği `_drain_launch_response`, `:1319-1320`).
+- **F4 — Node `/json/list` girdisi debuggee kimliğidir ama bugün atılıyor.** Canlı prob (node v26.8.1, `--inspect-brk`): girdi `{id, type: "node", title: "<...>/sleepy.mjs", url: "file://...", webSocketDebuggerUrl}` taşır, PID taşımaz. `discoverAttach` (`bridge/node/src/nodebridge.js:957-985`) girdiyi seçip ATAR, yalnızca `webSocketDebuggerUrl` döner → protokol-onaylı debuggee kimliği çöpe gidiyor. Node'da portu V8'in kendisi tutar (arada adapter süreci yok) → OS port-sahibi launch'ta da attach'te de debuggee'nin ta kendisidir (debugpy F1'den asimetrik; tasarım bunu dürüstçe söyler).
+- **F5 — Java: attach'te protokolde PID yok, port-sahibi debuggee'dir; launch'ta pid alınabilir.** `BridgeConn.java:32-48` `SocketAttach` yalnızca `hostname`/`port` alır (JDI'de attach-PID kavramı yoktur). JDWP `dt_socket` portunu hedef JVM tutar (in-process) → OS argv debuggee'nindir. Launch'ta `LaunchingConnector` + `vm.process()` non-null (`BridgeConn.java:69-92`) → `Process.pid()` ile debuggee pid'i alınabilir (araç-zinciri Java 9+ ise — H3'e bakın). Ek olarak JDI `VirtualMachine {name(), version(), description()}` standart API'dir (doğrulanması ucuz, canlı prob gerektirmez).
+- **F6 — Browser zaten doğru modeldir.** `buildObservedTab` (`bridge/browser/src/browserbridge.js:585-591`) `/json/list` girdisini debuggee (tab) kimliği yapar, process iddiası yoktur. Genelleştirilecek kelime dağarcığının (`debuggee` vs `endpoint`) emsalidir; browser tarafında şema-alias dışında iş yoktur.
+- **F7 — Adapter argv'sinde SECRET vardır.** F1 probunda adapter cmdline'ında `--server-access-token <hex>` görüldü → `redact_argv`/`is_secret_flag` SUBSTR listesi (`src/session.rs:521-545`, `accesstoken` dahil) bunu yakalar (kod-okuma doğrulaması; canlı redaksiyon testi MVP kabulüne yazıldı).
+- **F8 — Timeout metni donmuştur.** `timeout: no stop within Ns` prefix'i `tests/test_ux_live.py:344,347`'de assert'li → timeout raporundaki her ek alan ADDITIVE olur, prefix değişmez. Mevcut rapor yapısız string'dir (`timeout_text`: py `:1168-1174`, node `:1828-1834`, browser `:1059`, Java `BridgeSession.java:663`).
+- **F9 — Süreç-ağacı çıkarımı güvenilmezdir, tasarım ona dayanmaz.** F1 probunda launcher reparent sonrası `PPID=1` görüldü (nohup/disown artifaktı; genel derstir: exec wrapper'lar — `uv`, `python -m debugpy` — daemonize/reparent, PID reuse, remote host). Kural: ağaçtan debuggee/launcher İDDİA EDİLMEZ; ata-zincir en fazla ertelenmiş, düşük-güvenli, açık-etiketli iştir.
+
+### Hipotezler (doğrulanmadı — MVP'yi bloklamaz, metinde işaretli kalır)
+
+- **H1:** launch yolunda `process` olayı payload/timing (attach F2 probu launch'ı kapsamaz; spec her ikisini de söyler ama debugpy-launch canlı kanıtı yok).
+- **H2:** `--listen ... --pid <pid>` attach varyantında `process` olayı (Context7'de CLI kalıbı doğrulandı, olay payload'u doğrulanmadı).
+- **H3:** Java araç-zinciri seviyesi (`Process.pid()` için 9+; derleme kontrolü MVP acceptance'ındadır).
+- **H4:** `resource_tracker` benzeri helper'ların `process` olayına etkisi (etkisizlik varsayımı; M-T'deki cmdline-tanımlama kuralı saklıdır).
+
+### Değerlendirilen Seçenekler (tradeoff + karar)
+
+- **O1 — `observedTarget`'ı sessizce debuggee ile overwrite:** REDDEDİLDİ. `status`/`context`/attach-yanıtı tüketicileri + `test_live.py:1459-1460` (`observedTarget.pid == proc.pid` attach beklentisi) sessiz anlam değişiminde kırılır. Kural (M-I'den devralınır): `observedTarget` BIREBIR korunur; yenilik additive alandır.
+- **O2 — Süreç-ağacından `launcherChain` çıkarımı (uv → python → adapter):** REDDEDİLDİ (F9). MVP'de ağaçtan gelen hiçbir alan `protocol-confirmed` sayılmaz; zincir "ertelenmiş" bölümündedir.
+- **O3 — `--trigger COMMAND` (debugger tetikleyiciyi kendisi koşsun):** DEĞERLENDİRİLDİ, ERTELENDİ. Karşı argümanlar: shell alıntılama/enjeksiyon yüzeyi, süreç sahipliği/reap/zombi, timeout kompozisyonu (`--timeout` × trigger-timeout), env/secret sızıntısı, KISS ihlali — ve zorlayıcı gerekçe yok (tetikleyici zaten debugger dışında yaşıyor: HTTP isteği, insan tıkı, agent-browser). Gelecek alternatifi (ayrı tasarım ister): operasyon-korelasyon jetonu veya debugger-sahipli çocuk koşan `capture --exec`. M5'in "operasyon-kimliği v1 dışı" kararıyla tutarlıdır.
+- **O4 — (ÖNERİLEN) Additive üç-rol şeması:** `endpoint` (OS-gözlemli port-sahibi, rolü dürüst etiketli) + `debuggee` (yalnızca protokol-onaylı) + `adapter` (biliniyorsa; debugpy'de endpoint-sahibi = adapter). Eski alanlar değişmez; insan çıktısı debuggee'yi öne çıkarır.
+
+### Önerilen MVP Tasarımı (M-ID)
+
+- **Ortak şema (proposed, additive; `requestedTarget`/`observedTarget` değişmez):**
+  ```json
+  "endpoint": {"host": "127.0.0.1", "port": 5678, "ownerPid": 15298,
+    "source": "os-lsof-ps", "argv": [".../debugpy/adapter", "..."],
+    "role": "listener-owner (not necessarily the debuggee)"},
+  "debuggee": {"kind": "process", "pid": 15292, "name": "<...>/srv.py",
+    "startMethod": "attach", "source": "dap-process-event",
+    "confidence": "protocol-confirmed", "observedAt": 1735689600}
+  ```
+  (PID'ler şematik örnektir, gerçek gözlem değildir.)
+- **Confidence kuralları (non-negotiable):** `protocol-confirmed` YALNIZCA protokol alanından gelir (DAP `process`, CDP `/json/list` girdisi, `debugpyAttach.subProcessId`, `NodeWorker.workerInfo`, JDI VM özellikleri). OS port-sahibi tek başına en fazla `os-corroborated` olur — debugpy attach'te adapter olduğu için OS asla `protocol-confirmed` OLAMAZ. Kaynak yoksa `unavailable: [{field, reason}]` + `warnings: ["identity-unverified..."]` (M-I deyimi korunur). Bulunamayan rol uydurulmaz (`null` + gerekçe). `pid` tek başına kimlik değildir (reuse notu; `pid` + `startMethod` + `observedAt` birlikte okunur).
+- **Dil matrisi (MVP):**
+  | Dil/yol | `debuggee` kaynağı | `endpoint` kaynağı | Not |
+  |---------|-------------------|-------------------|-----|
+  | py attach | DAP `process` (`name`, `systemProcessId`, `startMethod`) — F2 | mevcut `observedTarget` içeriği (= adapter, F1) | çekirdek düzeltme: pybridge `process` tüketir (F3 noktası), bounded bekleyiş (attach'i geciktirmez; gelmezse `unavailable`) |
+  | py launch | aynı tüketici (H1 doğrulanınca netleşir) + launcher-args korunur | CLI launcher-args + adapter-pid (biliniyorsa) | H1 MVP acceptance probudur |
+  | node attach/launch | `/json/list` girdisi (`title`/`url`/`id`) — F4, artık atılmaz | OS port-sahibi (= debuggee süreci; `os-corroborated`) | port-sahibi==debuggee asimetrisi metinde açık yazılır |
+  | java attach | JDI VM `name/version` + OS port-sahibi argv (`os-corroborated`) — F5 | OS port-sahibi (= hedef JVM) | protokol-PID yokluğu dürüstçe `unavailable` |
+  | java launch | + `vm.process().pid()` (H3) | CLI launcher-args | derleme-seviye kontrolü acceptance'tadır |
+  | browser | mevcut tab kimliği `debuggee` rolüne taşınır (additive alias) — F6 | `host:port` + `debugEndpoint` | davranış değişmez |
+  | child:/worker: | M-T dondurulan `observed` aynen taşınır (`debugpy-subProcessId` / `workerInfo`) | ana oturumun endpoint'i | M-T metni değişmez |
+- **UX önceliği (insan çıktısı, concise):** protokol-onaylı `debuggee` varsa İLK ve belirgin satır (`debuggee: <name> (pid <pid>, protocol-confirmed)`); endpoint-sahibi ayrı satırda (`endpoint owner: <argv…> (adapter/listener — kodunuz değil)`); `observedTarget` alanı dokunulmaz, `compact_hint` debuggee-öncelikli hale gelir. Timeout/vurulmayan-break çıktısına kompakt debuggee satırı eklenir — kök-neden iddiası YOK (`verified` plant-only kuralı korunur).
+- **Güvenlik (M-I'den devralınır, non-negotiable):** redaksiyon (`--server-access-token` F7 dahil) + cap (alan ≤512, toplam ≤2KB, dizi ≤32) yeni alanlara aynen uygulanır; env ASLA; ham persist ASLA; `process`-bekleyiş sınırlı (örn. ≤3 sn; attach yavaşlamaz); remote host'ta OS rolleri daimi `unavailable`.
+
+### Capture-Timeout Nedenselliği Tasarımı (M-TC, M-ID sonrası)
+
+- **Çekirdek dürüstlük kuralı:** debugger dış tetikleyiciyi GÖREMEZ (harici helper isteği göndermeden ölebilir; debugger tüm timeout'u bekler ve trigger durumunu bilemez) → raporda `triggerStatus: "unknown"` VARSAYILANDIR ve metin asla "hedef kodu ıskaladı" demez. O3 (`--trigger`) ertelendiği için `unknown` dışında değer üreten mekanizma v1'de YOKTUR.
+- **Additive rapor (proposed; F8 prefix'i korunur, örn. `timeout: no stop within 2s; <debuggee-hint>; trigger unknown (...)`):**
+  ```json
+  {"error": "timeout: no stop within 2s; ...",
+   "waitReport": {"waitStartedAt": 1735689600, "waitedMs": 2000, "timeoutSecs": 2,
+     "breakpointState": [{"spec": "app.py:42", "state": "verified|pending|slid", "hits": 0}],
+     "triggerStatus": "unknown",
+     "targetIdentity": {"debuggee": {...}, "endpoint": {...}},
+     "recommendation": "verify the trigger path ran (e.g. the HTTP request reached the handler); app.py:42 is verified-but-unhit"}}
+  ```
+  `breakpointState` mevcut plant-kayıtlarından türetilir (yeni izleme yok); `recommendation` şablonludur, hedefe-özel teşhis uydurmaz. Başarı yanıtları değişmez.
+- **KISS notu:** rapor, `wait`/`capture`/launch-ilk-stop timeout'larında aynı yapıyı kullanır; `breaks verified` = plant kabulü kuralı tekrar yazılır (çalıştırma kanıtı değildir).
+
+### Test Stratejisi (uygulanmadı — MVP acceptance'ına yazılır)
+
+- **Birim (yeni):** DAP `process`-tüketici (stash/parse → `debuggee`; H1 varyantları; bounded-bekleyiş zaman-aşımında `unavailable`); Node `/json/list` keeper (girdi-atılmama); additive şema (eski okuyucu toleransı; `observedTarget` bayt-koruması); redaksiyon/cap (F7 `server-access-token` dahil) + no-secret taraması (persist + log); timeout-raporu (donmuş prefix + `triggerStatus: unknown` + `breakpointState`); Java derleme-seviye kontrolü (H3).
+- **Canlı (yeni; ağ kurulumu YOK, `uv` YOK):** stdlib wrapper fixture — F1 kalıbı (`exec: python -m debugpy --listen ... srv.py`): external-launch + attach → `debuggee.pid == <server-pid> != endpoint.ownerPid` + insan çıktısında `srv.py` yolu, site-packages değil. Aynı-dosya-yolu yanlış-process attach negatifi (M-I niyeti korunur). Node: `/json/list` title/url taşınması. Java: fork'lanmış JDWP hedefi attach (H3'e koşullu pid). Browser: değişmezlik. Timeout: helper-failure simülasyonu (asla-vurmayan break + kısa timeout) → raporda `unknown` + breakpoint durumu + kök-neden-yok iddiası; `test_ux_live.py:344,347` prefix assert'leri yeşil kalır.
+- **Kanıt geçersizleşmesi:** debugpy minor değişirse F2 probu tekrarlanır (M0 kuralı).
+
+### Sıra / Kabul / Stop (öneri)
+
+- **Milestone/sıra:** M-ID (kimlik v2: `process` tüketimi + üç-rol şema + UX; M5 sonrası, paylaşılan `session.rs`/`spawn.rs`/üç köprü nedeniyle tek dilim) → M-TC (timeout raporu, M-ID sonrası). Paralel implementasyon yok (sıralı repo düzeni korunur).
+- **Kabul matrisi (özet):** py-attach debuggee==server-pid canlı kanıtı + adapter-endpoint ayrımı; 4 dilde additive şema + eski testler yeşil (`test_live.py:1459-1460`, `test_ux_live.py:344,347` dahil full gate); no-secret taraması temiz; `process`-bekleyiş attach süresine ölçülür tavan eklemez.
+- **Stop koşulları:** redaksiyon sızıntısı veya ham-secret persist → STOP; `process`-bekleyiş attach'i >tavan geciktirirse → STOP/redesign (bekleyişsiz stash-tarama fallback'i); OS rolünü `protocol-confirmed` sayan implementasyon → NEEDS_CHANGES; H1 ters-prob sonucu (launch'ta olay yok) M-ID'yi değil yalnızca launch-satırını kapsar (attach değeri korunur).
+- **Rollback:** ek alanlar kalkar (`observedTarget` tek başına kalır; eski okuyucular etkilenmez).
+
+### Çözülmemiş Gerçekler
+
+- H1 (launch `process` olayı), H2 (`--pid` varyantı), H3 (Java 9+ zinciri), H4 (helper-etkisizliği).
+- Remote-host attach'ta OS rolleri daimi `unavailable` kalır (tasarım kararı, prob gerektirmez).
+- `uv`-özel zincir (`uv run` → yorumlayıcı → debugpy → adapter): F1'in genellemesidir; uv'ye özel prob yapılmadı ve GEREKMEZ (tasarım sarıcıdan bağımsızdır — protokol kanıtı esastır).
+- Gerçek PID/secret bu bölüme yazılmadı (örnekler şematiktir); F1-F2 prob artıkları onaylı geçici dizinden silindi, süreçler temizlendi.
+
+### Bu Notun Kanıt Envanteri (çalıştırılanlar)
+
+- Read-only repo: `src/spawn.rs:290-334,221-283`, `src/session.rs:511-545,603-666,672-753,803-933,937-961`, `bridge/py/src/pybridge.py:1168-1174,1202-1234,1245-1338,1394-1433,2197-2317,2529-2615`, `bridge/node/src/nodebridge.js:957-985,1828-1834`, `bridge/browser/src/browserbridge.js:585-591,1059`, `bridge/java/src/BridgeConn.java:32-92`, `bridge/java/src/BridgeSession.java:663`, `tests/test_ux_live.py:344,347`, `tests/test_live.py:1459-1460`.
+- Context7: DAP `ProcessEvent` (startMethod/systemProcessId), debugpy `debugpyAttach`/subprocess-attach dokümanı, CDP `Target.getTargets`/`attachedToTarget` (NodeWorker sarmalı M0 bulgusuyla tutarlı).
+- Canlı problar (onaylı geçici dizin, stdlib-only; `uv`/ağ kurulumu YOK; sonrası silindi + süreç temizliği doğrulandı): (a) wrapper-exec debugpy `--listen` + `lsof`/`ps` port-sahibi kanıtı (F1+F9); (b) ham-DAP attach `process`-olay kaydı (F2); (c) `node --inspect-brk` + `/json/list` + `/json/version` (F4).
+
+## M-ID/M-TC Implementation Notes (Batch4 — implemente edildi, review bekler)
+
+> Kapsam: yukarıdaki Tasarım Notu'nun MVP'si (M-ID: üç-rol kimlik + M-TC: dürüst timeout raporu), tek dilimde dört adaptör + CLI. M-I/`observedTarget` metni ve tüm frozen sözleşmeler değişmez; ek alanlar additive'dir. Test/skill eklendi; commit yok.
+
+- **Şema (additive):** `session.json` + attach/start yanıtı + `status` + `context` + `targets` roster'ında `targetIdentity: {debuggee, endpoint, adapter}` (bu sırada). Rol-başına yalnızca bilinen alanlar + `source`/`confidence`/`observedAt`/`unavailable[]`. `confidence` katıdır: `protocol-confirmed` yalnızca protokol verisinden (DAP `process`, `/json/list` girdisi, JDI VM özellikleri), `os-corroborated` yalnızca OS port-sahibinden, gerisi `unavailable` + gerekçe. `observedTarget` bayt-uyumlu korunur (`test_live.py:1459-1460` yeşil).
+- **Python:** `handshake_attach`/`handshake_launch` `attach`/`launch` yanıtı + `configurationDone` sonrası DAP `process` olayını bounded (~2 sn) tüketir (önce stash taraması, sonra re-stash'leyen sınırlı okuma — stop/`debugpyAttach` kaybolmaz); geç gelen olay `_handle_main_event`'teki `process` dalıyla zenginleşir (park etmez, child akışına dokunmaz) ve `session.json`'u atomik günceller. Debuggee PID varsa `/proc`/`ps` argv/cwd/exe `osDetails` altında (`os-corroborated`, confidence yükseltilmez). Endpoint+adapter = CLI OS gözlemi (adapter argv'de `debugpy` tanınırsa; launch'ta köprünün kendi spawn pid'i). Yayın öncesi her rol re-redact + cap (alan ≤512, rol ≤2KB, toplam ≤4KB) — `--server-access-token` ham sızıntısı unit ile kapalı.
+- **Node:** `discoverAttach` seçili `/json/list` girdisini artık atmaz (`attachEntry {id,title,url}`); launch'ta ws URL'den parse edilen porta best-effort `/json/list` (URL-eşleşen ya da tek girdi). Debuggee `protocol-confirmed` (PID iddiası YOK — `pid` alanı taşınmaz); endpoint host/port/ws + CLI OS pid'i (`os-corroborated`); adapter `{inProcess:true, unavailable}`.
+- **Java:** attach'te JDI `vm.name()/version()` (`protocol-confirmed`, target-code eval YOK); launch'ta `+ vm.process().pid()` (JDK 24 zincirinde derlenir, try/catch korumalı); attach PID `unavailable` (SocketAttach'ta PID kavramı yok). Endpoint host/port + CLI gözleminden regex-çıkarım ownerPid/argv/exe/cwd (CLI-redacted verbatim; toplam-bütçe aşımında argv düşer + işaretlenir); adapter in-process. `StopTimeout`/`BridgeException` `waitContextJson` taşır; continue/step/idle/handshake bekleyişleri context'siz kalır.
+- **Browser:** mevcut tab kimliği `debuggee` rolüne taşınır (`protocol-confirmed`, PID iddiası yok); endpoint `host:port` + `debugEndpoint` (`unavailable`, OS gözlemi yok); adapter tanımsız-süreç. `pump` artık typed `StopTimeout` atar (mesaj aynı).
+- **Timeout raporu (M-TC):** `wait`/`capture` timeout'unda köprü `{ok:false, error:"timeout: no stop within Ns; …", waitContext:{waitStartedAt, waitedMs, triggerStatus:"unknown", expectedBreak?, targetIdentity, note}}` döner (prefix donmuş, F8). CLI (`BridgeFailure` + `output::emit`) `waitContext`'i JSON/human hata zarfına additive taşır (mesaj dizesi değişmez). Başarılı capture değişmez (`triggerStatus` uydurulmaz). Operasyon detayı persist edilmez (yanıt/hata dışında).
+- **H-kararları:** H1 (launch `process` olayı) — CANLI DOĞRULANDI (debugpy 1.8.21: launch handshake'te `process` olayı gelir, `startMethod:"launch"` + debuggee PID; launch-satırında `protocol-confirmed` debuggee + `osDetails` zenginleştirmesi çalışır; ayrıca launcher cmdline'ındaki ikinci secret varyantı `--adapter-access-token` köprü-redaktörünce canlı yakalandı). Olay gelmezse launch-satırı `unavailable` kalır (fallback korunur), attach değeri bağımsızdır. H2 (`--pid` varyantı) — denenmedi, kapsam dışı (CLI'da pid girdisi yok). H3 (Java 9+ zinciri) — host JDK 24 ile derlenir + runtime-guard'lı; eski JDK'da derleme garantisi yok (destek matrisi M0'dadır). H4 (helper-etkisizliği) — M-T cmdline kuralı saklı, `process` olayına etkisi varsayılmadı (first-wins + child akışı dokunulmaz).
+- **Kalan sınırlar:** remote-host attach'te OS rolleri daimi `unavailable`; `uv`-özel zincir prob'lanmadı (tasarım sarıcıdan bağımsızdır); PID-reuse'a karşı debuggee zenginleştirmesi okuma-anı canlılık kontrolünden ibarettir; `waitContext` `continue`/`step` timeout'larında taşınmaz (bilinçli).
+- **Testler:** `cargo test` (+3: failure-passthrough, identity-cache, surface), `tests/test_pybridge.py` (+10: stash/delay/unavailable, redact F7, caps, waitContext, expectedBreak, envelope, OS-enrich), `tests/target_identity.test.js` (8: node entry-keeper/no-pid/inProcess, waitContext, expectedBreak, caps; browser tab/waitContext), `tests/M7JavaCheck.java` (37 assertion, canlı VM yok), `tests/stoptimeout.test.js` pattern-güncellemesi (typed-timeout niyeti korunur), `tests/test_ux_live.py` flow genleşmesi (prefix + unknown/expectedBreak/identity-armed). SKILL: katmanlı-kimlik + dürüst-trigger reçetesi + `uv/debugpy/uvicorn` örneği.
