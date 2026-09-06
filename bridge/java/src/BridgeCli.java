@@ -59,8 +59,12 @@ class BridgeCli {
                 case "--timeout": cfg.timeoutMs = timeoutMillis(next(argv, ++i, "--timeout")); break;
                 case "--dir": cfg.sessionDir = next(argv, ++i, "--dir"); break;
                 case "--kind": cfg.sessionKind = next(argv, ++i, "--kind"); break;
-                case "--observed-target": cfg.observedTargetJson = coerceObserved(next(argv, ++i, "--observed-target")); break;
-                case "--observed-hint": cfg.observedHint = next(argv, ++i, "--observed-hint"); break;
+                case "--target-identity": {
+                    String seed = coerceSeed(next(argv, ++i, "--target-identity"));
+                    cfg.targetIdentitySeedJson = seed;
+                    cfg.seedHint = BridgeSession.seedHint(seed);
+                    break;
+                }
                 default: throw new UsageException("unknown arg: " + a);
             }
         }
@@ -137,9 +141,11 @@ class BridgeCli {
         return argv[i];
     }
 
-    /** Keep only plausible objects (we generate the JSON CLI-side); anything
-     *  else reads as unknown, never persisted verbatim. */
-    static String coerceObserved(String raw) {
+    /** Keep only plausible layered seeds (we generate the JSON CLI-side);
+     *  anything else reads as unknown, never persisted verbatim. A
+     *  malformed/missing seed degrades to an all-unavailable identity,
+     *  never a spawn failure. */
+    static String coerceSeed(String raw) {
         if (raw == null) return null;
         String t = raw.trim();
         if ((t.startsWith("{") && t.endsWith("}")) || t.equals("null")) return raw;

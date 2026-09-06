@@ -693,7 +693,7 @@ class BridgeSession {
         String msg = "timeout: no stop within " + (timeoutMs / 1000) + "s";
         String hint = (st != null && st.cfg != null && st.cfg.identityHint != null
                 && !st.cfg.identityHint.isEmpty()) ? st.cfg.identityHint
-                : (st != null && st.cfg != null ? st.cfg.observedHint : null);
+                : (st != null && st.cfg != null ? st.cfg.seedHint : null);
         if (hint != null && !hint.isEmpty()) {
             msg += "; " + hint;
         }
@@ -724,8 +724,8 @@ class BridgeSession {
         return sb.append('}').toString();
     }
 
-    // -- layered target identity (M-ID): additive {debuggee, endpoint,
-    // adapter} roles beside the untouched observedTarget. Confidence is
+    // -- layered target identity (M-ID): {debuggee, endpoint,
+    // adapter} roles with strict confidence (no flat identity view remains).
     // strict: protocol-confirmed only from JDI VM properties (attach) plus
     // the launch pid when this runtime exposes it; os-corroborated only for
     // the OS-observed listener owner; attach pids stay honestly unavailable
@@ -812,15 +812,43 @@ class BridgeSession {
             buildTargetIdentityInner(st);
         } catch (Exception e) {
             st.cfg.targetIdentityJson = null;
-            st.cfg.identityHint = st.cfg.observedHint == null ? "" : st.cfg.observedHint;
+            st.cfg.identityHint = st.cfg.seedHint == null ? "" : st.cfg.seedHint;
+        }
+    }
+
+    /** One-line redacted hint derived from the layered CLI seed (debuggee
+     *  launcher args, then endpoint listener details). Empty for a null
+     *  seed; an unavailable note when the seed carries nothing nameable.
+     *  Never throws; a malformed seed never fails the bridge. */
+    static String seedHint(String seed) {
+        if (seed == null) return "";
+        try {
+            String exe = jsonString(seed, "executable");
+            String cwd = jsonString(seed, "cwd");
+            java.util.List<String> parts = new java.util.ArrayList<>();
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                    "\"((?:[^\"\\\\]|\\\\.)*)\"").matcher(
+                    jsonStringArray(seed, "argv") == null ? "" : jsonStringArray(seed, "argv"));
+            while (m.find() && parts.size() < 3) {
+                parts.add(m.group(1));
+            }
+            if (exe == null && parts.isEmpty()) {
+                return "target identity unavailable (no independent source)";
+            }
+            String hint = "target identity: " + (exe == null ? "?" : exe)
+                    + " " + String.join(" ", parts)
+                    + " (cwd " + (cwd == null ? "?" : cwd) + ")";
+            return hint.length() <= 200 ? hint : hint.substring(0, 200);
+        } catch (Exception e) {
+            return "";
         }
     }
 
     static void buildTargetIdentityInner(SessionState st) {
         long now = System.currentTimeMillis() / 1000;
-        String obs = st.cfg.observedTargetJson;
-        Long ownerPid = jsonLong(obs, "pid");
-        String ownerSource = jsonString(obs, "source");
+        String seed = st.cfg.targetIdentitySeedJson;
+        Long ownerPid = jsonLong(seed, "ownerPid");
+        String ownerSource = jsonString(seed, "source");
         // -- debuggee: JDI VM properties confirm it (safe metadata calls,
         // never target eval). Attach exposes no pid; launch adds the child
         // pid only when this runtime offers it (host JDK 9+; guarded).
@@ -887,14 +915,14 @@ class BridgeSession {
         StringBuilder ep = new StringBuilder("{\"host\":")
                 .append(JdiBridge.quote(st.cfg.host))
                 .append(",\"port\":").append(st.cfg.port);
-        String ownerArgv = jsonStringArray(obs, "argv");
-        String ownerExe = jsonString(obs, "executable");
-        String ownerCwd = jsonString(obs, "cwd");
+        String ownerArgv = jsonStringArray(seed, "argv");
+        String ownerExe = jsonString(seed, "executable");
+        String ownerCwd = jsonString(seed, "cwd");
         if (ownerPid != null) ep.append(",\"ownerPid\":").append(ownerPid);
         if (ownerExe != null) {
             ep.append(",\"executable\":").append(JdiBridge.quote(truncField(ownerExe)));
         }
-        if (ownerArgv != null) ep.append(",\"ownerArgv\":").append(ownerArgv);
+        if (ownerArgv != null) ep.append(",\"argv\":").append(ownerArgv);
         if (ownerCwd != null) {
             ep.append(",\"cwd\":").append(JdiBridge.quote(truncField(ownerCwd)));
         }
@@ -922,7 +950,7 @@ class BridgeSession {
         String ident = "{\"debuggee\":" + dg + ",\"endpoint\":" + ep + ",\"adapter\":" + ad + "}";
         if (ident.length() > IDENT_TOTAL_CAP) {
             // Over budget only via the embedded CLI argv: drop it (marked)
-            // and rebuild; the CLI copy in observedTarget is untouched.
+            // and rebuild; the CLI seed copy is untouched.
             ep = new StringBuilder("{\"host\":")
                     .append(JdiBridge.quote(st.cfg.host))
                     .append(",\"port\":").append(st.cfg.port);
@@ -943,7 +971,7 @@ class BridgeSession {
             if (ownerPid == null) {
                 ep.append(unavailableEntry("ownerPid", "no independent pid source")).append(',');
             }
-            ep.append(unavailableEntry("ownerArgv", "dropped: over budget")).append("]}");
+            ep.append(unavailableEntry("argv", "dropped: over budget")).append("]}");
             ident = "{\"debuggee\":" + dg + ",\"endpoint\":" + ep + ",\"adapter\":" + ad + "}";
         }
         st.cfg.targetIdentityJson = ident;
@@ -954,7 +982,7 @@ class BridgeSession {
         } else if (vmName != null) {
             hint = "debuggee: " + vmName + " (protocol-confirmed)";
         } else {
-            hint = st.cfg.observedHint == null ? "" : st.cfg.observedHint;
+            hint = st.cfg.seedHint == null ? "" : st.cfg.seedHint;
         }
         st.cfg.identityHint = hint.length() <= 200 ? hint : hint.substring(0, 200);
     }
@@ -1164,15 +1192,18 @@ class BridgeSession {
         return "transport";
     }
 
-    /** error.json body: the message verbatim plus the additive phase. */
+    /** error.json body: schemaVersion 2, the message verbatim, plus the
+     *  additive phase. */
     static String setupErrorJson(String message, String stage) {
-        return "{\"error\":" + JdiBridge.quote(message)
+        return "{\"schemaVersion\":" + 2
+                + ",\"error\":" + JdiBridge.quote(message)
                 + ",\"phase\":" + JdiBridge.quote(setupPhaseOf(stage)) + "}";
     }
 
     /** error.json body with the phase derived from the failure type. */
     static String setupErrorJson(Throwable t, String message) {
-        return "{\"error\":" + JdiBridge.quote(message)
+        return "{\"schemaVersion\":" + 2
+                + ",\"error\":" + JdiBridge.quote(message)
                 + ",\"phase\":" + JdiBridge.quote(phaseOfError(t)) + "}";
     }
 
@@ -1906,7 +1937,6 @@ class BridgeSession {
         try { port = st.server.getLocalPort(); } catch (Exception ignored) {}
         String name = "?";
         try { name = st.dir.getFileName().toString(); } catch (Exception ignored) {}
-        String observed = st.cfg.observedTargetJson == null ? "null" : st.cfg.observedTargetJson;
         String identity = st.cfg.targetIdentityJson == null ? "null" : st.cfg.targetIdentityJson;
         BridgeProto.writeFile(st.dir.resolve("session.json"),
                 "{\"name\":" + JdiBridge.quote(name)
@@ -1915,7 +1945,7 @@ class BridgeSession {
                 + ",\"stopped\":" + stopped
                 + ",\"lastStop\":" + (st.lastStopJson == null ? "null" : st.lastStopJson)
                 + ",\"updatedAt\":" + now
-                + ",\"observedTarget\":" + observed
+                + ",\"schemaVersion\":" + 2
                 + ",\"targetIdentity\":" + identity + "}");
     }
 

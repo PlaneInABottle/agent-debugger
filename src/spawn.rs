@@ -52,11 +52,11 @@ pub(super) fn cmd_spawn(
 ) -> anyhow::Result<Value> {
     // Empty breaks allowed: thread dumps and log collection need no stop.
     // Commands needing a stop fail gracefully until one arrives.
-    // Identity first: both builders only borrow the target; the args match
-    // below moves it.
+    // Identity first: the seed builder only borrows the target; the args
+    // match below moves it.
     let requested = requested_target(&target, kind);
-    let observed = observed_target(&target);
-    let observed_hint = session::compact_hint(&observed);
+    let seed = seed_target_identity(&target);
+    let seed_hint = session::identity_hint(&seed);
     let mut args: Vec<String> = Vec::new();
     match target {
         Target::JavaLaunch { main, classpath } => {
@@ -172,8 +172,10 @@ pub(super) fn cmd_spawn(
     }
 
     // Spawn-time intent for resume-without-memory: armed stops + target,
-    // derived automatically (the agent writes nothing by hand).
+    // derived automatically (the agent writes nothing by hand). v2 markers:
+    // every sidecar object carries schemaVersion 2.
     let intent = json!({
+        "schemaVersion": session::SCHEMA_VERSION,
         "breaks": stops.breakpoints,
         "logpoints": stops.logpoints,
         "watches": stops.watches,
@@ -193,8 +195,8 @@ pub(super) fn cmd_spawn(
             wait_secs: stops.timeout.saturating_add(10),
             stops: intent,
             requested,
-            observed,
-            observed_hint,
+            target_identity: seed,
+            identity_hint: seed_hint,
         },
     )
 }
@@ -282,12 +284,11 @@ fn requested_target(target: &Target<'_>, kind: &str) -> Value {
     }
 }
 
-/// Bridge-observed identity for process targets, computed CLI-side from
-/// bounded OS-native sources (never target eval, never env):
-/// launch argv/cwd from our own spawn, attach pid/exe/argv/cwd via a
-/// localhost port lookup. Browser identity comes from the bridge's
-/// `/json/list` entry instead (no process claim here).
-fn observed_target(target: &Target<'_>) -> Value {
+/// Layered seed identity for a spawn, computed CLI-side from bounded
+/// OS-native sources (never target eval, never env): launch argv/cwd from
+/// our own spawn, attach endpoint via the localhost port lookup. Browser
+/// builds its own tab identity from `/json/list` (seed null here).
+fn seed_target_identity(target: &Target<'_>) -> Value {
     match target {
         Target::PyLaunch {
             program,
@@ -305,18 +306,17 @@ fn observed_target(target: &Target<'_>) -> Value {
                 }
                 _ => {}
             }
-            session::launch_observed(exe, argv, "launcher-args")
+            session::launch_seed(exe, argv)
         }
         Target::NodeLaunch {
             program,
             node,
             workers: _,
-        } => session::launch_observed(
+        } => session::launch_seed(
             node.unwrap_or("node"),
             vec![node.unwrap_or("node").to_string(), program.to_string()],
-            "launcher-args",
         ),
-        Target::JavaLaunch { main, classpath } => session::launch_observed(
+        Target::JavaLaunch { main, classpath } => session::launch_seed(
             "java",
             vec![
                 "java".to_string(),
@@ -324,11 +324,10 @@ fn observed_target(target: &Target<'_>) -> Value {
                 classpath.unwrap_or(".").to_string(),
                 main.to_string(),
             ],
-            "launcher-args",
         ),
         Target::PyAttach { host, port }
         | Target::NodeAttach { host, port }
-        | Target::JavaAttach { host, port } => session::attach_observed(host, *port),
+        | Target::JavaAttach { host, port } => session::attach_seed(host, *port),
         Target::BrowserAttach { .. } => Value::Null,
     }
 }

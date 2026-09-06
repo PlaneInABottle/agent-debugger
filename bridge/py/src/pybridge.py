@@ -290,8 +290,7 @@ class Config:
         self.want_exc = False
         self.timeout = 20.0
         self.prog_args = []
-        self.observed_target = None  # redacted CLI-observed identity (dict)
-        self.observed_hint = ""      # one-line redacted diagnostic hint
+        self.target_identity_seed = None  # layered CLI seed identity (dict)
         # Stored raw spec per canonical line-break key, for remove/clear
         # echo (the CLI persists exactly these strings in stops.json).
         self.break_raws = {}  # (path, line, cond) -> raw spec
@@ -573,14 +572,12 @@ def parse_args(argv):
                 raise Usage("timeout must be between 0 and 3600 seconds")
         elif a == "--subprocess":
             cfg.subprocess = True
-        elif a == "--observed-target":
+        elif a == "--target-identity":
             try:
                 parsed = json.loads(_need(a))
-                cfg.observed_target = parsed if isinstance(parsed, dict) else None
+                cfg.target_identity_seed = parsed if isinstance(parsed, dict) else None
             except ValueError:
-                cfg.observed_target = None
-        elif a == "--observed-hint":
-            cfg.observed_hint = _need(a)
+                cfg.target_identity_seed = None
         else:
             raise Usage(f"unknown arg: {a}")
         i += 1
@@ -621,13 +618,13 @@ def trunc_str(s, limit=MAX_STRING):
 
 
 # ---------------------------------------------------------------- layered target identity (M-ID)
-# Additive `{debuggee, endpoint, adapter}` roles beside the untouched
-# `observedTarget`. Confidence is strict: protocol-confirmed only from the
-# DAP `process` event; os-corroborated only for the OS-observed listener
-# owner; everything else is unavailable (never guessed, no parent-tree
-# inference). Every new string is redacted + capped before persistence or
-# output; env is never collected.
-IDENT_FIELD_CAP = 512   # per-field chars (matches the CLI observedTarget cap)
+# `{debuggee, endpoint, adapter}` roles with strict confidence:
+# protocol-confirmed only from the DAP `process` event; os-corroborated
+# only for the OS-observed listener owner (seeded by the CLI's layered
+# `--target-identity` seed); everything else is unavailable (never guessed,
+# no parent-tree inference). Every new string is redacted + capped before
+# persistence or output; env is never collected.
+IDENT_FIELD_CAP = 512   # per-field chars (matches the CLI layered-identity cap)
 IDENT_ROLE_CAP = 2048   # per-role serialized chars
 IDENT_TOTAL_CAP = 4096  # aggregate chars over the three roles
 IDENT_ARRAY_CAP = 32    # elements per array (head kept, dropped tail marked)
@@ -1022,13 +1019,15 @@ class Session:
         return resp
 
     def target_entry(self, tid):
-        """One roster entry {id,kind,pid,state,lastStop,observed,scope}."""
+        """One roster entry {id,kind,pid,state,lastStop,scope} (+ `observed`
+        only for child targets: their protocol facts). Main entries carry
+        no `observed` — main identity lives in the top-level
+        `targetIdentity`."""
         if tid == "main":
             return {"id": "main", "kind": "main", "pid": None,
                     "state": "exited" if self.main_exited
                     else ("stopped" if self.suspended else "running"),
                     "lastStop": self.last_stop,
-                    "observed": self.cfg.observed_target,
                     "scope": "global"}
         t = self.targets[tid]
         scope = "target" if t.target_raws else "inherited"
@@ -1348,7 +1347,7 @@ class Session:
         """Timeout message with the compact identity hint (debuggee-first,
         names the target, never claims root cause)."""
         msg = f"timeout: no stop within {timeout:g}s"
-        hint = self._identity_hint or self.cfg.observed_hint
+        hint = self._identity_hint or seed_hint(self.cfg.target_identity_seed)
         if hint:
             msg += f"; {hint}"
         return msg
@@ -1374,20 +1373,21 @@ class Session:
             if r.get("detail"):
                 s += f" ({r['detail']})"
             parts.append(s)
+        seed = seed_hint(self.cfg.target_identity_seed)
         return ("unresolved breakpoints: " + "; ".join(parts)
                 + " — check the path names the executed file and the line "
                 "is executable code (not a blank, comment, or def/class header)"
-                + (f"; {self.cfg.observed_hint}" if self.cfg.observed_hint else ""))
+                + (f"; {seed}" if seed else ""))
 
     def publish_state(self, stopped, target=None):
         """Rewrite session.json so `status` shows live truth (parked stop +
         time) with zero prior memory. lastStop survives resume/exit — it
-        answers 'where was I last', not 'where am I now'. The redacted
-        observedTarget rides along verbatim (CLI-computed, atomic write),
-        plus the layered targetIdentity (debuggee/endpoint/adapter, null
-        until the handshake builds it). Child target parks/resumes never
-        rewrite the main-focused file: the per-target last stop lives in
-        the roster served by `targets`."""
+        answers 'where was I last', not 'where am I now'. The v2
+        session.json carries schemaVersion 2 plus the layered
+        targetIdentity (debuggee/endpoint/adapter, null until the handshake
+        builds it). Child target parks/resumes never rewrite the
+        main-focused file: the per-target last stop lives in the roster
+        served by `targets`."""
         eff = target if target is not None else self._serving
         if eff != "main":
             if stopped and self.frames:
@@ -1413,7 +1413,7 @@ class Session:
             {"name": os.path.basename(self.cfg.dir), "kind": self.cfg.kind,
              "port": self.session_port, "stopped": stopped,
              "lastStop": self.last_stop, "updatedAt": int(time.time()),
-             "observedTarget": self.cfg.observed_target,
+             "schemaVersion": 2,
              "targetIdentity": self._target_identity}))
 
     # -- layered target identity (M-ID)
@@ -1526,13 +1526,21 @@ class Session:
 
     def _build_target_identity(self):
         """Build the layered {debuggee, endpoint, adapter} identity from the
-        DAP process event (protocol-confirmed debuggee) plus the CLI-supplied
-        OS listener observation (os-corroborated endpoint/adapter). The
-        `observedTarget` compatibility view is untouched. Everything is
-        redacted + capped here, before any publish."""
+        DAP process event (protocol-confirmed debuggee) plus the CLI seed's
+        layered endpoint role (os-corroborated listener owner). A
+        malformed/missing seed degrades to all-unavailable, never a spawn
+        failure. Everything is redacted + capped here, before any publish."""
         now = int(time.time())
-        obs = (self.cfg.observed_target
-               if isinstance(self.cfg.observed_target, dict) else {})
+        seed = (self.cfg.target_identity_seed
+                if isinstance(self.cfg.target_identity_seed, dict) else {})
+        ep = seed.get("endpoint") if isinstance(seed.get("endpoint"), dict) else {}
+        obs = {
+            "pid": ep.get("ownerPid"),
+            "source": ep.get("source"),
+            "argv": ep.get("argv"),
+            "executable": ep.get("executable"),
+            "cwd": ep.get("cwd"),
+        }
         pid = obs.get("pid") if isinstance(obs.get("pid"), int) else None
         source = obs.get("source") if isinstance(obs.get("source"), str) else None
         # Re-redact here (idempotent over the CLI's copy): the bridge never
@@ -1645,7 +1653,7 @@ class Session:
             else:
                 hint = f"debuggee: {nm} (protocol-confirmed)"
         if not hint:
-            hint = self.cfg.observed_hint or ""
+            hint = seed_hint(self.cfg.target_identity_seed)
         self._identity_hint = hint[:200]
         return ident
 
@@ -4500,8 +4508,31 @@ def phase_of_error(e):
 
 
 def setup_error_payload(exc, message):
-    """error.json body: the message verbatim plus the additive phase."""
-    return {"error": message, "phase": phase_of_error(exc)}
+    """error.json body: schemaVersion 2, the message verbatim, plus the
+    additive phase."""
+    return {"schemaVersion": 2, "error": message, "phase": phase_of_error(exc)}
+
+
+def seed_hint(seed):
+    """One-line redacted hint derived from the layered CLI seed (debuggee
+    launcher args, then endpoint listener details). Empty for a null seed;
+    an unavailable note when the seed carries nothing nameable. Never
+    raises; never a spawn failure."""
+    try:
+        if not isinstance(seed, dict):
+            return ""
+        for role in ("debuggee", "endpoint"):
+            r = seed.get(role)
+            if not isinstance(r, dict):
+                continue
+            exe = r.get("executable") if isinstance(r.get("executable"), str) else "?"
+            argv = [a for a in (r.get("argv") or []) if isinstance(a, str)][:3]
+            cwd = r.get("cwd") if isinstance(r.get("cwd"), str) else "?"
+            if exe != "?" or argv:
+                return f"target identity: {exe} {' '.join(argv)} (cwd {cwd})"[:200]
+        return "target identity unavailable (no independent source)"
+    except Exception:
+        return ""
 
 
 def dir_from_argv(argv):
@@ -4522,7 +4553,7 @@ def write_parse_error(argv, message):
         d = dir_from_argv(argv)
         if d:
             write_file(os.path.join(d, "error.json"),
-                       json.dumps({"error": message, "phase": "config"}))
+                       json.dumps({"schemaVersion": 2, "error": message, "phase": "config"}))
     except Exception:
         pass
 
@@ -4810,7 +4841,7 @@ def main(argv):
                  "stopped": bool(st.suspended or any(
                      t.suspended for t in st.live_targets())),
                  "lastStop": st.last_stop, "updatedAt": int(time.time()),
-                 "observedTarget": cfg.observed_target,
+                 "schemaVersion": 2,
                  "targetIdentity": st._target_identity}))
             serve(st, server, nonce)
         except (Usage, BridgeErr) as e:

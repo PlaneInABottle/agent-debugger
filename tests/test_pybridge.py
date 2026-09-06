@@ -472,7 +472,7 @@ class BridgeTests(unittest.TestCase):
             for flag in ["--kind", "--dir", "--program", "--module",
                          "--python", "--host", "--port", "--src",
                          "--break", "--logpoint", "--timeout",
-                         "--observed-target", "--observed-hint"]:
+                         "--target-identity"]:
                 with self.subTest(flag=flag):
                     with self.assertRaises(bridge.Usage) as cm:
                         bridge.parse_args(base + [flag])
@@ -1182,20 +1182,31 @@ class BridgeTests(unittest.TestCase):
 
     def test_timeout_text_carries_identity_hint(self):
         st = self.session()
-        st.cfg.observed_hint = "target identity: python3 a.py (cwd /t)"
+        st.cfg.target_identity_seed = {
+            "debuggee": {"executable": "python3", "argv": ["python3", "a.py"], "cwd": "/t"},
+            "endpoint": {}, "adapter": {},
+        }
         self.assertIn("target identity", st.timeout_text(5))
-        st.cfg.observed_hint = ""
+        st.cfg.target_identity_seed = None
         self.assertNotIn("identity", st.timeout_text(5))
 
-    def test_publish_state_carries_observed_target(self):
+    def test_publish_state_carries_schema_v2_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             st = self.session()
             st.cfg.dir = tmp
             st.session_port = 4242
-            st.cfg.observed_target = {"kind": "process", "pid": 7}
+            st.cfg.target_identity_seed = {
+                "debuggee": {"kind": "process", "pid": None},
+                "endpoint": {}, "adapter": {},
+            }
             st.publish_state(False)
             saved = json.loads(Path(tmp, "session.json").read_text())
-            self.assertEqual(saved["observedTarget"], {"kind": "process", "pid": 7})
+            self.assertEqual(saved["schemaVersion"], 2)
+            self.assertNotIn("observedTarget", saved)
+            self.assertIn("targetIdentity", saved)
+            # Main roster entries carry no observed (identity is top-level).
+            entry = st.target_entry("main")
+            self.assertNotIn("observed", entry)
 
     # -- multi-target roster (M-T/M3) -------------------------------------
 
@@ -1929,23 +1940,26 @@ class TargetIdentityTests(unittest.TestCase):
 
     def test_process_event_from_stash_builds_protocol_debuggee(self):
         st = self.session()
-        st.cfg.observed_target = {
-            "kind": "process", "pid": 15298,
-            "executable": ".../site-packages/debugpy/adapter",
-            "argv": [".../site-packages/debugpy/adapter", "--for-server",
-                     "--server-access-token", "SECRET",
-                     "--host", "127.0.0.1", "--port", "5678"],
-            "cwd": None, "source": "os-lsof-ps", "observedAt": 1,
-            "unavailable": [], "warnings": [],
+        st.cfg.target_identity_seed = {
+            "debuggee": {"kind": "process", "pid": None, "confidence": "unavailable"},
+            "endpoint": {
+                "host": "127.0.0.1", "port": 5678, "ownerPid": 15298,
+                "executable": ".../site-packages/debugpy/adapter",
+                "argv": [".../site-packages/debugpy/adapter", "--for-server",
+                         "--server-access-token", "SECRET",
+                         "--host", "127.0.0.1", "--port", "5678"],
+                "cwd": None, "source": "os-lsof-ps",
+            },
+            "adapter": {"confidence": "unavailable"},
         }
         proc = {"type": "event", "event": "process",
                 "body": {"name": "/srv/srv.py", "systemProcessId": 15292,
                          "isLocalProcess": True, "startMethod": "attach"}}
         st.dap = SimpleNamespace(stash=[proc], sock=Mock(), _read_msg=Mock(
             side_effect=socket.timeout("no more")))
-        before = json.dumps(st.cfg.observed_target, sort_keys=True)
+        before = json.dumps(st.cfg.target_identity_seed, sort_keys=True)
         self.assertTrue(st._consume_process_event(timeout=0.2))
-        self.assertEqual(json.dumps(st.cfg.observed_target, sort_keys=True), before)
+        self.assertEqual(json.dumps(st.cfg.target_identity_seed, sort_keys=True), before)
         self.assertEqual(st._process_event["pid"], 15292)
         ident = st._target_identity
         # Debuggee is protocol-confirmed and differs from the endpoint owner.
@@ -1960,7 +1974,8 @@ class TargetIdentityTests(unittest.TestCase):
         blob = json.dumps(ident)
         self.assertNotIn("SECRET", blob)
         self.assertIn("[redacted]", blob)
-        # observedTarget compatibility view untouched (still None here).
+        # Layered seed untouched by the protocol event (still None here
+        # is fine); the seed is CLI-owned, the identity is bridge-built.
         self.assertLessEqual(len(blob), bridge.IDENT_TOTAL_CAP)
         # Debuggee-first hint names the program, not the adapter.
         self.assertIn("/srv/srv.py", st._identity_hint)
@@ -1972,7 +1987,7 @@ class TargetIdentityTests(unittest.TestCase):
         st.dap = SimpleNamespace(stash=[], sock=Mock(),
                                  _read_msg=Mock(side_effect=socket.timeout("quiet")))
         self.assertFalse(st._consume_process_event(timeout=0.1))
-        st.cfg.observed_target = None
+        st.cfg.target_identity_seed = None
         ident = st._build_target_identity()
         self.assertEqual(ident["debuggee"]["confidence"], "unavailable")
         self.assertTrue(any(u["field"] == "pid"
@@ -1982,9 +1997,13 @@ class TargetIdentityTests(unittest.TestCase):
 
     def test_handle_main_event_process_never_parks_or_disturbs_child(self):
         st = self.session()
-        st.cfg.observed_target = {"kind": "process", "pid": 9,
-                                  "argv": ["python", "-m", "debugpy", "--listen", "5678"],
-                                  "source": "os-proc"}
+        st.cfg.target_identity_seed = {
+            "debuggee": {"kind": "process", "pid": None},
+            "endpoint": {"host": "127.0.0.1", "port": 5678, "ownerPid": 9,
+                         "argv": ["python", "-m", "debugpy", "--listen", "5678"],
+                         "source": "os-proc"},
+            "adapter": {"confidence": "unavailable"},
+        }
         proc = {"type": "event", "event": "process",
                 "body": {"name": "srv.py", "systemProcessId": 7,
                          "startMethod": "attach"}}
@@ -2004,8 +2023,7 @@ class TargetIdentityTests(unittest.TestCase):
         st = self.session(kind="launch")
         st.adapter = SimpleNamespace(pid=4242)
         st.adapter_port = 5555
-        st.cfg.observed_target = {"kind": "process", "pid": None,
-                                  "source": "launcher-args"}
+        st.cfg.target_identity_seed = None
         ident = st._build_target_identity()
         self.assertEqual(ident["endpoint"]["ownerPid"], 4242)
         self.assertEqual(ident["adapter"]["pid"], 4242)
@@ -2030,8 +2048,12 @@ class TargetIdentityTests(unittest.TestCase):
 
     def test_wait_context_is_honest_and_additive(self):
         st = self.session()
-        st.cfg.observed_target = {"kind": "process", "pid": 11,
-                                  "argv": ["python", "srv.py"], "source": "os-proc"}
+        st.cfg.target_identity_seed = {
+            "debuggee": {"kind": "process", "pid": None},
+            "endpoint": {"host": "127.0.0.1", "port": 5678, "ownerPid": 11,
+                         "argv": ["python", "srv.py"], "source": "os-proc"},
+            "adapter": {"confidence": "unavailable"},
+        }
         st._note_process_event({"name": "srv.py", "systemProcessId": 12,
                                 "startMethod": "attach"})
         started = time.time() - 2.0
@@ -2047,8 +2069,12 @@ class TargetIdentityTests(unittest.TestCase):
 
     def test_cmd_wait_timeout_carries_wait_context(self):
         st = self.session()
-        st.cfg.observed_target = {"kind": "process", "pid": 11,
-                                  "argv": ["python", "srv.py"], "source": "os-proc"}
+        st.cfg.target_identity_seed = {
+            "debuggee": {"kind": "process", "pid": None},
+            "endpoint": {"host": "127.0.0.1", "port": 5678, "ownerPid": 11,
+                         "argv": ["python", "srv.py"], "source": "os-proc"},
+            "adapter": {"confidence": "unavailable"},
+        }
         st._build_target_identity()
         ctx = st._wait_context(7, time.time())
         st.pump = Mock(side_effect=bridge.StopTimeout(st.timeout_text(7), ctx))
@@ -2062,8 +2088,12 @@ class TargetIdentityTests(unittest.TestCase):
         st = self.session()
         path = os.path.realpath(os.path.join(st.cfg.dir, "a.py"))
         Path(path).write_text("".join(f"line {n}\n" for n in range(12)))
-        st.cfg.observed_target = {"kind": "process", "pid": 11,
-                                  "argv": ["python", "a.py"], "source": "os-proc"}
+        st.cfg.target_identity_seed = {
+            "debuggee": {"kind": "process", "pid": None},
+            "endpoint": {"host": "127.0.0.1", "port": 5678, "ownerPid": 11,
+                         "argv": ["python", "a.py"], "source": "os-proc"},
+            "adapter": {"confidence": "unavailable"},
+        }
         st._build_target_identity()
         st.dap_request = Mock(side_effect=lambda *a, **k: {"breakpoints": [{"verified": True}]})
         ctx = st._wait_context(5, time.time())
@@ -2126,15 +2156,15 @@ class TargetIdentityTests(unittest.TestCase):
     def test_setup_error_payload_from_exception(self):
         self.assertEqual(
             bridge.setup_error_payload(bridge.BridgeErr("boom"), "boom"),
-            {"error": "boom", "phase": "transport"})
+            {"schemaVersion": 2, "error": "boom", "phase": "transport"})
         self.assertEqual(
             bridge.setup_error_payload(
                 bridge.ConfigErr("bad cond"), "bad cond"),
-            {"error": "bad cond", "phase": "config"})
+            {"schemaVersion": 2, "error": "bad cond", "phase": "config"})
         self.assertEqual(
             bridge.setup_error_payload(
                 bridge.Usage("no such line: x"), "no such line: x"),
-            {"error": "no such line: x", "phase": "config"})
+            {"schemaVersion": 2, "error": "no such line: x", "phase": "config"})
 
     def test_handshake_attach_refused_stays_transport(self):
         # Nothing listens: socket/connect failure, phase transport, exact

@@ -324,7 +324,7 @@ function parseArgs(argv) {
     kind: 'launch', dir: null, program: null, nodeBin: 'node',
     host: 'localhost', port: 9229, srcs: [], breaks: [], logpoints: [],
     wantExc: false, timeout: 20, programArgs: [],
-    observedTarget: null, observedHint: '', breakRaws: {},
+    targetIdentitySeed: null, breakRaws: {},
     // Opt-in multi-target: follow worker_threads via NodeWorker
     // (launch only; default is main-only, no flag needed to stay single).
     workers: false,
@@ -358,16 +358,15 @@ function parseArgs(argv) {
     else if (a === '--exit') throw new Usage(`--exit has no CDP equivalent yet (Node): ${rest[i] || ''}`);
     else if (a === '--timeout') cfg.timeout = needInt(a, need(a));
     else if (a === '--workers') cfg.workers = true;
-    else if (a === '--observed-target') {
+    else if (a === '--target-identity') {
       const raw = need(a);
       try {
         const parsed = JSON.parse(raw);
-        cfg.observedTarget = (parsed && typeof parsed === 'object') ? parsed : null;
+        cfg.targetIdentitySeed = (parsed && typeof parsed === 'object') ? parsed : null;
       } catch (_) {
-        cfg.observedTarget = null;
+        cfg.targetIdentitySeed = null;
       }
     }
-    else if (a === '--observed-hint') cfg.observedHint = need(a);
     else throw new Usage(`unknown arg: ${a}`);
   }
   for (const [kind, spec] of pendingStops) {
@@ -441,13 +440,13 @@ function truncStr(s, limit = MAX_STRING) {
 }
 
 // ---------------------------------------------------------------- layered target identity (M-ID)
-// Additive `{debuggee, endpoint, adapter}` roles beside the untouched
-// `observedTarget`. Confidence is strict: protocol-confirmed only from the
-// `/json/list` entry; os-corroborated only for the OS-observed listener
-// owner; everything else is unavailable (never guessed, no parent-tree
-// inference). The inspector runs in-process, so the adapter role is always
-// unavailable-by-design. Every new string is redacted + capped before
-// persistence or output; env is never collected.
+// `{debuggee, endpoint, adapter}` roles with strict confidence:
+// protocol-confirmed only from the `/json/list` entry; os-corroborated
+// only for the OS-observed listener owner (seeded by the CLI's layered
+// `--target-identity` seed); everything else is unavailable (never guessed,
+// no parent-tree inference). The inspector runs in-process, so the adapter
+// role is always unavailable-by-design. Every new string is redacted +
+// capped before persistence or output; env is never collected.
 const IDENT_FIELD_CAP = 512;   // per-field chars (matches the CLI cap)
 const IDENT_ROLE_CAP = 2048;   // per-role serialized chars
 const IDENT_TOTAL_CAP = 4096;  // aggregate chars over the three roles
@@ -662,7 +661,30 @@ function phaseOfError(e) {
 }
 
 function setupErrorPayload(exc, message) {
-  return { error: message, phase: phaseOfError(exc) };
+  return { schemaVersion: 2, error: message, phase: phaseOfError(exc) };
+}
+
+/** One-line redacted hint derived from the layered CLI seed (debuggee
+ *  launcher args, then endpoint listener details). Empty for a null seed;
+ *  an unavailable note when the seed carries nothing nameable. */
+function seedHint(seed) {
+  try {
+    if (!seed || typeof seed !== 'object') return '';
+    for (const role of ['debuggee', 'endpoint']) {
+      const r = seed[role];
+      if (!r || typeof r !== 'object') continue;
+      const exe = (typeof r.executable === 'string') ? r.executable : '?';
+      const argv = Array.isArray(r.argv)
+        ? r.argv.filter((a) => typeof a === 'string').slice(0, 3) : [];
+      const cwd = (typeof r.cwd === 'string') ? r.cwd : '?';
+      if (exe !== '?' || argv.length > 0) {
+        return `target identity: ${exe} ${argv.join(' ')} (cwd ${cwd})`.slice(0, 200);
+      }
+    }
+    return 'target identity unavailable (no independent source)';
+  } catch (_) {
+    return '';
+  }
 }
 
 function dirFromArgv(argv) {
@@ -681,7 +703,7 @@ function dirFromArgv(argv) {
 function writeParseError(argv, message) {
   try {
     const d = dirFromArgv(argv);
-    if (d) writeFile(path.join(d, 'error.json'), JSON.stringify({ error: message, phase: 'config' }));
+    if (d) writeFile(path.join(d, 'error.json'), JSON.stringify({ schemaVersion: 2, error: message, phase: 'config' }));
   } catch (_) { /* best effort: die() below still reports */ }
 }
 
@@ -993,12 +1015,13 @@ class Session {
   }
 
   targetEntry(tid) {
+    // Main entries carry no `observed` (main identity lives in the
+    // top-level targetIdentity); worker entries carry their protocol facts.
     if (tid === 'main') {
       return {
         id: 'main', kind: 'main', pid: null,
         state: (this.exited || this.mainDead) ? 'exited' : (this.paused ? 'stopped' : 'running'),
         lastStop: this.lastStop,
-        observed: (this.cfg && this.cfg.observedTarget) || null,
         scope: 'global',
       };
     }
@@ -1193,13 +1216,22 @@ class Session {
   }
 
   /** Build the layered {debuggee, endpoint, adapter} identity from the kept
-   *  /json/list entry (protocol-confirmed debuggee) plus the CLI-supplied
-   *  OS listener observation (os-corroborated endpoint). No OS pid is ever
-   *  presented as the debuggee; the `observedTarget` view is untouched.
-   *  Everything is redacted + capped here, before any publish. */
+   *  /json/list entry (protocol-confirmed debuggee) plus the CLI seed's
+   *  layered endpoint role (os-corroborated listener owner). A
+   *  malformed/missing seed degrades to all-unavailable, never a spawn
+   *  failure. No OS pid is ever presented as the debuggee. Everything is
+   *  redacted + capped here, before any publish. */
   buildTargetIdentity() {
     const now = Math.floor(Date.now() / 1000);
-    const obs = (this.cfg && this.cfg.observedTarget) || {};
+    const seed = (this.cfg && this.cfg.targetIdentitySeed) || {};
+    const ep = (seed.endpoint && typeof seed.endpoint === 'object') ? seed.endpoint : {};
+    const obs = {
+      pid: ep.ownerPid,
+      source: ep.source,
+      argv: ep.argv,
+      executable: ep.executable,
+      cwd: ep.cwd,
+    };
     const pid = (typeof obs.pid === 'number') ? obs.pid : null;
     const source = (typeof obs.source === 'string') ? obs.source : null;
     const obsArgv = Array.isArray(obs.argv)
@@ -1256,12 +1288,12 @@ class Session {
     };
     this.targetIdentity = identCapIdentity({ debuggee, endpoint, adapter });
     // Debuggee-first one-liner for timeout diagnostics (concise, no
-    // root-cause claim); falls back to the CLI hint when unknown.
+    // root-cause claim); falls back to the layered seed hint when unknown.
     let hint = '';
     if (debuggee.confidence === 'protocol-confirmed') {
       hint = `debuggee: ${debuggee.title || debuggee.url || '?'} (protocol-confirmed)`;
     }
-    if (!hint) hint = this.cfg.observedHint || '';
+    if (!hint) hint = seedHint(this.cfg && this.cfg.targetIdentitySeed);
     this.identityHint = hint.slice(0, 200);
     return this.targetIdentity;
   }
@@ -2178,7 +2210,7 @@ class Session {
     // Timeout message with the compact identity hint (debuggee-first, names
     // the target, never claims root cause).
     let msg = `timeout: no stop within ${fmtTimeout(timeout)}`;
-    const hint = this.identityHint || this.cfg.observedHint;
+    const hint = this.identityHint || seedHint(this.cfg && this.cfg.targetIdentitySeed);
     if (hint) msg += `; ${hint}`;
     return msg;
   }
@@ -2237,8 +2269,8 @@ class Session {
 
   /** Rewrite session.json so `status` shows live truth (parked stop +
    *  time) with zero prior memory. lastStop survives resume/exit — it
-   *  answers 'where was I last', not 'where am I now'. The redacted
-   *  observedTarget rides along verbatim (CLI-computed, atomic write).
+   *  answers 'where was I last', not 'where am I now'. The v2
+   *  session.json carries schemaVersion 2 plus the layered targetIdentity.
    *  Worker target parks/resumes never rewrite the main-focused file:
    *  per-worker last stops live in the roster served by `targets`. */
   publishState(stopped) {
@@ -2252,7 +2284,7 @@ class Session {
       name: path.basename(this.cfg.dir), kind: this.cfg.kind,
       port: this.sessionPort, stopped,
       lastStop: this.lastStop, updatedAt: Math.floor(Date.now() / 1000),
-      observedTarget: this.cfg.observedTarget || null,
+      schemaVersion: 2,
       targetIdentity: this.targetIdentity || null,
     }));
   }
@@ -3860,11 +3892,10 @@ async function serve(st, server, queue) {
 }
 
 function writeSessionFile(dir, obj, cfg, st) {
-  // Main-path session.json writes carry the redacted observed identity
-  // (CLI-computed) plus the layered targetIdentity (bridge-built); explicit
-  // nulls keep legacy readers honest.
-  if (obj && typeof obj === 'object' && !('observedTarget' in obj)) {
-    obj = { ...obj, observedTarget: (cfg && cfg.observedTarget) || null };
+  // Main-path session.json writes carry schemaVersion 2 plus the layered
+  // targetIdentity (bridge-built); explicit nulls keep readers honest.
+  if (obj && typeof obj === 'object' && !('schemaVersion' in obj)) {
+    obj = { ...obj, schemaVersion: 2 };
   }
   if (obj && typeof obj === 'object' && !('targetIdentity' in obj)) {
     obj = { ...obj, targetIdentity: (st && st.targetIdentity) || null };

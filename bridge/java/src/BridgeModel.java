@@ -46,8 +46,8 @@ class Config {
         List<String> excFilters = new ArrayList<>();
         Map<String, String> condByLoc = new LinkedHashMap<>(); // "cls:line" -> condition
         Map<String, String> breakRaws = new LinkedHashMap<>(); // "cls:line|cond" -> stored raw (remove/clear echo)
-        String observedTargetJson = null; // redacted CLI-observed identity (verbatim JSON)
-        String observedHint = ""; // one-line redacted diagnostic hint
+        String targetIdentitySeedJson = null; // layered CLI seed identity (verbatim JSON)
+        String seedHint = ""; // one-line hint derived from the seed at parse
         String targetIdentityJson = null; // layered {debuggee,endpoint,adapter} (verbatim JSON, redacted+capped)
         String identityHint = ""; // debuggee-first one-liner for timeouts
         List<Logpoint> logpoints = new ArrayList<>();

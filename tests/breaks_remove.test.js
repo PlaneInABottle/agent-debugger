@@ -26,7 +26,7 @@ function loadBridge(rel, exports) {
 }
 
 const node = loadBridge('bridge/node/src/nodebridge.js', 'Session, parseBreak, canon');
-const browser = loadBridge('bridge/browser/src/browserbridge.js', 'Session, parseBreak, fragRegex, buildObservedTab, tabHint');
+const browser = loadBridge('bridge/browser/src/browserbridge.js', 'Session, parseBreak, fragRegex, buildTabIdentity, tabHint');
 
 function tmpdir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -201,18 +201,21 @@ test('node: removing a break re-arms a shadowed startup logpoint', async () => {
   assert.equal(rearmed.state, 'verified');
 });
 
-test('node: session.json carries the redacted observed identity', async () => {  const dir = tmpdir('m2-rm-node-');
+test('node: session.json carries schemaVersion 2 and layered identity', async () => {  const dir = tmpdir('m2-rm-node-');
   const st = new node.Session({
     kind: 'attach', dir, host: 'localhost', port: 9229, srcs: [],
     breaks: [], logpoints: [], wantExc: false, timeout: 20, programArgs: [],
-    observedTarget: { kind: 'process', pid: 7 },
-    observedHint: 'target identity: node app.js (cwd /t)',
+    targetIdentitySeed: {
+      debuggee: { executable: 'node', argv: ['node', 'app.js'], cwd: '/t' },
+      endpoint: {}, adapter: {},
+    },
   });
   st.sessionPort = 4242;
   st.publishState(false);
   const saved = JSON.parse(fs.readFileSync(path.join(dir, 'session.json'), 'utf-8'));
-  assert.deepEqual(saved.observedTarget, { kind: 'process', pid: 7 });
-  assert.match(st.timeoutText(5), /target identity: node app\.js/);
+  assert.equal(saved.schemaVersion, 2);
+  assert.ok(!('observedTarget' in saved));
+  assert.match(st.timeoutText(5), /target identity: node node app\.js/);
 });
 
 // ---- browser ----
@@ -271,19 +274,19 @@ test('browser: handshake records tab identity, publish persists it', async () =>
   // Handshake shape without network: tab known, CDP stubbed past attach.
   st.tab = { id: 'ABC', title: 'Shop', url: 'http://h/app.js', webSocketDebuggerUrl: 'ws://x' };
   const t = st.tab;
-  st.cfg.observedTarget = {
+  st.cfg.tabIdentity = {
     kind: 'tab', url: t.url, title: t.title, targetId: t.id,
     debugEndpoint: '127.0.0.1:9222', cwd: null, argv: null,
     notApplicable: ['cwd', 'argv'], source: 'cdp-target-list',
     observedAt: 1, unavailable: [], warnings: [],
   };
   st.sessionPort = 4242;
+  st.buildTargetIdentity();
   st.publishState(false);
   const saved = JSON.parse(fs.readFileSync(path.join(dir, 'session.json'), 'utf-8'));
-  assert.equal(saved.observedTarget.kind, 'tab');
-  assert.equal(saved.observedTarget.url, 'http://h/app.js');
-  assert.equal(saved.observedTarget.targetId, 'ABC');
-  assert.deepEqual(saved.observedTarget.notApplicable, ['cwd', 'argv']);
+  assert.equal(saved.schemaVersion, 2);
+  assert.ok(!('observedTarget' in saved));
+  assert.equal(saved.targetIdentity.debuggee.targetId, 'ABC');
 });
 
 test('browser: long tab url/title are capped and query secrets redacted', () => {
@@ -294,7 +297,7 @@ test('browser: long tab url/title are capped and query secrets redacted', () => 
     title: 'Shop',
     url: `http://h/app.js?token=${sentinel}&next=1&author=Jane`,
   };
-  const red = browser.buildObservedTab(secretTab, 'localhost', 9222, 1);
+  const red = browser.buildTabIdentity(secretTab, 'localhost', 9222, 1);
   const redDumped = JSON.stringify(red);
   assert.ok(!redDumped.includes(sentinel), 'raw query secret must not persist');
   assert.ok(red.url.includes('token=%5Bredacted%5D'), 'token query value redacted');
@@ -306,7 +309,7 @@ test('browser: long tab url/title are capped and query secrets redacted', () => 
     title: `Shop ${'t'.repeat(600)}`,
     url: `http://h/${'p'.repeat(600)}/app.js?token=${sentinel}`,
   };
-  const obs = browser.buildObservedTab(longTab, 'localhost', 9222, 1);
+  const obs = browser.buildTabIdentity(longTab, 'localhost', 9222, 1);
   const dumped = JSON.stringify(obs);
   assert.ok(!dumped.includes(sentinel), 'raw query secret must not persist');
   assert.ok(obs.url.includes('(+'), 'url capped with shared idiom');

@@ -63,13 +63,13 @@ for (const [name, mod] of [['node', node], ['browser', browser]]) {
   test(`${name} phase derives from the exception type, error unchanged`, () => {
     assert.deepEqual(
       mod.setupErrorPayload(new mod.BridgeErr('boom'), 'boom'),
-      { error: 'boom', phase: 'transport' });
+      { schemaVersion: 2, error: 'boom', phase: 'transport' });
     assert.deepEqual(
       mod.setupErrorPayload(new mod.Usage('no such file: x'), 'no such file: x'),
-      { error: 'no such file: x', phase: 'config' });
+      { schemaVersion: 2, error: 'no such file: x', phase: 'config' });
     assert.deepEqual(
       mod.setupErrorPayload(new mod.ConfigError('CDP setBreakpoint failed: bad cond'), 'CDP setBreakpoint failed: bad cond'),
-      { error: 'CDP setBreakpoint failed: bad cond', phase: 'config' });
+      { schemaVersion: 2, error: 'CDP setBreakpoint failed: bad cond', phase: 'config' });
     // ConfigError is still a BridgeErr: existing catches keep working.
     assert.ok(new mod.ConfigError('x') instanceof mod.BridgeErr);
     // Transport losses, timeouts, exits, unexpected values: transport.
@@ -139,6 +139,7 @@ for (const [name, mod] of [['node', node], ['browser', browser]]) {
     const dir = tmpdir('phase-');
     mod.writeParseError(['session', '--dir', dir, '--break', 'x'], 'no such line: x');
     const body = JSON.parse(fs.readFileSync(path.join(dir, 'error.json'), 'utf-8'));
+    assert.equal(body.schemaVersion, 2);
     assert.equal(body.error, 'no such line: x');
     assert.equal(body.phase, 'config');
     // No --dir or a bad dir: never throws, nothing to read.

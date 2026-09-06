@@ -28,6 +28,78 @@ def free_port():
         return sock.getsockname()[1]
 
 
+class _MockOldBridge(threading.Thread):
+    """Minimal framed old-protocol session server (Content-Length JSON, no
+    schemaVersion anywhere): proves `close` is version-agnostic and a live
+    legacy daemon blocks spawn/collisions. Replies ok to everything; on
+    `close` it ACKs then shuts its listener down (confirmed close)."""
+    daemon = True
+
+    def __init__(self):
+        super().__init__()
+        self.sock = socket.socket()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.port = self.sock.getsockname()[1]
+        self.sock.listen(5)
+        self.sock.settimeout(0.5)
+        self.alive = True
+
+    def run(self):
+        while self.alive:
+            try:
+                conn, _ = self.sock.accept()
+            except (socket.timeout, OSError):
+                if not self.alive:
+                    return
+                continue
+            try:
+                self._serve(conn)
+            except Exception:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _read_frame(self, conn):
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = conn.recv(4096)
+            if not chunk:
+                return None
+            buf += chunk
+        head, rest = buf.split(b"\r\n\r\n", 1)
+        length = int(head.decode().split("Content-Length:")[1].strip().split()[0])
+        while len(rest) < length:
+            chunk = conn.recv(4096)
+            if not chunk:
+                return None
+            rest += chunk
+        return json.loads(rest[:length].decode())
+
+    def _serve(self, conn):
+        body = self._read_frame(conn)
+        if body is None:
+            return
+        payload = json.dumps({"ok": True, "target": "main"}).encode()
+        conn.sendall(b"Content-Length: %d\r\n\r\n" % len(payload) + payload)
+        if body.get("cmd") == "close":
+            self.alive = False
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+
+    def stop(self):
+        self.alive = False
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
 class LiveTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -739,7 +811,8 @@ class LiveTests(unittest.TestCase):
                         "--logpoint", f"{self.py_fast}:1:fast-exit-marker",
                         "--timeout", "10")
         self.assertIn("requestedTarget", data)
-        self.assertIn("observedTarget", data)
+        self.assertIn("targetIdentity", data)
+        self.assertNotIn("observedTarget", data)
         if "logs" in data:
             self.assertIn("already exited", data.get("warning", ""))
             lines = data["logs"]["lines"]
@@ -1389,10 +1462,11 @@ class LiveTests(unittest.TestCase):
         self.assertEqual(row["target"].get("module"), "modpkg.runner")
         ctx = self.cli(name, "context")
         self.assertEqual(ctx["requestedTarget"].get("module"), "modpkg.runner")
-        observed = ctx["observedTarget"]
-        self.assertEqual(observed["kind"], "process")
-        self.assertIn("-m", observed["argv"])
-        self.assertIn("modpkg.runner", observed["argv"])
+        dbg = ctx["targetIdentity"]["debuggee"]
+        self.assertEqual(dbg["confidence"], "protocol-confirmed")
+        argv = (dbg.get("osDetails") or {}).get("argv") or []
+        self.assertIn("-m", argv)
+        self.assertIn("modpkg.runner", argv)
         self.assertTrue(self.cli(name, "close")["confirmed"])
         self.sessions.remove(name)
         # Unknown module: launch fails (the break forces module resolution),
@@ -1421,9 +1495,10 @@ class LiveTests(unittest.TestCase):
 
     def test_24_attach_target_identity(self):
         """M-I: attach responses + status/context surface requestedTarget
-        (endpoint, pid null) and observedTarget (kernel-observed pid/exe/
-        argv/cwd, redacted); secrets never persist; browser reports tab
-        metadata with no process claim."""
+        (endpoint, pid null) and layered targetIdentity (debuggee
+        protocol-confirmed from protocol data, endpoint os-corroborated
+        listener owner, redacted); secrets never persist; browser reports
+        tab metadata with no process claim."""
         self._ensure_idle_fixtures()
         sentinel = "BATCH1SECRET-9f8e7d"
         # Java target carries a secret JVM flag (JVM-accepted, no behavior change).
@@ -1439,10 +1514,9 @@ class LiveTests(unittest.TestCase):
         requested = data["requestedTarget"]
         self.assertEqual(requested["port"], port)
         self.assertIsNone(requested.get("pid"))
-        observed = data["observedTarget"]
-        self.assertEqual(observed["kind"], "process")
-        self.assertEqual(observed["pid"], proc.pid)
-        argv = observed["argv"]
+        endpoint = data["targetIdentity"]["endpoint"]
+        self.assertEqual(endpoint["ownerPid"], proc.pid)
+        argv = endpoint["argv"]
         self.assertTrue(any("IdleAttach" in a for a in argv))
         redacted = [a for a in argv if "token" in a.lower()]
         self.assertTrue(redacted and all("[redacted]" in a for a in redacted),
@@ -1456,8 +1530,9 @@ class LiveTests(unittest.TestCase):
                                  f"raw secret leaked into {fname}")
         ctx = self.cli(name, "context") if data.get("location") else None
         status_row = next(r for r in self.cli(name, "status")["sessions"] if r["name"] == name)
-        self.assertEqual(status_row["observedTarget"]["pid"], proc.pid)
+        self.assertEqual(status_row["targetIdentity"]["endpoint"]["ownerPid"], proc.pid)
         self.assertEqual(status_row["requestedTarget"]["port"], port)
+        self.assertNotIn("observedTarget", status_row)
         self.assertNotIn(sentinel, json.dumps(status_row))
         self.assertTrue(self.cli(name, "close")["confirmed"])
         self.sessions.remove(name)
@@ -1469,14 +1544,14 @@ class LiveTests(unittest.TestCase):
         name = "mi-py"
         self.sessions.add(name)
         data = self.cli(name, "py", "attach", "--port", str(port), "--timeout", "2")
-        observed = data["observedTarget"]
+        endpoint = data["targetIdentity"]["endpoint"]
         # debugpy forks: the kernel-observed listener is a child of the
         # spawned process, so verify it is the debugpy listener itself.
-        self.assertTrue(any("debugpy" in a for a in observed["argv"]))
-        self.assertTrue(any(str(port) in a for a in observed["argv"]))
-        self.assertEqual(observed["source"], "os-lsof-ps")
-        self.assertEqual(observed["unavailable"], [])
-        listener = subprocess.run(["ps", "-p", str(observed["pid"]), "-o", "args="],
+        self.assertTrue(any("debugpy" in a for a in endpoint["argv"]))
+        self.assertTrue(any(str(port) in a for a in endpoint["argv"]))
+        self.assertEqual(endpoint["source"], "os-lsof-ps")
+        self.assertEqual(endpoint["unavailable"], [])
+        listener = subprocess.run(["ps", "-p", str(endpoint["ownerPid"]), "-o", "args="],
                                   capture_output=True, text=True, timeout=10)
         self.assertIn("debugpy", listener.stdout)
         self.assertIn(str(port), listener.stdout)
@@ -1485,8 +1560,8 @@ class LiveTests(unittest.TestCase):
 
     def test_25_wrong_process_same_path(self):
         """M-I: the same script in two processes is distinguishable — each
-        attach shows the observed pid/argv of its own listener, so a break
-        armed on the wrong port is visibly the wrong target."""
+        attach shows the endpoint ownerPid/argv of its own listener, so a
+        break armed on the wrong port is visibly the wrong target."""
         self._ensure_idle_fixtures()
         gate_a = self.fixture / "migo-a"
         gate_b = self.fixture / "migo-b"
@@ -1516,13 +1591,13 @@ class LiveTests(unittest.TestCase):
                                        ("mi-two-b", port_b, proc_b, gate_b)]:
             self.sessions.add(name)
             data = self.cli(name, "py", "attach", "--port", str(port), "--timeout", "2")
-            observed = data["observedTarget"]
+            endpoint = data["targetIdentity"]["endpoint"]
             # debugpy forks: the observed listener is a child process, so
             # each twin is identified by its own port in its own argv.
-            self.assertTrue(any("debugpy" in a for a in observed["argv"]))
-            self.assertTrue(any(str(port) in a for a in observed["argv"]),
-                            f"{name} identity must name its own port: {observed['argv']}")
-            seen[name] = observed["pid"]
+            self.assertTrue(any("debugpy" in a for a in endpoint["argv"]))
+            self.assertTrue(any(str(port) in a for a in endpoint["argv"]),
+                            f"{name} identity must name its own port: {endpoint['argv']}")
+            seen[name] = endpoint["ownerPid"]
             self.assertTrue(self.cli(name, "close")["confirmed"])
             self.sessions.remove(name)
         self.assertNotEqual(seen["mi-two-a"], seen["mi-two-b"])
@@ -1691,16 +1766,17 @@ class LiveTests(unittest.TestCase):
         self.sessions.add(name)
         data = self.cli(name, "browser", "attach", "--port", str(cdp_port), "--tab", url,
                         "--break", "app.js:8")
-        observed = data["observedTarget"]
-        self.assertEqual(observed["kind"], "tab")
-        self.assertEqual(observed["url"], url)
-        self.assertTrue(observed["targetId"])
-        self.assertEqual(observed["debugEndpoint"], f"localhost:{cdp_port}")
-        self.assertIn("cwd", observed["notApplicable"])
-        self.assertIn("argv", observed["notApplicable"])
+        self.assertNotIn("observedTarget", data)
+        dbg = data["targetIdentity"]["debuggee"]
+        self.assertEqual(dbg["kind"], "tab")
+        self.assertEqual(dbg["url"], url)
+        self.assertTrue(dbg["targetId"])
+        self.assertEqual(dbg["confidence"], "protocol-confirmed")
+        self.assertIn("cwd", dbg["notApplicable"])
+        self.assertIn("argv", dbg["notApplicable"])
         row = next(r for r in self.cli(name, "status")["sessions"] if r["name"] == name)
-        self.assertEqual(row["observedTarget"]["kind"], "tab")
-        self.assertEqual(row["observedTarget"]["url"], url)
+        self.assertEqual(row["targetIdentity"]["debuggee"]["kind"], "tab")
+        self.assertEqual(row["targetIdentity"]["debuggee"]["url"], url)
         self.assertEqual(row["requestedTarget"]["port"], cdp_port)
         added = self.cli(name, "breaks", "add", "--break", "app.js:2")
         self.assertEqual(len(added["added"]), 1)
@@ -2048,6 +2124,177 @@ class LiveTests(unittest.TestCase):
                 except Exception:
                     pass
                 self.sessions.remove(name)
+
+    def _write_old_fixture(self, name, kind="attach", port=1, lang="py", requested=None):
+        """Legacy v1 session dir: version-less markers + old session file."""
+        d = self.home / ".agent-debugger/sessions" / name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "lang.json").write_text(json.dumps({"lang": lang}))
+        stops = {"breaks": [], "logpoints": [], "watches": [], "exits": [],
+                 "sources": [], "timeout": 7,
+                 "target": {"host": "127.0.0.1", "port": port},
+                 "requestedTarget": requested if requested is not None
+                 else {"host": "127.0.0.1", "port": port, "pid": None}}
+        (d / "stops.json").write_text(json.dumps(stops))
+        (d / "session.json").write_text(json.dumps(
+            {"name": name, "kind": kind, "port": port,
+             "stopped": True, "lastStop": None, "updatedAt": 1}))
+        return d
+
+    def test_32_schema_v1_old_session_reject_status_close(self):
+        """Old dirs reject every gated command, stay status-visible as
+        unsupported, and close (dead dir, plus a framed-mock old-live
+        bridge speaking the old protocol with no version knowledge)."""
+        name = "oldneg"
+        self._write_old_fixture(name)
+        for args in [
+            ("continue", "--timeout", "1"), ("wait", "--timeout", "1"),
+            ("capture", "--timeout", "1"), ("step", "over", "--timeout", "1"),
+            ("stack",), ("threads",), ("vars",), ("eval", "1+1"),
+            ("reload", "--timeout", "1"), ("breaks",), ("logs",),
+            ("targets",), ("context",),
+            ("breaks", "add", "--break", "a.py:1"),
+            ("breaks", "remove", "--break", "a.py:1"),
+            ("breaks", "clear"),
+        ]:
+            data = self.cli(name, *args, ok=False)
+            self.assertFalse(data["ok"], args)
+            self.assertIn(
+                f"unsupported session '{name}' (schema v1; close it and recreate)",
+                data["error"], args)
+        rows = self.cli("unused", "status")["sessions"]
+        row = next(r for r in rows if r["name"] == name)
+        self.assertTrue(row["unsupported"] and row["stale"])
+        self.assertNotIn("observedTarget", row)
+        self.assertIn("and recreate (unsupported schema v1)", row["hint"])
+        out = self.cli(name, "close")
+        self.assertEqual(out["closed"], name)
+        self._assert_absent(name)
+        # Old-live close through a minimal framed mock (Content-Length JSON,
+        # old protocol, no schemaVersion anywhere): version-agnostic close.
+        mock = _MockOldBridge()
+        mock.start()
+        self.addCleanup(mock.stop)
+        live = "oldlive"
+        self._write_old_fixture(live, port=mock.port)
+        out = self.cli(live, "close", timeout=85)
+        self.assertEqual(out["closed"], live)
+        self.assertTrue(out["confirmed"], "mock ACKed and died: confirmed close")
+        self._assert_absent(live)
+
+    def test_33_legacy_reclaim_proven_dead_vs_refuse(self):
+        """Same-name start: v2-present bails always; old-present reclaims
+        only when proven dead (numeric port + silent daemon); corrupt or
+        possibly-live old state refuses for `close`."""
+        script = self.fixture / "repeat.py"
+        name = "reclaim-me"
+        # Proven dead legacy dir reclaims into a live v2 session.
+        self._write_old_fixture(name, kind="launch", port=1)
+        self.sessions.add(name)
+        data = self.cli(name, "py", "start", str(script),
+                        "--break", f"{script}:4", "--timeout", "10")
+        self.assertIn("location", data)
+        markers = json.loads(
+            (self.home / ".agent-debugger/sessions" / name / "lang.json").read_text())
+        self.assertEqual(markers["schemaVersion"], 2)
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+        # Corrupt session.json: unprovable, refuse; dir survives for close.
+        self._write_old_fixture(name, kind="launch", port=1)
+        (self.home / ".agent-debugger/sessions" / name / "session.json").write_text("not json")
+        data = self.cli(name, "py", "start", str(script), "--timeout", "2", ok=False)
+        self.assertFalse(data["ok"])
+        self.assertIn(f"unsupported session '{name}' (schema v1; close it first)",
+                      data["error"])
+        out = self.cli(name, "close")
+        self.assertEqual(out["closed"], name)
+        self._assert_absent(name)
+        # v2-present dir bails always, live or dead.
+        self.sessions.add(name)
+        self.cli(name, "py", "start", str(script),
+                 "--break", f"{script}:4", "--timeout", "10")
+        data = self.cli(name, "py", "start", str(script), "--timeout", "2", ok=False)
+        self.assertIn(f"session '{name}' already exists (close it first)", data["error"])
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+
+    def test_34_legacy_live_blocks_attach(self):
+        """Exclusive attach never proceeds while a live legacy session
+        exists: endpoint-matched old owner blocks first (all-unavailable
+        identity, zero pids), then the global scan blocks unknowable
+        endpoints; closing the legacy dirs unblocks. Also covers
+        attach-before-publish layered identity and marker-less session
+        staleness."""
+        self._ensure_idle_fixtures()
+        port = free_port()
+        proc = self._launch_target(self._m1_target("py", port), "legacytarget")
+        self._wait_log("legacytarget", "ready")
+        time.sleep(1)
+        match_mock = _MockOldBridge()
+        match_mock.start()
+        self.addCleanup(match_mock.stop)
+        global_mock = _MockOldBridge()
+        global_mock.start()
+        self.addCleanup(global_mock.stop)
+        self._write_old_fixture(
+            "legacy-match", kind="attach", port=match_mock.port,
+            requested={"host": "127.0.0.1", "port": port, "pid": None})
+        self._write_old_fixture(
+            "legacy-global", kind="attach", port=global_mock.port,
+            requested={"host": "127.0.0.1", "port": 59999, "pid": None})
+        # (a) endpoint-matched old owner: names the session, zero pids.
+        data = self.cli("legacy-new", "py", "attach", "--port", str(port),
+                        "--timeout", "2", ok=False)
+        self.assertFalse(data["ok"])
+        self.assertIn("already attached by session 'legacy-match'", data["error"])
+        self.assertEqual(data["diagnosis"]["code"], "endpoint-already-attached")
+        ident = data["targetIdentity"]
+        for role in ["debuggee", "endpoint", "adapter"]:
+            self.assertIn(role, ident)
+        self.assertNotRegex(json.dumps(ident), r'"(ownerPid|pid)":\s*\d',
+                            f"legacy owner must carry zero pids: {ident}")
+        # (b) after closing the match, the global scan still blocks.
+        out = self.cli("legacy-match", "close", timeout=85)
+        self.assertEqual(out["closed"], "legacy-match")
+        data = self.cli("legacy-new", "py", "attach", "--port", str(port),
+                        "--timeout", "2", ok=False)
+        self.assertIn("unsupported live legacy session(s) 'legacy-global'", data["error"])
+        self.assertEqual(data["diagnosis"]["code"], "unsupported-legacy-live")
+        for role in ["debuggee", "endpoint", "adapter"]:
+            self.assertEqual(data["targetIdentity"][role]["confidence"], "unavailable")
+        # Closing the last legacy dir unblocks the attach.
+        out = self.cli("legacy-global", "close", timeout=85)
+        self.assertEqual(out["closed"], "legacy-global")
+        name = "legacy-new-ok"
+        self.sessions.add(name)
+        data = self.cli(name, "py", "attach", "--port", str(port), "--timeout", "2")
+        self.assertIn("targetIdentity", data)
+        row = next(r for r in self.cli(name, "status")["sessions"] if r["name"] == name)
+        self.assertFalse(row["unsupported"] or row["stale"])
+        self.assertNotIn("observedTarget", row)
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+        # Attach failure before any publish carries layered attempted identity.
+        data = self.cli("deadattach", "py", "attach", "--port", "9",
+                        "--timeout", "1", ok=False)
+        self.assertTrue(data["error"].startswith("attach failed:"), data)
+        self.assertNotIn("observedTarget", data)
+        self.assertEqual(data["targetIdentity"]["debuggee"]["confidence"], "unavailable")
+        self.assertEqual(data["requestedTarget"]["port"], 9)
+        # v2 markers + marker-less session.json: stale, never current.
+        weird = "badmarker"
+        d = self.home / ".agent-debugger/sessions" / weird
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "lang.json").write_text(json.dumps({"lang": "py", "schemaVersion": 2}))
+        (d / "stops.json").write_text(json.dumps({"breaks": [], "schemaVersion": 2,
+                                                  "requestedTarget": {}}))
+        (d / "session.json").write_text(json.dumps({"name": weird, "kind": "attach",
+                                                    "port": 1, "stopped": True}))
+        row = next(r for r in self.cli("unused", "status")["sessions"] if r["name"] == weird)
+        self.assertTrue(row["unsupported"] and row["stale"])
+        out = self.cli(weird, "close")
+        self.assertEqual(out["closed"], weird)
+        self._assert_absent(weird)
 
     def _m1_target(self, lang, port):
         if lang == "py":

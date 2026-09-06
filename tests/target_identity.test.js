@@ -74,10 +74,15 @@ test('node discoverAttach keeps the selected /json/list entry', () => {
 
 test('node endpoint corroborates (never confirms) the OS owner pid', () => {
   const st = nodeSession(tmpdir('ti-node-'), {
-    observedTarget: {
-      kind: 'process', pid: 4242, executable: '/usr/bin/node',
-      argv: ['node', '--inspect=9333', 'sleepy.mjs', '--server-access-token', 'HEX'],
-      cwd: '/srv', source: 'os-proc',
+    targetIdentitySeed: {
+      debuggee: { kind: 'process', pid: null, confidence: 'unavailable' },
+      endpoint: {
+        host: '127.0.0.1', port: 9333, ownerPid: 4242,
+        executable: '/usr/bin/node',
+        argv: ['node', '--inspect=9333', 'sleepy.mjs', '--server-access-token', 'HEX'],
+        cwd: '/srv', source: 'os-proc',
+      },
+      adapter: { confidence: 'unavailable' },
     },
   });
   st.attachEntry = { id: 'n7', title: 'sleepy.mjs', url: 'file:///srv/sleepy.mjs', type: 'node' };
@@ -187,7 +192,7 @@ function browserSession(dir, over = {}) {
 
 test('browser tab becomes the protocol-confirmed debuggee', () => {
   const st = browserSession(tmpdir('ti-br-'));
-  st.cfg.observedTarget = {
+  st.cfg.tabIdentity = {
     kind: 'tab', url: 'http://h/app.js?token=HEX', title: 'Shop',
     targetId: 'ABC', debugEndpoint: 'localhost:9222',
     cwd: null, argv: null, notApplicable: ['cwd', 'argv'],
@@ -206,7 +211,7 @@ test('browser tab becomes the protocol-confirmed debuggee', () => {
 
 test('browser wait timeout carries trigger-unknown waitContext', async () => {
   const st = browserSession(tmpdir('ti-br-'));
-  st.cfg.observedTarget = {
+  st.cfg.tabIdentity = {
     kind: 'tab', url: 'http://h/app.js', title: 'T', targetId: 'ABC',
     debugEndpoint: 'localhost:9222', cwd: null, argv: null,
     notApplicable: ['cwd', 'argv'], source: 'cdp-target-list',

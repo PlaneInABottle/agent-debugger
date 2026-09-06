@@ -29,7 +29,7 @@ function loadBridge(rel, exports) {
 
 const browser = loadBridge('bridge/browser/src/browserbridge.js',
   'Session, parseBreak, parseLogpoint, fragRegex, normFrag, slidLine, ' +
-  'redactUrl, pickTab, tabSummary, buildObservedTab, isSecretQueryKey');
+  'redactUrl, pickTab, tabSummary, buildTabIdentity, isSecretQueryKey');
 const node = loadBridge('bridge/node/src/nodebridge.js',
   'Session, slidLine');
 
@@ -125,8 +125,8 @@ test('browser cmdThreads: served tab identity carries no secret', async () => {
   assert.ok(!resp.threads[0].name.includes('ZZZ9'), 'served thread name redacted');
 });
 
-test('browser buildObservedTab: persisted identity redacts id/url/title', () => {
-  const obs = browser.buildObservedTab(
+test('browser buildTabIdentity: persisted identity redacts id/url/title', () => {
+  const obs = browser.buildTabIdentity(
     { id: 'id?token=SECRET123', title: SECRET_TITLE, url: SECRET_URL },
     'localhost', 9222, 1);
   for (const v of [obs.url, obs.title, obs.targetId]) {

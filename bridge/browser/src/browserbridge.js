@@ -144,7 +144,7 @@ function parseArgs(argv) {
     host: 'localhost', port: 9222, tab: null,
     srcs: [], breaks: [], logpoints: [],
     wantExc: false, timeout: 20,
-    observedTarget: null, observedHint: '', breakRaws: {},
+    tabIdentity: null, tabHint: '', breakRaws: {},
   };
   const rest = argv;
   let i = 0;
@@ -175,6 +175,10 @@ function parseArgs(argv) {
       }
     }
     else if (a === '--logpoint') parseLogpoint(need(a), cfg);
+    // The CLI always passes --target-identity (layered seed, null for
+    // browser): accepted and ignored — the tab identity below is built
+    // from /json/list instead. Malformed seeds never fail the bridge.
+    else if (a === '--target-identity') need(a);
     else if (a === '--watch') throw new Usage(`--watch has no CDP equivalent (browser): ${rest[i] || ''}`);
     else if (a === '--exit') throw new Usage(`--exit has no CDP equivalent (browser): ${rest[i] || ''}`);
     else throw new Usage(`unknown arg: ${a}`);
@@ -210,8 +214,9 @@ function truncField(s) {
 }
 
 // ---------------------------------------------------------------- layered target identity (M-ID)
-// Additive `{debuggee, endpoint, adapter}` roles beside the untouched
-// `observedTarget`. The attached tab IS the debuggee (protocol-confirmed
+// `{debuggee, endpoint, adapter}` roles with strict confidence (no flat
+// identity view remains). The attached tab IS the debuggee
+// (protocol-confirmed
 // via /json/list); the endpoint is the debugger listener; there is no
 // adapter process and no process claim anywhere. Tab fields reuse the
 // redacted + capped tab identity above; the aggregate is bounded here.
@@ -291,7 +296,7 @@ function redactUrl(raw) {
 
 /** Tab identity for session.json/status (no process claim). Redacted and
  *  capped before return — raw tab query secrets never persist or print. */
-function buildObservedTab(tab, host, port, nowSec) {
+function buildTabIdentity(tab, host, port, nowSec) {
   const t = tab || {};
   const obs = {
     kind: 'tab',
@@ -559,7 +564,7 @@ function phaseOfError(e) {
 }
 
 function setupErrorPayload(exc, message) {
-  return { error: message, phase: phaseOfError(exc) };
+  return { schemaVersion: 2, error: message, phase: phaseOfError(exc) };
 }
 
 function dirFromArgv(argv) {
@@ -578,7 +583,7 @@ function dirFromArgv(argv) {
 function writeParseError(argv, message) {
   try {
     const d = dirFromArgv(argv);
-    if (d) writeFile(path.join(d, 'error.json'), JSON.stringify({ error: message, phase: 'config' }));
+    if (d) writeFile(path.join(d, 'error.json'), JSON.stringify({ schemaVersion: 2, error: message, phase: 'config' }));
   } catch (_) { /* best effort: die() below still reports */ }
 }
 
@@ -670,9 +675,9 @@ class Session {
     // to, persisted redacted into session.json and surfaced in
     // status/context. cwd/argv are not applicable to tabs. Immutable for
     // the session (handshake-time only, never re-probed per command).
-    this.cfg.observedTarget = buildObservedTab(
+    this.cfg.tabIdentity = buildTabIdentity(
       this.tab, this.cfg.host, this.cfg.port, Math.floor(Date.now() / 1000));
-    this.cfg.observedHint = tabHint(this.cfg.observedTarget);
+    this.cfg.tabHint = tabHint(this.cfg.tabIdentity);
     this.buildTargetIdentity();
     const WebSocket = loadWs();
     const ws = new WebSocket(this.tab.webSocketDebuggerUrl, { maxPayload: 256 * 1024 * 1024 });
@@ -856,10 +861,10 @@ class Session {
   /** Build the layered {debuggee, endpoint, adapter} identity from the
    *  attached tab (protocol-confirmed debuggee) plus the debugger listener
    *  (endpoint). The tab fields reuse the redacted + capped tab identity;
-   *  the aggregate is bounded here. The `observedTarget` view is untouched. */
+   *  the aggregate is bounded here. */
   buildTargetIdentity() {
     const now = Math.floor(Date.now() / 1000);
-    const obs = (this.cfg && this.cfg.observedTarget) || {};
+    const obs = (this.cfg && this.cfg.tabIdentity) || {};
     // -- debuggee: the attached tab itself (no process claim, ever).
     const debuggee = {
       kind: 'tab',
@@ -900,12 +905,12 @@ class Session {
     };
     this.targetIdentity = identShrinkToTotal({ debuggee, endpoint, adapter }, IDENT_TOTAL_CAP);
     // Debuggee-first one-liner for timeout diagnostics (concise, no
-    // root-cause claim); falls back to the CLI hint when unknown.
+    // root-cause claim); falls back to the tab hint when unknown.
     let hint = '';
     if (debuggee.confidence === 'protocol-confirmed') {
       hint = `debuggee: tab ${debuggee.url || debuggee.title || '?'} (protocol-confirmed)`;
     }
-    if (!hint) hint = this.cfg.observedHint || '';
+    if (!hint) hint = this.cfg.tabHint || '';
     this.identityHint = hint.slice(0, 200);
     return this.targetIdentity;
   }
@@ -1222,7 +1227,7 @@ class Session {
     // Timeout message with the compact identity hint (debuggee-first: the
     // tab, never claims root cause).
     let msg = `timeout: no stop within ${fmtTimeout(timeout)}`;
-    const hint = this.identityHint || this.cfg.observedHint;
+    const hint = this.identityHint || this.cfg.tabHint;
     if (hint) msg += `; ${hint}`;
     return msg;
   }
@@ -1263,8 +1268,8 @@ class Session {
 
   /** Rewrite session.json so `status` shows live truth (parked stop +
    *  time) with zero prior memory. lastStop survives resume/exit — it
-   *  answers 'where was I last', not 'where am I now'. The redacted
-   *  observedTarget (tab identity) rides along verbatim. */
+   *  answers 'where was I last', not 'where am I now'. The v2
+   *  session.json carries schemaVersion 2 plus the layered targetIdentity. */
   publishState(stopped) {
     if (stopped) {
       try {
@@ -1275,7 +1280,7 @@ class Session {
       name: path.basename(this.cfg.dir), kind: this.cfg.kind,
       port: this.sessionPort, stopped,
       lastStop: this.lastStop, updatedAt: Math.floor(Date.now() / 1000),
-      observedTarget: this.cfg.observedTarget || null,
+      schemaVersion: 2,
       targetIdentity: this.targetIdentity || null,
     }));
   }
@@ -2457,10 +2462,10 @@ async function serve(st, server, queue) {
 }
 
 function writeSessionFile(dir, obj, cfg, st) {
-  // Main-path session.json writes carry the tab observed identity plus the
-  // layered targetIdentity; explicit null keeps legacy readers honest.
-  if (obj && typeof obj === 'object' && !('observedTarget' in obj)) {
-    obj = { ...obj, observedTarget: (cfg && cfg.observedTarget) || null };
+  // Main-path session.json writes carry schemaVersion 2 plus the layered
+  // targetIdentity; explicit nulls keep readers honest.
+  if (obj && typeof obj === 'object' && !('schemaVersion' in obj)) {
+    obj = { ...obj, schemaVersion: 2 };
   }
   if (obj && typeof obj === 'object' && !('targetIdentity' in obj)) {
     obj = { ...obj, targetIdentity: (st && st.targetIdentity) || null };

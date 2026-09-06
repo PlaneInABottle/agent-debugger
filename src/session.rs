@@ -93,6 +93,7 @@ pub fn cmd_breaks_add(
 ) -> anyhow::Result<Value> {
     check_name(name)?;
     let dir = checked_session_dir(name)?;
+    require_schema_v2(&dir, name)?;
     let target = normalize_target_for_lang_opt(session_lang_opt(&dir).as_deref(), target)?;
     let port = session_port(name)?;
     let secs = std::cmp::min(10 + 5 * breaks.len() as u64, 65);
@@ -140,6 +141,7 @@ pub fn cmd_breaks_remove(
 ) -> anyhow::Result<Value> {
     check_name(name)?;
     let dir = checked_session_dir(name)?;
+    require_schema_v2(&dir, name)?;
     let target = normalize_target_for_lang_opt(session_lang_opt(&dir).as_deref(), target)?;
     let port = session_port(name)?;
     let secs = std::cmp::min(10 + 5 * breaks.len() as u64, 65);
@@ -176,6 +178,7 @@ pub fn cmd_breaks_remove(
 pub fn cmd_breaks_clear(name: &str, target: Option<&str>) -> anyhow::Result<Value> {
     check_name(name)?;
     let dir = checked_session_dir(name)?;
+    require_schema_v2(&dir, name)?;
     let target = normalize_target_for_lang_opt(session_lang_opt(&dir).as_deref(), target)?;
     let port = session_port(name)?;
     let secs = std::cmp::min(10 + 5 * persisted_line_breaks(name), 65);
@@ -386,25 +389,6 @@ pub fn forward(name: &str, body: &Value, timeout: Duration) -> anyhow::Result<Va
     forward_target(name, body, timeout, None)
 }
 
-/// Normalize a target selector for one session: omitted and explicit `main`
-/// both serve main (no wire difference — legacy bridges never see the
-/// field); anything else on a main-only adapter (java/browser) fails fast
-/// instead of silently serving main. Unknown languages pass through for
-/// bridge-side validation — never assume java (a legacy live py/node dir
-/// without lang.json must forward, not fail fast as main-only).
-/// Legacy narrow helper kept for unit tests; routing uses the `_opt`
-/// variant so missing/unknown languages forward instead of assuming java.
-#[allow(dead_code)]
-fn normalize_target_for_lang(lang: &str, target: Option<&str>) -> anyhow::Result<Option<String>> {
-    match target {
-        None | Some("main") => Ok(None),
-        Some(other) if lang == "java" || lang == "browser" => {
-            anyhow::bail!("unsupported target '{other}' (session is {lang}, main-only)")
-        }
-        Some(other) => Ok(Some(other.to_string())),
-    }
-}
-
 /// Routing variant over an optional language: `None` (missing/corrupt
 /// lang.json) and unrecognized values forward like multi-target langs.
 /// Display callers keep `session_lang_in` (java default); every routing
@@ -447,6 +431,7 @@ pub fn forward_target(
 ) -> anyhow::Result<Value> {
     check_name(name)?;
     let dir = checked_session_dir(name)?;
+    require_schema_v2(&dir, name)?;
     let target = normalize_target_for_lang_opt(session_lang_opt(&dir).as_deref(), target)?;
     let port = session_port(name)?;
     let mut body = body.clone();
@@ -472,6 +457,7 @@ pub fn forward_target(
 pub fn cmd_targets(name: &str) -> anyhow::Result<Value> {
     check_name(name)?;
     let dir = checked_session_dir(name)?;
+    require_schema_v2(&dir, name)?;
     if targets_use_local_roster(&dir) {
         return Ok(cmd_targets_in(&dir));
     }
@@ -511,14 +497,13 @@ fn cmd_targets_in(dir: &std::path::Path) -> Value {
             "pid": Value::Null,
             "state": if stopped { "stopped" } else { "running" },
             "lastStop": parsed.get("lastStop").cloned().unwrap_or(Value::Null),
-            "observed": parsed.get("observedTarget").cloned().unwrap_or(Value::Null),
             "scope": "global",
         }],
         "selected": "main",
         "ignored": 0,
         "droppedExited": 0,
         "target": "main",
-        "targetIdentity": parsed.get("targetIdentity").filter(|v| v.is_object()).cloned().unwrap_or(Value::Null),
+        "targetIdentity": layered_identity_or_null(parsed.get("targetIdentity").cloned()),
     })
 }
 
@@ -532,25 +517,26 @@ pub struct SpawnSpec {
     pub stops: Value,
     /// WHAT was requested (endpoint + CLI flags; never an observation).
     pub requested: Value,
-    /// Bridge-observed identity (redacted, capped). Process bridges receive
-    /// it as `--observed-target` and persist it verbatim into session.json;
-    /// the browser bridge reports its own `/json/list` entry instead.
-    pub observed: Value,
-    /// One-line redacted hint for timeout/unhit diagnostics (no root-cause
-    /// claim). Bridges append it; the CLI appends it to spawn errors.
-    pub observed_hint: String,
+    /// Layered seed identity (redacted, capped). Process bridges receive
+    /// it as `--target-identity` and upgrade it from protocol facts; the
+    /// browser accepts the flag and builds its own tab identity instead.
+    pub target_identity: Value,
+    /// One-line redacted hint derived from the seed (no root-cause claim).
+    /// Bridges derive their own hint from the upgraded identity; the CLI
+    /// appends this seed hint to spawn timeouts.
+    pub identity_hint: String,
 }
 
 // ---- target identity (M-I) ----
 
-/// Per-field cap (chars) for observed identity strings.
-pub const OBSERVED_FIELD_CAP: usize = 512;
-/// Total cap (chars, serialized) for one observedTarget object.
-pub const OBSERVED_TOTAL_CAP: usize = 2048;
-/// Element cap per array inside an observedTarget (argv/cmdline). High-count
+/// Per-field cap (chars) for layered identity strings.
+pub const IDENTITY_FIELD_CAP: usize = 512;
+/// Total cap (chars, serialized) for one layered identity object.
+pub const IDENTITY_TOTAL_CAP: usize = 2048;
+/// Element cap per array inside a layered identity (argv/cmdline). High-count
 /// argv shapes (~80+ small strings) converge via this count cap plus the
 /// total loop's guaranteed shrink-or-collapse, never by re-marking forever.
-pub const OBSERVED_ARRAY_CAP: usize = 32;
+pub const IDENTITY_ARRAY_CAP: usize = 32;
 
 /// Lowercase substrings marking a flag/value as secret. Matched against the
 /// flag name (`--token`, `--password=`, `api-key:` …) case-insensitively;
@@ -637,7 +623,7 @@ fn trunc_chars(s: &str, limit: usize) -> String {
     format!("{kept}… (+{} more chars)", n - limit)
 }
 
-/// Cap one observedTarget object: every string field to 512 chars, every
+/// Cap one layered identity object: every string field to 512 chars, every
 /// array to a bounded element count (tail marker), then the whole object to
 /// 2KB serialized. Only the known identity shapes are capped (process/tab);
 /// anything else passes through untouched. The total loop always terminates:
@@ -645,10 +631,10 @@ fn trunc_chars(s: &str, limit: usize) -> String {
 /// would not shrink it, collapses it to a 1-char marker (strictly smaller
 /// than any picked string), so ~80+ small argv entries converge by dropping
 /// rather than re-marking forever.
-fn cap_observed(mut v: Value) -> Value {
+fn cap_identity(mut v: Value) -> Value {
     fn cap_str(s: &mut String) {
-        if s.chars().count() > OBSERVED_FIELD_CAP {
-            *s = trunc_chars(s, OBSERVED_FIELD_CAP);
+        if s.chars().count() > IDENTITY_FIELD_CAP {
+            *s = trunc_chars(s, IDENTITY_FIELD_CAP);
         }
     }
     fn walk(v: &mut Value) {
@@ -658,9 +644,9 @@ fn cap_observed(mut v: Value) -> Value {
                 // Deterministic count cap: keep the head, note the dropped
                 // tail. Bounds high-count argv/cmdline shapes before the
                 // total loop runs.
-                if a.len() > OBSERVED_ARRAY_CAP {
-                    let dropped = a.len() - OBSERVED_ARRAY_CAP;
-                    a.truncate(OBSERVED_ARRAY_CAP);
+                if a.len() > IDENTITY_ARRAY_CAP {
+                    let dropped = a.len() - IDENTITY_ARRAY_CAP;
+                    a.truncate(IDENTITY_ARRAY_CAP);
                     a.push(Value::String(format!("… (+{dropped} more)")));
                 }
                 a.iter_mut().for_each(walk);
@@ -676,7 +662,7 @@ fn cap_observed(mut v: Value) -> Value {
     // Either branch strictly reduces the serialized size, guaranteeing
     // progress; a bounded pass count is the backstop, not the mechanism.
     let mut passes = 0;
-    while v.to_string().chars().count() > OBSERVED_TOTAL_CAP && passes < 4096 {
+    while v.to_string().chars().count() > IDENTITY_TOTAL_CAP && passes < 4096 {
         passes += 1;
         fn longest(v: &mut Value) -> Option<&mut String> {
             match v {
@@ -706,87 +692,173 @@ fn unavailable(field: &str, reason: &str) -> Value {
     json!({"field": field, "reason": reason})
 }
 
-/// Launch identity from our own spawn (executable + argv + cwd are
-/// genuinely launcher-observed; the adapter-spawned pid is not reported).
-pub fn launch_observed(exe: &str, argv: Vec<String>, source: &str) -> Value {
+/// Launch seed identity: layered roles built directly from our own spawn
+/// (executable + argv + cwd are genuinely launcher-observed; nothing here
+/// is OS-corroborated or protocol-confirmed). `debuggee.confidence` stays
+/// `unavailable` with `source: "launcher-args"` — launcher truth is not
+/// OS-corroborated identity; the bridge's protocol event upgrades it.
+pub fn launch_seed(exe: &str, argv: Vec<String>) -> Value {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .ok();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    cap_observed(json!({
-        "kind": "process",
-        "pid": Value::Null,
-        "executable": exe,
-        "argv": redact_argv(&argv),
-        "cwd": cwd.map(Value::String).unwrap_or(Value::Null),
-        "source": source,
-        "observedAt": now,
-        "unavailable": [unavailable("pid", "target pid is not reported by the adapter")],
-        "warnings": Value::Array(vec![]),
+    let now = identity_now();
+    cap_identity(json!({
+        "debuggee": {
+            "kind": "process",
+            "pid": Value::Null,
+            "executable": exe,
+            "argv": redact_argv(&argv),
+            "cwd": cwd.map(Value::String).unwrap_or(Value::Null),
+            "source": "launcher-args",
+            "confidence": "unavailable",
+            "observedAt": now,
+            "unavailable": [unavailable(
+                "pid",
+                "not protocol-confirmed (launcher args only); protocol event upgrades debuggee",
+            )],
+        },
+        "endpoint": {
+            "confidence": "unavailable",
+            "observedAt": now,
+            "unavailable": [unavailable(
+                "endpoint",
+                "no listener yet (launcher args only)",
+            )],
+        },
+        "adapter": {
+            "confidence": "unavailable",
+            "observedAt": now,
+            "unavailable": [unavailable(
+                "adapter",
+                "adapter not started (launcher args only)",
+            )],
+        },
     }))
 }
 
-/// Attach identity via a bounded OS-native lookup of the localhost listener.
-/// No target eval, no env, no shell reparse: pids come from the kernel
-/// (lsof on macOS, /proc on Linux), details from /proc or lsof/ps.
+/// Attach seed identity via a bounded OS-native lookup of the localhost
+/// listener. No target eval, no env, no shell reparse: pids come from the
+/// kernel (lsof on macOS, /proc on Linux), details from /proc or lsof/ps.
 /// Anything missing becomes a structured `unavailable` entry — never a
-/// fabricated value.
-pub fn attach_observed(host: &str, port: u16) -> Value {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let mut missing: Vec<Value> = vec![unavailable("pid", "no independent pid source")];
-    let mut warnings: Vec<Value> = vec![];
-    let mut base = json!({
+/// fabricated value. The `debuggee` role stays `unavailable` until the
+/// bridge's protocol event confirms it; no adapter name is guessed.
+pub fn attach_seed(host: &str, port: u16) -> Value {
+    let now = identity_now();
+    let debuggee = json!({
         "kind": "process",
         "pid": Value::Null,
-        "executable": Value::Null,
-        "argv": Value::Null,
-        "cwd": Value::Null,
-        "source": Value::Null,
+        "confidence": "unavailable",
         "observedAt": now,
+        "unavailable": [unavailable(
+            "pid",
+            "debuggee pid not confirmed by protocol (seed only)",
+        )],
     });
-    let local = normalize_attach_host(host) == "loopback";
-    if !local {
-        missing = vec![
-            unavailable("pid", "remote host has no local source"),
-            unavailable("executable", "remote host has no local source"),
-            unavailable("argv", "remote host has no local source"),
-            unavailable("cwd", "remote host has no local source"),
-        ];
-    } else if let Some(info) = port_lookup(port) {
-        missing.clear();
-        base["pid"] = json!(info.pid);
-        base["source"] = Value::String(info.source);
-        match info.exe {
-            Some(e) => base["executable"] = Value::String(e),
-            None => missing.push(unavailable("executable", info.exe_reason)),
+    let adapter = json!({
+        "confidence": "unavailable",
+        "observedAt": now,
+        "unavailable": [unavailable(
+            "adapter",
+            "adapter not confirmed by protocol (seed only)",
+        )],
+    });
+    if normalize_attach_host(host) != "loopback" {
+        let missing = ["ownerPid", "executable", "argv", "cwd"]
+            .iter()
+            .map(|f| unavailable(f, "remote host has no local source"))
+            .collect::<Vec<_>>();
+        return cap_identity(json!({
+            "debuggee": debuggee,
+            "endpoint": {
+                "host": host,
+                "port": port,
+                "ownerPid": Value::Null,
+                "confidence": "unavailable",
+                "observedAt": now,
+                "unavailable": missing,
+            },
+            "adapter": adapter,
+        }));
+    }
+    match port_lookup(port) {
+        Some(info) => {
+            let mut missing: Vec<Value> = vec![];
+            let mut warnings: Vec<Value> = vec![];
+            let mut endpoint = json!({
+                "host": host,
+                "port": port,
+                "ownerPid": info.pid,
+                "source": info.source,
+                "confidence": "os-corroborated",
+                "observedAt": now,
+            });
+            match info.exe {
+                Some(e) => endpoint["executable"] = Value::String(e),
+                None => missing.push(unavailable("executable", info.exe_reason)),
+            }
+            if info.argv.is_empty() {
+                missing.push(unavailable("argv", info.argv_reason));
+            } else {
+                endpoint["argv"] = Value::Array(redact_argv(&info.argv));
+            }
+            match info.cwd {
+                Some(c) => endpoint["cwd"] = Value::String(c),
+                None => missing.push(unavailable("cwd", info.cwd_reason)),
+            }
+            for w in info.warnings {
+                warnings.push(Value::String(w));
+            }
+            endpoint["unavailable"] = Value::Array(missing);
+            endpoint["warnings"] = Value::Array(warnings);
+            cap_identity(json!({
+                "debuggee": debuggee,
+                "endpoint": endpoint,
+                "adapter": adapter,
+            }))
         }
-        if info.argv.is_empty() {
-            missing.push(unavailable("argv", info.argv_reason));
-        } else {
-            base["argv"] = Value::Array(redact_argv(&info.argv));
-        }
-        match info.cwd {
-            Some(c) => base["cwd"] = Value::String(c),
-            None => missing.push(unavailable("cwd", info.cwd_reason)),
-        }
-        for w in info.warnings {
-            warnings.push(Value::String(w));
+        None => cap_identity(json!({
+            "debuggee": debuggee,
+            "endpoint": {
+                "host": host,
+                "port": port,
+                "ownerPid": Value::Null,
+                "confidence": "unavailable",
+                "observedAt": now,
+                "unavailable": [unavailable("ownerPid", "no independent pid source")],
+            },
+            "adapter": adapter,
+        })),
+    }
+}
+
+/// One-line redacted hint derived from a layered seed identity (no
+/// root-cause claim). Prefers the debuggee's launcher-observed
+/// executable/argv, then the endpoint's OS-corroborated copy; a null or
+/// empty identity reads as empty (the caller omits the suffix).
+pub fn identity_hint(seed: &Value) -> String {
+    let hint = identity_hint_inner(seed);
+    trunc_chars(&hint, 200)
+}
+
+fn identity_hint_inner(seed: &Value) -> String {
+    for role in ["debuggee", "endpoint"] {
+        if let Some(r) = seed.get(role) {
+            let exe = r.get("executable").and_then(|e| e.as_str()).unwrap_or("?");
+            let argv: Vec<&str> = r
+                .get("argv")
+                .and_then(|a| a.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).take(3).collect())
+                .unwrap_or_default();
+            let cwd = r.get("cwd").and_then(|c| c.as_str()).unwrap_or("?");
+            if exe != "?" || !argv.is_empty() {
+                return format!("target identity: {} {} (cwd {})", exe, argv.join(" "), cwd);
+            }
         }
     }
-    if base["executable"].is_null() && base["pid"].is_null() {
-        warnings.push(Value::String(
-            "identity-unverified: showing attach endpoint only".to_string(),
-        ));
+    if seed.is_null() {
+        return String::new();
     }
-    base["unavailable"] = Value::Array(missing);
-    base["warnings"] = Value::Array(warnings);
-    cap_observed(base)
+    "target identity unavailable (no independent source)".to_string()
 }
 
 struct ProcInfo {
@@ -975,34 +1047,6 @@ fn port_lookup(port: u16) -> Option<ProcInfo> {
     })
 }
 
-/// One-line redacted hint for timeout/unhit diagnostics. Names the observed
-/// target without claiming root cause (`verified` stays plant-only).
-pub fn compact_hint(observed: &Value) -> String {
-    let hint = compact_hint_inner(observed);
-    trunc_chars(&hint, 200)
-}
-
-fn compact_hint_inner(observed: &Value) -> String {
-    if observed.get("kind").and_then(|k| k.as_str()) == Some("tab") {
-        let url = observed.get("url").and_then(|u| u.as_str()).unwrap_or("?");
-        return format!("target identity: tab {url}");
-    }
-    let exe = observed
-        .get("executable")
-        .and_then(|e| e.as_str())
-        .unwrap_or("?");
-    let argv: Vec<&str> = observed
-        .get("argv")
-        .and_then(|a| a.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).take(3).collect())
-        .unwrap_or_default();
-    let cwd = observed.get("cwd").and_then(|c| c.as_str()).unwrap_or("?");
-    if exe == "?" && argv.is_empty() {
-        return "target identity unavailable (no independent source)".to_string();
-    }
-    format!("target identity: {} {} (cwd {})", exe, argv.join(" "), cwd)
-}
-
 /// Summarize WHAT the session targets by scanning bridge args for known
 /// flags. Derived automatically at spawn — the agent never writes this.
 /// Unknown flags are ignored (forward-compat with new target options).
@@ -1067,13 +1111,6 @@ fn stops_armed(stops: &Value) -> Value {
     })
 }
 
-/// Language owning a session dir (sidecar file; missing = "java" for
-/// display/status only — routing must use `session_lang_opt` so unknown
-/// forwards to the bridge instead of assuming main-only java).
-fn session_lang_in(dir: &std::path::Path) -> String {
-    session_lang_opt(dir).unwrap_or_else(|| "java".to_string())
-}
-
 /// Routing language: `None` when lang.json is missing, corrupt, or has no
 /// `lang` string. Unknown values pass through as `Some` and still forward
 /// (only exact "java"/"browser" take the main-only path).
@@ -1088,22 +1125,68 @@ fn session_lang_opt(dir: &std::path::Path) -> Option<String> {
         })
 }
 
+/// Schema v2 marker: every sidecar object carries `schemaVersion: 2`.
+pub const SCHEMA_VERSION: u64 = 2;
+
+/// True when one CLI-owned sidecar file is a v2 object: present, parseable,
+/// an object, with `schemaVersion == 2`.
+fn sidecar_is_v2(dir: &std::path::Path, file: &str) -> bool {
+    std::fs::read_to_string(dir.join(file))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.as_object().cloned())
+        .and_then(|m| m.get("schemaVersion").and_then(|s| s.as_u64()))
+        == Some(SCHEMA_VERSION)
+}
+
+/// Old iff a CLI-owned marker (`lang.json` OR `stops.json`) is
+/// missing/corrupt/lacks `schemaVersion == 2`. Bridge-owned `session.json`
+/// never gates by itself (absence is a startup row, not a version verdict).
+fn cli_markers_v2(dir: &std::path::Path) -> bool {
+    sidecar_is_v2(dir, "lang.json") && sidecar_is_v2(dir, "stops.json")
+}
+
+/// Gate for every command that speaks the bridge protocol: old dirs are
+/// `status`-visible then `close`-only. Runs after `check_name` /
+/// `check_dir_real`, before lang/port routing.
+fn require_schema_v2(dir: &std::path::Path, name: &str) -> anyhow::Result<()> {
+    if cli_markers_v2(dir) {
+        return Ok(());
+    }
+    anyhow::bail!("unsupported session '{name}' (schema v1; close it and recreate)")
+}
+
+/// Atomic sidecar write (tmp+rename in the same dir): a concurrent `status`
+/// never reads a torn file.
+fn write_sidecar_atomic(dir: &std::path::Path, file: &str, content: &str) -> anyhow::Result<()> {
+    let tmp = dir.join(format!("{file}.tmp"));
+    std::fs::write(&tmp, content)
+        .map_err(|e| anyhow::anyhow!("cannot write session {file}: {e}"))?;
+    std::fs::rename(&tmp, dir.join(file))
+        .map_err(|e| anyhow::anyhow!("cannot write session {file}: {e}"))?;
+    Ok(())
+}
+
 /// Write sidecars and spawn the bridge process. Called only from `spawn`,
 /// which removes the session dir if this fails.
 fn setup_bridge(dir: &std::path::Path, spec: &SpawnSpec) -> anyhow::Result<std::process::Child> {
     // Spawn-time intent first: while the session lives, stops.json is
     // always present for resume. Unlike before, these writes propagate
     // errors — a session whose intent cannot persist must not start.
-    std::fs::write(
-        dir.join("lang.json"),
-        format!("{{\"lang\":\"{}\"}}", spec.lang),
-    )
-    .map_err(|e| anyhow::anyhow!("cannot write session lang: {e}"))?;
-    std::fs::write(
-        dir.join("stops.json"),
-        serde_json::to_string_pretty(&spec.stops).unwrap_or_else(|_| "{}".to_string()),
-    )
-    .map_err(|e| anyhow::anyhow!("cannot write session intent: {e}"))?;
+    // Both markers carry schemaVersion: 2 (atomic tmp+rename, same dir).
+    write_sidecar_atomic(
+        dir,
+        "lang.json",
+        &format!(
+            "{{\"lang\":\"{}\",\"schemaVersion\":{SCHEMA_VERSION}}}",
+            spec.lang
+        ),
+    )?;
+    write_sidecar_atomic(
+        dir,
+        "stops.json",
+        &serde_json::to_string_pretty(&spec.stops).unwrap_or_else(|_| "{}".to_string()),
+    )?;
 
     let log = std::fs::File::create(dir.join("bridge.log"))
         .map_err(|e| anyhow::anyhow!("cannot create bridge log: {e}"))?;
@@ -1185,26 +1268,23 @@ fn setup_bridge(dir: &std::path::Path, spec: &SpawnSpec) -> anyhow::Result<std::
         }
     };
     args.extend(spec.bridge_args.clone());
-    // Process bridges persist our redacted observed identity verbatim into
-    // session.json (atomic, bridge-owned write) and use the hint in
-    // timeout/unhit diagnostics. The browser reports its own /json/list
-    // entry instead — no process claim is passed. Inserted BEFORE the `--`
-    // program-args separator: anything after it belongs to the target.
-    if spec.lang != "browser" {
-        let extra = vec![
-            "--observed-target".to_string(),
-            spec.observed.to_string(),
-            "--observed-hint".to_string(),
-            spec.observed_hint.clone(),
-        ];
-        match args.iter().position(|a| a == "--") {
-            Some(pos) => {
-                let tail = args.split_off(pos);
-                args.extend(extra);
-                args.extend(tail);
-            }
-            None => args.extend(extra),
+    // The layered seed identity rides as `--target-identity` (redacted,
+    // capped CLI-side; the bridge upgrades it from protocol facts).
+    // Inserted BEFORE the `--` program-args separator: anything after it
+    // belongs to the target. The browser accepts the flag and builds its
+    // own tab identity instead. Malformed seeds never fail the bridge —
+    // every bridge degrades to an all-unavailable identity.
+    let extra = vec![
+        "--target-identity".to_string(),
+        spec.target_identity.to_string(),
+    ];
+    match args.iter().position(|a| a == "--") {
+        Some(pos) => {
+            let tail = args.split_off(pos);
+            args.extend(extra);
+            args.extend(tail);
         }
+        None => args.extend(extra),
     }
 
     let child = std::process::Command::new(&program)
@@ -1489,21 +1569,29 @@ fn daemon_alive_in(dir: &std::path::Path) -> bool {
     matches!(updated_ago, Some(age) if age < RECENT_PUBLISH)
 }
 
-/// Attach endpoint from a persisted intent: `requestedTarget` first (exact
-/// CLI request), `target` summary as fallback (string ports there).
+/// Attach endpoint from a persisted intent: `requestedTarget` only (exact
+/// CLI request, numeric port). The old `target`-summary fallback (string
+/// ports) is gone: v2 intents always carry a numeric `requestedTarget`.
 /// Anything unparseable reads as absent — never a block.
 fn intent_endpoint(stops: &Value) -> Option<(String, u16)> {
-    for key in ["requestedTarget", "target"] {
-        let v = stops.get(key)?;
-        let host = v.get("host")?.as_str()?;
-        let port = v
-            .get("port")
-            .and_then(|p| p.as_u64().or_else(|| p.as_str()?.parse::<u64>().ok()))?;
-        if let Ok(port) = u16::try_from(port) {
-            return Some((host.to_string(), port));
-        }
-    }
-    None
+    let v = stops.get("requestedTarget")?;
+    let host = v.get("host")?.as_str()?;
+    let port = v.get("port")?.as_u64()?;
+    let port = u16::try_from(port).ok()?;
+    Some((host.to_string(), port))
+}
+
+/// Proven-dead legacy dir: parseable `session.json` with a numeric nonzero
+/// port AND a dead daemon (double TCP fail + no recent publish). Only this
+/// proof authorizes spawn-time reclaim; everything else bails for `close`.
+fn legacy_proven_dead(dir: &std::path::Path) -> bool {
+    let port: Option<u16> = std::fs::read_to_string(dir.join("session.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.get("port").and_then(|p| p.as_u64()))
+        .and_then(|p| u16::try_from(p).ok())
+        .filter(|p| *p != 0);
+    port.is_some() && !daemon_alive_in(dir)
 }
 
 /// A confirmed live owner of an attach endpoint: a session dir (not a
@@ -1556,6 +1644,59 @@ fn find_live_endpoint_owner_in(
         return Some(name);
     }
     None
+}
+
+/// Global live-legacy scan (fail-safe upgrade rule): every remaining live
+/// OLD session dir (CLI markers not v2) whose lang is exclusive or
+/// unknown/missing (fail-closed — an unknowable owner may hold our
+/// endpoint), excluding browser (CDP multiplexes, never collides) and the
+/// session being started. Sorted by name. Read-only: nothing is deleted or
+/// touched — a live old daemon is only ever cleaned by `close`.
+fn find_live_legacy_sessions_in(sessions_root: &std::path::Path, exclude: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(sessions_root) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == exclude || check_name(&name).is_err() {
+            continue;
+        }
+        let dir = sessions_root.join(&name);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(m) if m.file_type().is_dir() => {}
+            _ => continue,
+        }
+        if cli_markers_v2(&dir) {
+            continue;
+        }
+        match session_lang_opt(&dir).as_deref() {
+            Some("browser") => continue,
+            Some(l) if attach_exclusive(l) => {}
+            // Unknown/missing lang fails closed: it may be an exclusive
+            // owner whose markers predate the scan.
+            _ => {}
+        }
+        let kind: Option<String> = std::fs::read_to_string(dir.join("session.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|v| {
+                v.get("kind")
+                    .and_then(|k| k.as_str())
+                    .map(|s| s.to_string())
+            });
+        match kind.as_deref() {
+            Some("attach") | Some("launch") => {}
+            _ => continue,
+        }
+        if !daemon_alive_in(&dir) {
+            continue;
+        }
+        out.push(name);
+    }
+    out.sort();
+    out
 }
 
 // ---- endpoint-scoped atomic reservation ----
@@ -2258,7 +2399,7 @@ fn attach_setup_failure(
         error,
         Some(cause),
         diagnosis,
-        &spec.observed,
+        &spec.target_identity,
         &spec.requested,
     )
 }
@@ -2272,7 +2413,7 @@ fn attach_failure(
     error: String,
     cause: Option<String>,
     diagnosis: Value,
-    observed: &Value,
+    identity: &Value,
     requested: &Value,
 ) -> anyhow::Error {
     // A cause identical to the concise error carries no information —
@@ -2283,7 +2424,7 @@ fn attach_failure(
         cause,
         wait_context: None,
         diagnosis: Some(diagnosis),
-        target_identity: Some(observed.clone()),
+        target_identity: Some(identity.clone()),
         requested_target: Some(requested.clone()),
     }
     .into()
@@ -2296,13 +2437,13 @@ fn attach_failure(
 /// cause duplication (there is no separate raw text). The redacted
 /// attempted identity and requested endpoint still ride along; they are
 /// spawn-time OS observations, never a diagnosis claim.
-fn attach_config_failure(message: String, observed: &Value, requested: &Value) -> anyhow::Error {
+fn attach_config_failure(message: String, identity: &Value, requested: &Value) -> anyhow::Error {
     BridgeFailure {
         message,
         cause: None,
         wait_context: None,
         diagnosis: None,
-        target_identity: Some(observed.clone()),
+        target_identity: Some(identity.clone()),
         requested_target: Some(requested.clone()),
     }
     .into()
@@ -2310,9 +2451,8 @@ fn attach_config_failure(message: String, observed: &Value, requested: &Value) -
 
 /// True only for the bridge-reported config phase: the connection was
 /// established, so the message is semantic, not a transport symptom.
-/// Any other value (transport, unknown, non-string, missing — including
-/// older bridges that never wrote `phase`) takes the conservative
-/// transport path with endpoint diagnosis.
+/// Anything else takes the conservative transport path with endpoint
+/// diagnosis (corrupt files never reach here — they bail earlier).
 fn is_config_phase(phase: Option<&str>) -> bool {
     matches!(phase, Some("config"))
 }
@@ -2322,13 +2462,16 @@ fn is_config_phase(phase: Option<&str>) -> bool {
 /// reuse or close it. No bridge is ever spawned, so the first session's
 /// target is untouched. No adapter ran, so there is no raw `cause` — the
 /// concise `attach failed:` error plus the diagnosis carry everything.
+/// `owner_identity` is the owner's layered `{debuggee, endpoint, adapter}`
+/// identity (see `owner_target_identity`) — never a raw pid claim, which
+/// would misdirect a kill at the adapter on wrapped servers.
 fn endpoint_owned_failure(
     owner: &str,
     in_progress: bool,
     lang: &str,
     host: &str,
     port: u16,
-    observed: &Value,
+    owner_identity: &Value,
     requested: &Value,
 ) -> anyhow::Error {
     let endpoint = display_endpoint(host, port);
@@ -2353,7 +2496,31 @@ fn endpoint_owned_failure(
         },
         "recommendation": "use the existing session for this endpoint, or close it first and retry",
     });
-    attach_failure(message, None, diagnosis, observed, requested)
+    attach_failure(message, None, diagnosis, owner_identity, requested)
+}
+
+/// Fail-closed rejection when live legacy (v1) sessions exist: their
+/// endpoints may be unknowable, so no v2 attach of an exclusive lang may
+/// proceed while any is live. Layered all-unavailable identity (no endpoint
+/// claim, zero pids); the sorted names name the blockers to `close`.
+fn legacy_live_failure(names: &str, requested: &Value) -> anyhow::Error {
+    let message = format!(
+        "attach failed: unsupported live legacy session(s) '{names}'; \
+         close them first and retry"
+    );
+    let diagnosis = serde_json::json!({
+        "code": "unsupported-legacy-live",
+        "confidence": "high",
+        "evidence": { "legacySessions": names },
+        "recommendation": "close the listed legacy session(s) first and retry",
+    });
+    attach_failure(
+        message,
+        None,
+        diagnosis,
+        &unavailable_identity("live legacy session without layered identity"),
+        requested,
+    )
 }
 
 /// `spawn` with an explicit sessions root (unit tests pass a tmpdir so the
@@ -2379,7 +2546,18 @@ fn spawn_in(
         .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", sessions_root.display()))?;
     let _guard = acquire_startup_lock(&startup_lock_path(sessions_root, name))?;
     if dir.join("session.json").exists() {
-        anyhow::bail!("session '{name}' already exists (close it first)");
+        if cli_markers_v2(&dir) {
+            anyhow::bail!("session '{name}' already exists (close it first)");
+        }
+        // Intentional one-time legacy exception: an OLD dir is reclaimed
+        // only when proven dead — parseable session.json with a numeric
+        // nonzero port AND a dead daemon (double TCP fail + no recent
+        // publish). Anything less (corrupt/missing/unparseable/zero port,
+        // or a possibly-live daemon) bails: a live old daemon is never
+        // killed by spawn/reclaim, only `close` may clean it.
+        if !legacy_proven_dead(&dir) {
+            anyhow::bail!("unsupported session '{name}' (schema v1; close it first)");
+        }
     }
     // Attach collision preflight (exclusive endpoints only: launch has no
     // pre-known endpoint and browser multiplexes tabs, so neither takes
@@ -2401,13 +2579,27 @@ fn spawn_in(
                         find_live_endpoint_owner_in(sessions_root, name, host, *port)
                     {
                         drop(g);
+                        let owner_identity = owner_target_identity(sessions_root, &owner);
                         return Err(endpoint_owned_failure(
                             &owner,
                             false,
                             spec.lang,
                             host,
                             *port,
-                            &spec.observed,
+                            &owner_identity,
+                            &spec.requested,
+                        ));
+                    }
+                    // Fail-safe upgrade rule: a pre-existing live v1 owner
+                    // may be invisible to the endpoint match (old intents
+                    // can lack a usable endpoint). Any remaining live legacy
+                    // session blocks the attach outright — never risk a
+                    // second client onto a possibly-shared target.
+                    let legacy_live = find_live_legacy_sessions_in(sessions_root, name);
+                    if !legacy_live.is_empty() {
+                        drop(g);
+                        return Err(legacy_live_failure(
+                            &legacy_live.join("', '"),
                             &spec.requested,
                         ));
                     }
@@ -2420,26 +2612,28 @@ fn spawn_in(
                             .unwrap_or_else(|| "another session".to_string());
                         let published = sessions_root.join(&cur).join("session.json").exists();
                         drop(g);
+                        let owner_identity = owner_target_identity(sessions_root, &cur);
                         return Err(endpoint_owned_failure(
                             &cur,
                             !published,
                             spec.lang,
                             host,
                             *port,
-                            &spec.observed,
+                            &owner_identity,
                             &spec.requested,
                         ));
                     }
                     Some(g)
                 }
                 EndpointClaim::Busy(busy) => {
+                    let owner_identity = owner_target_identity(sessions_root, &busy.session);
                     return Err(endpoint_owned_failure(
                         &busy.session,
                         !busy.published,
                         spec.lang,
                         host,
                         *port,
-                        &spec.observed,
+                        &owner_identity,
                         &spec.requested,
                     ));
                 }
@@ -2502,16 +2696,21 @@ fn spawn_in(
             let failure = read_bridge_error(&dir);
             reap(&mut child);
             let _ = std::fs::remove_dir_all(&dir);
+            // A present-but-corrupt setup error file is an internal error:
+            // exact message, never transport-diagnosed.
+            if failure.corrupt {
+                anyhow::bail!("{}", failure.message);
+            }
             // Attach setup failure: config phase (connection was
             // established) keeps the semantic message top-level with no
-            // endpoint diagnosis; transport or missing phase (older
-            // bridges) classifies from OS-observed listener state
-            // (pre-attach vs now) with the raw text as sanitized cause.
+            // endpoint diagnosis; transport takes the OS-observed listener
+            // state (pre-attach vs now) with the raw text as sanitized
+            // cause. Every v2 bridge writes schemaVersion + phase.
             if let Some((host, port)) = &endpoint {
                 if is_config_phase(failure.phase.as_deref()) {
                     return Err(attach_config_failure(
                         failure.message,
-                        &spec.observed,
+                        &spec.target_identity,
                         &spec.requested,
                     ));
                 }
@@ -2542,14 +2741,12 @@ fn spawn_in(
             match forward(name, &first, Duration::from_secs(15)) {
                 Ok(mut data) => {
                     // Immediate start/attach response carries identity:
-                    // requested from the CLI flags, observed from the
-                    // bridge-persisted cache (browser) or our own lookup
-                    // (process targets). Never invent: missing files read
-                    // as null. The layered targetIdentity (debuggee /
-                    // endpoint / adapter roles) rides along the same way —
-                    // no spawn-time fallback, the roles need bridge facts.
+                    // requested from the CLI flags, layered targetIdentity
+                    // (debuggee / endpoint / adapter roles) from the
+                    // bridge-persisted session.json. No spawn-time fallback:
+                    // the roles need bridge-observed protocol facts, so a
+                    // missing copy reads as null (honest "unknown").
                     data["requestedTarget"] = spec.requested.clone();
-                    data["observedTarget"] = cached_observed(&dir, spec);
                     data["targetIdentity"] = cached_target_identity(&dir);
                     return Ok(data);
                 }
@@ -2563,14 +2760,17 @@ fn spawn_in(
                     if let Some(failure) = settle_for_bridge_error(&dir) {
                         reap(&mut child);
                         let _ = std::fs::remove_dir_all(&dir);
+                        if failure.corrupt {
+                            anyhow::bail!("{}", failure.message);
+                        }
                         // Late-settling attach failure: same phase routing
                         // as the fast path (config keeps the semantic
-                        // message; transport/missing takes a fresh probe).
+                        // message; transport takes a fresh probe).
                         if let Some((host, port)) = &endpoint {
                             if is_config_phase(failure.phase.as_deref()) {
                                 return Err(attach_config_failure(
                                     failure.message,
-                                    &spec.observed,
+                                    &spec.target_identity,
                                     &spec.requested,
                                 ));
                             }
@@ -2599,7 +2799,6 @@ fn spawn_in(
                                 "logs": logs,
                             });
                             out["requestedTarget"] = spec.requested.clone();
-                            out["observedTarget"] = cached_observed(&dir, spec);
                             out["targetIdentity"] = cached_target_identity(&dir);
                             return Ok(out);
                         }
@@ -2653,24 +2852,11 @@ fn spawn_in(
             let _ = std::fs::remove_dir_all(&dir);
             anyhow::bail!(
                 "timed out waiting for first breakpoint. {log_tail}. {}",
-                spec.observed_hint
+                spec.identity_hint
             );
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-}
-
-/// Bridge-persisted observed identity for a live session dir (session.json
-/// `observedTarget`, written atomically by the bridge). Falls back to the
-/// spawn-time value (identical redacted content) when the file has no copy
-/// yet; unknown shapes read as null, never fabricated.
-fn cached_observed(dir: &std::path::Path, spec: &SpawnSpec) -> Value {
-    std::fs::read_to_string(dir.join("session.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| v.get("observedTarget").cloned())
-        .filter(|v| !v.is_null())
-        .unwrap_or_else(|| spec.observed.clone())
 }
 
 /// Layered target identity for a live session dir (session.json
@@ -2678,20 +2864,171 @@ fn cached_observed(dir: &std::path::Path, spec: &SpawnSpec) -> Value {
 /// bridge from protocol-confirmed + OS-corroborated sources). No spawn-time
 /// fallback: the roles need bridge-observed protocol facts the CLI never
 /// has, so a missing copy reads as null (honest "unknown"), never a
-/// fabricated role. `observedTarget` stays the compatibility view.
+/// fabricated role. Only a valid layered object is ever echoed (re-redacted
+/// + capped defensively); flat/malformed shapes read as null.
 fn cached_target_identity(dir: &std::path::Path) -> Value {
-    std::fs::read_to_string(dir.join("session.json"))
+    let stored = std::fs::read_to_string(dir.join("session.json"))
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| v.get("targetIdentity").cloned())
-        .filter(|v| v.is_object())
-        .unwrap_or(Value::Null)
+        .and_then(|v| v.get("targetIdentity").cloned());
+    layered_identity_or_null(stored)
+}
+
+/// Canonical persisted-identity read for status/spawn/context/roster: a
+/// valid layered `{debuggee, endpoint, adapter}` object echoes back
+/// (sanitized: re-redacted + capped, idempotent over bridge output);
+/// anything else — flat legacy, malformed, non-object, absent — reads as
+/// null, never echoed.
+fn layered_identity_or_null(stored: Option<Value>) -> Value {
+    match stored {
+        Some(ref v) if is_layered_identity(v) => sanitize_layered_identity(v),
+        _ => Value::Null,
+    }
+}
+
+/// Collision-safe owner identity for `endpoint-already-attached`: always a
+/// layered `{debuggee, endpoint, adapter}` object. Sources: the owner's
+/// cached session.json `targetIdentity` when it is a valid layered object
+/// (re-redacted + capped defensively so no stale raw secret leaks);
+/// otherwise all three roles unavailable — no pid is ever promoted from
+/// legacy or malformed stored state (on a wrapped Python server the
+/// listener-owner pid is the adapter, not the debuggee).
+fn owner_target_identity(sessions_root: &std::path::Path, owner: &str) -> Value {
+    let dir = sessions_root.join(owner);
+    let stored: Option<Value> = std::fs::read_to_string(dir.join("session.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.get("targetIdentity").cloned());
+    match stored {
+        // Owner already publishes layered roles: keep them (sanitized).
+        Some(v) if is_layered_identity(&v) => sanitize_layered_identity(&v),
+        // Anything else (legacy owner, malformed identity, unpublished
+        // lock holder): all unavailable, nothing killable inferable.
+        _ => unavailable_identity("owner has no layered identity"),
+    }
+}
+
+/// Valid layered identity: an object carrying exactly the three role keys
+/// (`debuggee`, `endpoint`, `adapter`, each an object or null; additional
+/// top-level metadata is allowed). A flat legacy shape (top-level
+/// `pid`/`argv`/`executable`) never qualifies, even when it happens to
+/// carry one of the role names.
+fn is_layered_identity(v: &Value) -> bool {
+    let m = match v.as_object() {
+        Some(m) => m,
+        None => return false,
+    };
+    for role in ["debuggee", "endpoint", "adapter"] {
+        match m.get(role) {
+            Some(Value::Object(_)) | Some(Value::Null) => {}
+            _ => return false,
+        }
+    }
+    // Flat-shape guard: a top-level pid/argv/executable/cwd/kind marks a
+    // legacy flat view, never the layered identity.
+    for flat in ["pid", "argv", "executable", "cwd"] {
+        if m.contains_key(flat) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Re-redact + cap a valid layered identity before it leaves the CLI: every
+/// `argv` array is passed through the secret redactor again (idempotent —
+/// a stale raw secret cached before redaction never leaks), then each role
+/// object is capped with the layered-identity caps. Non-object roles read
+/// as null; extra top-level metadata passes through capped.
+fn sanitize_layered_identity(v: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    if let Some(m) = v.as_object() {
+        for (k, role) in m {
+            if ["debuggee", "endpoint", "adapter"].contains(&k.as_str()) {
+                out.insert(
+                    k.clone(),
+                    match role {
+                        Value::Object(_) => {
+                            let mut r = role.clone();
+                            reredact_argv_in(&mut r);
+                            cap_identity(r)
+                        }
+                        Value::Null => Value::Null,
+                        _ => Value::Null,
+                    },
+                );
+            } else {
+                let mut extra = role.clone();
+                reredact_argv_in(&mut extra);
+                out.insert(k.clone(), cap_identity(extra));
+            }
+        }
+    }
+    // Roles are mandatory on the way out: a stored object that passed the
+    // shape check always has them, but fill defensively so a hand-built
+    // value can never leave a role missing.
+    let now = identity_now();
+    for role in ["debuggee", "endpoint", "adapter"] {
+        if !out.contains_key(role) {
+            out.insert(
+                role.to_string(),
+                json!({"confidence": "unavailable", "observedAt": now,
+                       "unavailable": [{"field": role, "reason": "role missing from stored identity"}]}),
+            );
+        }
+    }
+    Value::Object(out)
+}
+
+/// Re-run argv redaction in place over every `argv` array in a role value.
+fn reredact_argv_in(v: &mut Value) {
+    match v {
+        Value::Object(m) => {
+            for (k, child) in m.iter_mut() {
+                if k == "argv" {
+                    if let Value::Array(a) = child {
+                        let strs: Vec<String> = a
+                            .iter()
+                            .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                            .collect();
+                        if strs.len() == a.len() {
+                            *child = Value::Array(redact_argv(&strs));
+                            continue;
+                        }
+                    }
+                }
+                reredact_argv_in(child);
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(reredact_argv_in),
+        _ => {}
+    }
+}
+
+/// All-roles-unavailable identity: malformed or absent owner state carries
+/// no pid anywhere, so nothing killable can be inferred from it.
+fn unavailable_identity(reason: &str) -> Value {
+    let now = identity_now();
+    json!({
+        "debuggee": {"kind": "process", "pid": Value::Null, "confidence": "unavailable",
+            "observedAt": now, "unavailable": [{"field": "pid", "reason": reason}]},
+        "endpoint": {"confidence": "unavailable", "observedAt": now,
+            "unavailable": [{"field": "ownerPid", "reason": reason}]},
+        "adapter": {"confidence": "unavailable", "observedAt": now,
+            "unavailable": [{"field": "pid", "reason": reason}]},
+    })
+}
+
+fn identity_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Re-fetch location + threads + frames without resuming, with the cached
 /// redacted identity attached (same object as the start/attach response).
 /// An optional target selector routes to one parked target; identity stays
-/// session-level (requested/observed are main-focused, like status).
+/// session-level (requested/targetIdentity are main-focused, like status).
 pub fn cmd_context_target(name: &str, target: Option<&str>) -> anyhow::Result<Value> {
     check_name(name)?;
     let mut resp = forward_target(
@@ -2706,20 +3043,13 @@ pub fn cmd_context_target(name: &str, target: Option<&str>) -> anyhow::Result<Va
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .and_then(|v| v.get("requestedTarget").cloned())
         .unwrap_or(Value::Null);
-    let observed = std::fs::read_to_string(dir.join("session.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| v.get("observedTarget").cloned())
-        .unwrap_or(Value::Null);
     let identity = std::fs::read_to_string(dir.join("session.json"))
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| v.get("targetIdentity").cloned())
-        .filter(|v| v.is_object())
-        .unwrap_or(Value::Null);
+        .and_then(|v| v.get("targetIdentity").cloned());
+    let identity = layered_identity_or_null(identity);
     if let Value::Object(ref mut m) = resp {
         m.insert("requestedTarget".to_string(), requested);
-        m.insert("observedTarget".to_string(), observed);
         m.insert("targetIdentity".to_string(), identity);
     }
     Ok(resp)
@@ -2777,33 +3107,67 @@ fn read_logs_file(dir: &std::path::Path, tail: usize) -> Option<Value> {
     }))
 }
 
-/// Bridge setup-failure file: the message plus the optional additive
-/// `phase` (`transport` = connection never established, `config` =
-/// connection established, semantic setup error). Old files without
-/// `phase` read as `None` — callers keep the conservative transport
-/// behavior, never a guess.
+/// Bridge setup-failure file (v2): `{"schemaVersion":2,"error":"…",
+/// "phase":"transport"|"config"}`. Every v2 bridge writes all three keys on
+/// every early path. Strict action: a present parseable `error.json` that
+/// carries an `error` string but the wrong `schemaVersion` or a
+/// missing/invalid `phase` reads as corrupt (`corrupt: true` with the exact
+/// actionable message — internal, never transport-diagnosed). Absent,
+/// unparseable, or error-less files keep the transport fallback
+/// (`corrupt: false`, default message, `phase: None`).
 #[derive(Debug)]
 struct BridgeSetupError {
     message: String,
     phase: Option<String>,
+    corrupt: bool,
 }
 
 fn read_bridge_error(dir: &std::path::Path) -> BridgeSetupError {
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
     let parsed: Option<Value> = std::fs::read_to_string(dir.join("error.json"))
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok());
-    let message = parsed
+    let message = match parsed
         .as_ref()
         .and_then(|v| v.get("error"))
         .and_then(|e| e.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "bridge failed during setup (see bridge.log)".to_string());
+    {
+        Some(s) => s.to_string(),
+        None => {
+            return BridgeSetupError {
+                message: "bridge failed during setup (see bridge.log)".to_string(),
+                phase: None,
+                corrupt: false,
+            };
+        }
+    };
+    let version_ok = parsed
+        .as_ref()
+        .and_then(|v| v.get("schemaVersion").and_then(|s| s.as_u64()))
+        == Some(SCHEMA_VERSION);
     let phase = parsed
         .as_ref()
         .and_then(|v| v.get("phase"))
         .and_then(|p| p.as_str())
         .map(|s| s.to_string());
-    BridgeSetupError { message, phase }
+    let phase_ok = matches!(phase.as_deref(), Some("transport") | Some("config"));
+    if !version_ok || !phase_ok {
+        return BridgeSetupError {
+            message: format!(
+                "corrupt setup error file in '{name}' (schemaVersion/phase); close and retry"
+            ),
+            phase: None,
+            corrupt: true,
+        };
+    }
+    BridgeSetupError {
+        message,
+        phase,
+        corrupt: false,
+    }
 }
 
 fn read_log_tail(dir: &std::path::Path) -> String {
@@ -2893,16 +3257,43 @@ pub fn status() -> Value {
 
 /// One session's status row from its dir. Takes an explicit dir (not a name)
 /// so unit tests exercise it without touching the real sessions dir.
+/// Never errors a row: unparseable files read as nulls, never fabricated.
+/// Exact frozen contract — current rows keep every existing key, drop
+/// `observedTarget`, and add `stale`/`unsupported`/`hint`:
+/// - current: v2 CLI markers plus (when session.json is present) a v2
+///   session marker; `stale:false, unsupported:false, hint:null`.
+/// - old/unsupported: anything else (incl. a present session.json lacking
+///   `schemaVersion==2`, even when the CLI markers are v2); `stale:true,
+///   unsupported:true, hint:"close '<name>' and recreate (unsupported
+///   schema v1)"`, with `lang` from lang.json else `"unknown"`, `port`
+///   numeric-u16 else `0`, `alive` by TCP probe iff port nonzero,
+///   `kind`/`stopped`/`lastStop`/`updatedAt` from parseable session.json
+///   else `null`, `armed`/`target`/`requestedTarget` from parseable
+///   stops.json else nulls, `targetIdentity` when a valid layered object
+///   else `null` (never flat, never promoted).
 fn session_entry(dir: &std::path::Path) -> Value {
     let name = dir
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    let raw = std::fs::read_to_string(dir.join("session.json")).unwrap_or_default();
-    let parsed: Value = serde_json::from_str(&raw).unwrap_or(json!({}));
+    let session_raw = std::fs::read_to_string(dir.join("session.json")).ok();
+    let parsed: Option<Value> = session_raw
+        .as_ref()
+        .and_then(|raw| serde_json::from_str(raw).ok());
+    let session_v2 = match (&session_raw, &parsed) {
+        (None, _) => true, // absent session.json: startup row, not a verdict
+        (Some(_), Some(v)) => {
+            v.as_object()
+                .and_then(|m| m.get("schemaVersion").and_then(|s| s.as_u64()))
+                == Some(SCHEMA_VERSION)
+        }
+        (Some(_), None) => false,
+    };
+    let current = cli_markers_v2(dir) && session_v2;
+    let live = parsed.clone().unwrap_or(json!({}));
     // Checked conversion (like session_port): a corrupt huge port must not
     // truncate into a live-looking probe of an unrelated service.
-    let port = parsed
+    let port = live
         .get("port")
         .and_then(|p| p.as_u64())
         .and_then(|p| u16::try_from(p).ok())
@@ -2913,11 +3304,11 @@ fn session_entry(dir: &std::path::Path) -> Value {
             Duration::from_millis(300),
         )
         .is_ok();
-    // Resume intent: armed counts + target, derived at spawn. Old
-    // sessions predate stops.json — null there is honest ("unknown"),
-    // never fabricated zeros.
-    let stops_raw = std::fs::read_to_string(dir.join("stops.json")).ok();
-    let stops_parsed: Option<Value> = stops_raw.and_then(|raw| serde_json::from_str(&raw).ok());
+    // Resume intent: armed counts + target, derived at spawn. Unparseable
+    // intent reads as nulls — honest ("unknown"), never fabricated zeros.
+    let stops_parsed: Option<Value> = std::fs::read_to_string(dir.join("stops.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok());
     let (armed, target) = match &stops_parsed {
         Some(v) => (
             Some(stops_armed(v)),
@@ -2925,34 +3316,52 @@ fn session_entry(dir: &std::path::Path) -> Value {
         ),
         None => (None, Value::Null),
     };
-    // Identity: requested from the spawn-time intent, observed from the
-    // bridge-persisted session.json cache. Legacy dirs predate both —
-    // null there is honest ("unknown"), never fabricated.
+    // Identity: requested from the spawn-time intent, layered roles from
+    // the bridge-persisted session.json cache (valid layered object or
+    // null — flat/malformed never echoes).
     let requested = stops_parsed
         .as_ref()
         .and_then(|v| v.get("requestedTarget").cloned())
         .unwrap_or(Value::Null);
-    let observed = parsed.get("observedTarget").cloned().unwrap_or(Value::Null);
-    let identity = parsed
-        .get("targetIdentity")
-        .filter(|v| v.is_object())
-        .cloned()
-        .unwrap_or(Value::Null);
-    json!({
-        "name": name,
-        "lang": session_lang_in(dir),
-        "kind": parsed.get("kind"),
-        "port": port,
-        "alive": alive,
-        "stopped": parsed.get("stopped"),
-        "lastStop": parsed.get("lastStop").cloned().unwrap_or(Value::Null),
-        "updatedAt": parsed.get("updatedAt").cloned().unwrap_or(Value::Null),
-        "armed": armed,
-        "target": target,
-        "requestedTarget": requested,
-        "observedTarget": observed,
-        "targetIdentity": identity,
-    })
+    let identity = layered_identity_or_null(live.get("targetIdentity").cloned());
+    let lang = session_lang_opt(dir).unwrap_or_else(|| "unknown".to_string());
+    if current {
+        json!({
+            "name": name,
+            "lang": lang,
+            "kind": live.get("kind").cloned().unwrap_or(Value::Null),
+            "port": port,
+            "alive": alive,
+            "stopped": live.get("stopped").cloned().unwrap_or(Value::Null),
+            "lastStop": live.get("lastStop").cloned().unwrap_or(Value::Null),
+            "updatedAt": live.get("updatedAt").cloned().unwrap_or(Value::Null),
+            "armed": armed,
+            "target": target,
+            "requestedTarget": requested,
+            "targetIdentity": identity,
+            "stale": false,
+            "unsupported": false,
+            "hint": Value::Null,
+        })
+    } else {
+        json!({
+            "name": name,
+            "lang": lang,
+            "kind": live.get("kind").cloned().unwrap_or(Value::Null),
+            "port": port,
+            "alive": alive,
+            "stopped": live.get("stopped").cloned().unwrap_or(Value::Null),
+            "lastStop": live.get("lastStop").cloned().unwrap_or(Value::Null),
+            "updatedAt": live.get("updatedAt").cloned().unwrap_or(Value::Null),
+            "armed": armed,
+            "target": target,
+            "requestedTarget": requested,
+            "targetIdentity": identity,
+            "stale": true,
+            "unsupported": true,
+            "hint": format!("close '{name}' and recreate (unsupported schema v1)"),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -3135,10 +3544,13 @@ mod tests {
         )
         .unwrap();
         let v = session_entry(&dir);
-        assert_eq!(v["lang"], json!("java")); // missing sidecar default
+        assert_eq!(v["lang"], json!("unknown")); // missing sidecar: unknown
         assert_eq!(v["lastStop"], Value::Null);
         assert_eq!(v["armed"], Value::Null);
         assert_eq!(v["alive"], json!(false)); // port 0: no probe
+        assert_eq!(v["unsupported"], json!(true));
+        assert_eq!(v["stale"], json!(true));
+        assert!(v.get("observedTarget").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3186,24 +3598,39 @@ mod tests {
     #[test]
     fn target_normalize_keeps_main_and_rejects_on_single_target_langs() {
         // Omitted and explicit main are identical (legacy wire behavior).
-        assert_eq!(normalize_target_for_lang("java", None).unwrap(), None);
         assert_eq!(
-            normalize_target_for_lang("browser", Some("main")).unwrap(),
+            normalize_target_for_lang_opt(Some("java"), None).unwrap(),
             None
         );
-        assert_eq!(normalize_target_for_lang("py", Some("main")).unwrap(), None);
+        assert_eq!(
+            normalize_target_for_lang_opt(Some("browser"), Some("main")).unwrap(),
+            None
+        );
+        assert_eq!(
+            normalize_target_for_lang_opt(Some("py"), Some("main")).unwrap(),
+            None
+        );
         // Multi-target langs pass selectors through for bridge validation.
         assert_eq!(
-            normalize_target_for_lang("py", Some("child:7")).unwrap(),
+            normalize_target_for_lang_opt(Some("py"), Some("child:7")).unwrap(),
             Some("child:7".to_string())
         );
         assert_eq!(
-            normalize_target_for_lang("node", Some("worker:abc")).unwrap(),
+            normalize_target_for_lang_opt(Some("node"), Some("worker:abc")).unwrap(),
             Some("worker:abc".to_string())
         );
         // Main-only adapters fail fast instead of silently serving main.
-        assert!(normalize_target_for_lang("java", Some("child:7")).is_err());
-        assert!(normalize_target_for_lang("browser", Some("worker:abc")).is_err());
+        assert!(normalize_target_for_lang_opt(Some("java"), Some("child:7")).is_err());
+        assert!(normalize_target_for_lang_opt(Some("browser"), Some("worker:abc")).is_err());
+        // Missing/unknown languages forward for bridge-side validation.
+        assert_eq!(
+            normalize_target_for_lang_opt(None, Some("child:7")).unwrap(),
+            Some("child:7".to_string())
+        );
+        assert_eq!(
+            normalize_target_for_lang_opt(Some("go"), Some("child:7")).unwrap(),
+            Some("child:7".to_string())
+        );
     }
 
     #[test]
@@ -3213,7 +3640,8 @@ mod tests {
             dir.join("session.json"),
             r#"{"name":"x","kind":"attach","port":0,"stopped":true,
                 "lastStop":{"file":"a.java","line":3,"method":"m"},
-                "observedTarget":{"kind":"process"}}"#,
+                "schemaVersion":2,
+                "targetIdentity":{"debuggee":null,"endpoint":null,"adapter":null}}"#,
         )
         .unwrap();
         let v = cmd_targets_in(&dir);
@@ -3225,6 +3653,9 @@ mod tests {
         assert_eq!(t["state"], json!("stopped"));
         assert_eq!(t["lastStop"]["line"], json!(3));
         assert_eq!(t["scope"], json!("global"));
+        // No flat identity key on the roster entry; layered roles ride top-level.
+        assert!(t.get("observed").is_none());
+        assert!(v["targetIdentity"].is_object());
         assert_eq!(v["selected"], json!("main"));
         assert_eq!(v["ignored"], json!(0));
         assert_eq!(v["droppedExited"], json!(0));
@@ -3379,63 +3810,64 @@ mod tests {
     }
 
     #[test]
-    fn observed_fields_capped_and_total_bounded() {
+    fn identity_fields_capped_and_total_bounded() {
         let long = "x".repeat(600);
-        let v = cap_observed(json!({
-            "kind": "process", "pid": 1, "executable": long,
-            "argv": [long, long], "cwd": "/t",
-            "source": "s", "observedAt": 1,
-            "unavailable": [], "warnings": [],
+        let v = cap_identity(json!({
+            "debuggee": {"kind": "process", "pid": 1, "executable": long},
+            "endpoint": {"argv": [long, long]},
+            "adapter": {"cwd": "/t", "source": "s", "observedAt": 1},
         }));
-        assert!(v["executable"].as_str().unwrap().contains("(+"));
-        for entry in v["argv"].as_array().unwrap() {
-            assert!(entry.as_str().unwrap().chars().count() <= OBSERVED_FIELD_CAP + 30);
+        assert!(v["debuggee"]["executable"].as_str().unwrap().contains("(+"));
+        for entry in v["endpoint"]["argv"].as_array().unwrap() {
+            assert!(entry.as_str().unwrap().chars().count() <= IDENTITY_FIELD_CAP + 30);
         }
-        assert!(v.to_string().chars().count() <= OBSERVED_TOTAL_CAP);
+        assert!(v.to_string().chars().count() <= IDENTITY_TOTAL_CAP);
     }
 
     #[test]
-    fn attach_remote_host_is_structured_unavailable() {
-        let v = attach_observed("example.com", 5678);
-        assert_eq!(v["kind"], json!("process"));
-        assert!(v["pid"].is_null());
-        let unavailable = v["unavailable"].as_array().unwrap();
-        assert!(unavailable.iter().any(|u| u["field"] == json!("pid")));
-        let warnings: Vec<&str> = v["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|w| w.as_str())
-            .collect();
-        assert!(warnings.iter().any(|w| w.contains("identity-unverified")));
+    fn attach_seed_remote_host_is_structured_unavailable() {
+        let v = attach_seed("example.com", 5678);
+        assert!(v["debuggee"]["pid"].is_null());
+        assert_eq!(v["debuggee"]["confidence"], json!("unavailable"));
+        assert_eq!(v["endpoint"]["confidence"], json!("unavailable"));
+        assert_eq!(v["endpoint"]["host"], json!("example.com"));
+        assert_eq!(v["endpoint"]["port"], json!(5678));
+        let unavailable = v["endpoint"]["unavailable"].as_array().unwrap();
+        assert!(unavailable.iter().any(|u| u["field"] == json!("ownerPid")));
+        assert_eq!(v["adapter"]["confidence"], json!("unavailable"));
         // No env, no raw secrets: the whole object serializes clean.
-        assert!(v.to_string().len() <= OBSERVED_TOTAL_CAP);
+        assert!(v.to_string().len() <= IDENTITY_TOTAL_CAP);
     }
 
     #[test]
-    fn attach_closed_local_port_is_unavailable_not_fabricated() {
+    fn attach_seed_closed_local_port_is_unavailable_not_fabricated() {
         // Nothing listens on port 1: lookup must yield structured
         // unavailable, never an invented pid.
-        let v = attach_observed("localhost", 1);
-        assert!(v["pid"].is_null());
-        assert!(v["executable"].is_null());
-        assert!(!v["unavailable"].as_array().unwrap().is_empty());
+        let v = attach_seed("localhost", 1);
+        assert!(v["debuggee"]["pid"].is_null());
+        assert_eq!(v["endpoint"]["confidence"], json!("unavailable"));
+        assert!(!v["endpoint"]["unavailable"].as_array().unwrap().is_empty());
     }
 
     #[test]
-    fn compact_hint_names_target_without_root_cause() {
-        let v = launch_observed(
-            "python3",
-            vec!["python3".to_string(), "a.py".to_string()],
-            "launcher-args",
-        );
-        let hint = compact_hint(&v);
+    fn launch_seed_carries_launcher_args_without_confidence() {
+        let v = launch_seed("python3", vec!["python3".to_string(), "a.py".to_string()]);
+        assert_eq!(v["debuggee"]["source"], json!("launcher-args"));
+        assert_eq!(v["debuggee"]["confidence"], json!("unavailable"));
+        assert!(v["debuggee"]["pid"].is_null());
+        assert_eq!(v["endpoint"]["confidence"], json!("unavailable"));
+        assert_eq!(v["adapter"]["confidence"], json!("unavailable"));
+    }
+
+    #[test]
+    fn identity_hint_names_target_without_root_cause() {
+        let v = launch_seed("python3", vec!["python3".to_string(), "a.py".to_string()]);
+        let hint = identity_hint(&v);
         assert!(hint.contains("python3"));
         assert!(!hint.contains("reason"));
-        let tab = json!({"kind": "tab", "url": "http://h/app.js"});
-        assert!(compact_hint(&tab).contains("http://h/app.js"));
-        let missing = attach_observed("example.com", 9);
-        assert!(compact_hint(&missing).contains("unavailable"));
+        let missing = attach_seed("example.com", 9);
+        assert!(identity_hint(&missing).contains("unavailable"));
+        assert_eq!(identity_hint(&Value::Null), "");
     }
 
     #[test]
@@ -3481,21 +3913,21 @@ mod tests {
     }
 
     #[test]
-    fn observed_high_count_argv_terminates_bounded() {
+    fn identity_high_count_argv_terminates_bounded() {
         // ~80+ small strings: the old longest-shrink loop re-marked without
         // progress (attach hang); count cap + collapse must converge <=2KB.
         let argv: Vec<Value> = (0..120)
             .map(|i| Value::String(format!("--arg{i:03}-{}", "v".repeat(20))))
             .collect();
-        let v = cap_observed(json!({
+        let v = cap_identity(json!({
             "kind": "process", "pid": 1, "executable": "/bin/x",
             "argv": argv, "cwd": "/t",
             "source": "s", "observedAt": 1,
             "unavailable": [], "warnings": [],
         }));
-        assert!(v.to_string().chars().count() <= OBSERVED_TOTAL_CAP);
+        assert!(v.to_string().chars().count() <= IDENTITY_TOTAL_CAP);
         let arr = v["argv"].as_array().unwrap();
-        assert!(arr.len() <= OBSERVED_ARRAY_CAP + 1); // head + tail marker
+        assert!(arr.len() <= IDENTITY_ARRAY_CAP + 1); // head + tail marker
         assert!(
             arr.iter()
                 .any(|e| e.as_str().is_some_and(|s| s.contains("more"))),
@@ -3504,7 +3936,7 @@ mod tests {
         // Every surviving field still fits the per-field cap (+marker slack).
         for entry in arr {
             assert!(
-                entry.as_str().unwrap().chars().count() <= OBSERVED_FIELD_CAP + 30,
+                entry.as_str().unwrap().chars().count() <= IDENTITY_FIELD_CAP + 30,
                 "{}",
                 entry.as_str().unwrap().chars().count()
             );
@@ -3513,9 +3945,8 @@ mod tests {
 
     #[test]
     fn unknown_lang_forwards_instead_of_assuming_java() {
-        // Missing/corrupt lang.json: display stays java, routing forwards.
+        // Missing/corrupt lang.json: routing forwards.
         let dir = tmpdir("lang-missing");
-        assert_eq!(session_lang_in(&dir), "java");
         assert!(session_lang_opt(&dir).is_none());
         assert!(!targets_use_local_roster(&dir));
         assert_eq!(
@@ -3632,14 +4063,15 @@ mod tests {
 
     #[test]
     fn cached_target_identity_needs_bridge_object() {
-        // Present object passes through; missing/non-object reads as null
-        // (no spawn-time fabrication — the roles need bridge facts).
+        // Only a valid layered object echoes; missing/non-object reads as
+        // null (no spawn-time fabrication — the roles need bridge facts).
         let dir = tmpdir("identity-cache");
         assert_eq!(cached_target_identity(&dir), Value::Null);
         std::fs::write(
             dir.join("session.json"),
-            r#"{"name":"x","observedTarget":{"kind":"process"},
-                "targetIdentity":{"debuggee":{"confidence":"protocol-confirmed"}}}"#,
+            r#"{"name":"x",
+                "targetIdentity":{"debuggee":{"confidence":"protocol-confirmed"},
+                    "endpoint":null,"adapter":null}}"#,
         )
         .unwrap();
         let v = cached_target_identity(&dir);
@@ -3652,31 +4084,117 @@ mod tests {
     }
 
     #[test]
-    fn session_entry_and_roster_surface_identity_additively() {
-        // observedTarget shape untouched; targetIdentity rides alongside in
-        // both status rows and the main-only targets roster.
+    fn layered_reads_reject_flat_and_malformed_across_surfaces() {
+        // Canonical v2 read: flat legacy and malformed stored identities
+        // become null on every surface (status row, local roster, cached
+        // spawn/context read); valid layered echoes (sanitized, capped).
+        for (tag, body) in [
+            (
+                "flat",
+                r#"{"name":"x","kind":"attach","port":0,"stopped":true,
+                    "targetIdentity":{"kind":"process","pid":4343,"argv":["python"]}}"#,
+            ),
+            (
+                "role-type",
+                r#"{"name":"x","kind":"attach","port":0,"stopped":true,
+                    "targetIdentity":{"debuggee":7,"endpoint":null,"adapter":null}}"#,
+            ),
+            (
+                "partial",
+                r#"{"name":"x","kind":"attach","port":0,"stopped":true,
+                    "targetIdentity":{"debuggee":{"confidence":"protocol-confirmed"}}}"#,
+            ),
+        ] {
+            let dir = tmpdir(&format!("layered-reject-{tag}"));
+            std::fs::write(dir.join("session.json"), body).unwrap();
+            assert_eq!(cached_target_identity(&dir), Value::Null, "{tag}");
+            assert_eq!(cmd_targets_in(&dir)["targetIdentity"], Value::Null, "{tag}");
+            assert_eq!(session_entry(&dir)["targetIdentity"], Value::Null, "{tag}");
+            assert_eq!(
+                layered_identity_or_null(
+                    serde_json::from_str::<Value>(body)
+                        .unwrap()
+                        .get("targetIdentity")
+                        .cloned()
+                ),
+                Value::Null,
+                "{tag}: context read path"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        // Valid layered echoes verbatim when in budget (bridge output
+        // untouched); over-budget strings cap defensively, roles intact.
+        let dir = tmpdir("layered-accept");
+        let valid = json!({
+            "debuggee": {"kind": "process", "pid": 11, "confidence": "protocol-confirmed"},
+            "endpoint": {"host": "h", "port": 9, "confidence": "os-corroborated"},
+            "adapter": null,
+        });
+        assert_eq!(layered_identity_or_null(Some(valid.clone())), valid);
+        let long = "y".repeat(IDENTITY_FIELD_CAP + 100);
+        let big = json!({
+            "debuggee": {"kind": "process", "pid": 11, "name": long},
+            "endpoint": null,
+            "adapter": null,
+        });
+        let out = layered_identity_or_null(Some(big));
+        assert_eq!(out["debuggee"]["pid"], json!(11));
+        assert!(
+            out["debuggee"]["name"].as_str().unwrap().chars().count() <= IDENTITY_FIELD_CAP + 30,
+            "{out}"
+        );
+        assert!(out.to_string().chars().count() <= IDENTITY_TOTAL_CAP);
+        assert_eq!(layered_identity_or_null(None), Value::Null);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_entry_and_roster_surface_identity_layered_only() {
+        // Layered-only: no observedTarget key anywhere; targetIdentity rides
+        // in both status rows and the main-only targets roster.
         let dir = tmpdir("identity-surface");
+        std::fs::write(
+            dir.join("lang.json"),
+            r#"{"lang":"java","schemaVersion":2}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("stops.json"),
+            r#"{"breaks":[],"logpoints":[],"watches":[],"exits":[],
+                "sources":[],"timeout":7,"schemaVersion":2,
+                "target":{"main":"x"},"requestedTarget":{"main":"x"}}"#,
+        )
+        .unwrap();
         std::fs::write(
             dir.join("session.json"),
             r#"{"name":"x","kind":"attach","port":0,"stopped":false,
-                "observedTarget":{"kind":"process","pid":7},
+                "schemaVersion":2,
                 "targetIdentity":{"debuggee":{"pid":7},"endpoint":null,"adapter":null}}"#,
         )
         .unwrap();
-        std::fs::write(dir.join("lang.json"), r#"{"lang":"java"}"#).unwrap();
         let row = session_entry(&dir);
-        assert_eq!(row["observedTarget"]["pid"], json!(7));
+        assert!(row.get("observedTarget").is_none());
         assert_eq!(row["targetIdentity"]["debuggee"]["pid"], json!(7));
+        assert_eq!(row["unsupported"], json!(false));
+        assert_eq!(row["stale"], json!(false));
+        assert!(row["hint"].is_null());
+        assert_eq!(row["lang"], json!("java"));
         let roster = cmd_targets_in(&dir);
         assert_eq!(roster["targetIdentity"]["debuggee"]["pid"], json!(7));
-        assert_eq!(roster["targets"][0]["observed"]["pid"], json!(7));
-        // Legacy file without the key: honest nulls, same as before.
+        assert!(roster["targets"][0].get("observed").is_none());
+        // Marker-less session.json with v2 CLI markers: old/unsupported,
+        // never current.
         std::fs::write(
             dir.join("session.json"),
             r#"{"name":"x","kind":"attach","port":0,"stopped":false}"#,
         )
         .unwrap();
-        assert_eq!(session_entry(&dir)["targetIdentity"], Value::Null);
+        let row = session_entry(&dir);
+        assert_eq!(row["unsupported"], json!(true));
+        assert_eq!(row["stale"], json!(true));
+        let hint = row["hint"].as_str().unwrap();
+        assert!(hint.starts_with("close '"), "{hint}");
+        assert!(hint.contains("unsupported schema v1"), "{hint}");
         assert_eq!(cmd_targets_in(&dir)["targetIdentity"], Value::Null);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3741,8 +4259,8 @@ mod tests {
             wait_secs: 1,
             stops: json!({}),
             requested,
-            observed: Value::Null,
-            observed_hint: String::new(),
+            target_identity: Value::Null,
+            identity_hint: String::new(),
         };
         let req = json!({"host": "localhost", "port": 5678, "pid": Value::Null});
         assert_eq!(
@@ -4345,13 +4863,13 @@ mod tests {
         // sanitized `cause`; diagnosis + redacted identities ride alongside.
         let raw = "attach failed (127.0.0.1:9): Connection refused — is the target started \
              with debugpy --listen 9 ?";
-        let observed = attach_observed("127.0.0.1", 9);
+        let seed = attach_seed("127.0.0.1", 9);
         let requested = json!({"host": "127.0.0.1", "port": 9, "pid": Value::Null});
         let d = attach_diagnosis(Some(false), Some(false), "127.0.0.1:9");
         let code = d["code"].as_str().unwrap().to_string();
         let error = diagnosed_attach_error(&code, "127.0.0.1:9");
         let cause = sanitize_cause(raw);
-        let err = attach_failure(error.clone(), Some(cause.clone()), d, &observed, &requested);
+        let err = attach_failure(error.clone(), Some(cause.clone()), d, &seed, &requested);
         let text = format!("{err:#}");
         assert!(text.starts_with("attach failed:"), "{text}");
         assert!(text.contains("no debug listener found"), "{text}");
@@ -4369,16 +4887,22 @@ mod tests {
         // Redacted by construction: observed argv (if any) carries no
         // secrets and the envelope serializes within caps.
         let ser = serde_json::to_string(bf.target_identity.as_ref().unwrap()).unwrap();
-        assert!(ser.len() <= OBSERVED_TOTAL_CAP);
+        assert!(ser.len() <= IDENTITY_TOTAL_CAP);
         // Preflight owner errors are also `attach failed:`-prefixed, name
         // the session + endpoint actionably, and carry no adapter cause.
+        // The identity is the owner's layered roles, never flat observed.
+        let owner_identity = json!({
+            "debuggee": {"kind": "process", "pid": 4242, "confidence": "protocol-confirmed"},
+            "endpoint": {"ownerPid": 4343, "confidence": "os-corroborated"},
+            "adapter": {"pid": 4343, "confidence": "os-corroborated"},
+        });
         let err = endpoint_owned_failure(
             "first",
             false,
             "py",
             "127.0.0.1",
             5678,
-            &observed,
+            &owner_identity,
             &requested,
         );
         let text = format!("{err:#}");
@@ -4395,7 +4919,14 @@ mod tests {
             json!("first")
         );
         assert!(bf.cause.is_none(), "preflight ran no adapter: no cause");
-        let in_flight = endpoint_owned_failure("w", true, "py", "h", 1, &observed, &requested);
+        let layered = bf.target_identity.as_ref().expect("layered owner identity");
+        assert!(is_layered_identity(layered), "{layered}");
+        assert!(
+            layered.get("pid").is_none(),
+            "no flat top-level pid: {layered}"
+        );
+        let in_flight =
+            endpoint_owned_failure("w", true, "py", "h", 1, &owner_identity, &requested);
         let in_text = format!("{in_flight:#}");
         assert!(in_text.starts_with("attach failed:"), "{in_text}");
         assert!(
@@ -4403,6 +4934,187 @@ mod tests {
             "in-flight wording keeps the same aligned phrase: {in_text}"
         );
         assert!(in_text.contains("wait and retry"), "{in_text}");
+    }
+
+    #[test]
+    fn owner_collision_identity_is_layered_never_flat() {
+        // Current owner with a valid layered identity: preserved verbatim
+        // (roles intact), defensively re-redacted + capped, never flattened.
+        let root = tmpdir("owner-layered");
+        let owner = root.join("first");
+        std::fs::create_dir_all(&owner).unwrap();
+        std::fs::write(
+            owner.join("session.json"),
+            r#"{"name":"first","kind":"attach",
+                "observedTarget":{"kind":"process","pid":4343,
+                    "executable":"python","argv":["python","-m","debugpy","--listen","127.0.0.1:5678"],
+                    "cwd":"/work","source":"os-proc","observedAt":1},
+                "targetIdentity":{
+                    "debuggee":{"kind":"process","pid":4242,"name":"srv.py",
+                        "confidence":"protocol-confirmed","observedAt":2,"unavailable":[]},
+                    "endpoint":{"host":"127.0.0.1","port":5678,"ownerPid":4343,
+                        "role":"listener-owner (not necessarily the debuggee)",
+                        "source":"os-proc","confidence":"os-corroborated",
+                        "observedAt":2,"unavailable":[]},
+                    "adapter":{"name":"debugpy-adapter","pid":4343,
+                        "source":"os-proc","confidence":"os-corroborated",
+                        "observedAt":2,"unavailable":[]}}}"#,
+        )
+        .unwrap();
+        let ident = owner_target_identity(&root, "first");
+        assert!(is_layered_identity(&ident), "{ident}");
+        assert!(ident.get("pid").is_none(), "no flat top-level pid: {ident}");
+        assert_eq!(ident["debuggee"]["pid"], json!(4242));
+        assert_eq!(ident["endpoint"]["ownerPid"], json!(4343));
+        assert_eq!(ident["adapter"]["pid"], json!(4343));
+        // The requester's flat observed pid (the adapter) is not what the
+        // collision reports: the error carries the owner's layered roles.
+        let err = endpoint_owned_failure(
+            "first",
+            false,
+            "py",
+            "127.0.0.1",
+            5678,
+            &ident,
+            &json!({"host": "127.0.0.1", "port": 5678, "pid": Value::Null}),
+        );
+        let bf = err.downcast_ref::<BridgeFailure>().expect("typed failure");
+        let carried = bf.target_identity.as_ref().expect("owner identity carried");
+        assert!(is_layered_identity(carried), "{carried}");
+        assert_eq!(carried["debuggee"]["pid"], json!(4242));
+        // JSON envelope keeps the layered shape end to end.
+        let env = crate::output::build_error_envelope(
+            "attach",
+            &format!("{err:#}"),
+            None,
+            None,
+            bf.diagnosis.clone(),
+            bf.target_identity.clone(),
+            bf.requested_target.clone(),
+        );
+        assert!(is_layered_identity(&env["targetIdentity"]), "{env}");
+        assert!(env["targetIdentity"].get("pid").is_none(), "{env}");
+        assert_eq!(env["diagnosis"]["code"], json!("endpoint-already-attached"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_collision_reredacts_stale_raw_secrets() {
+        // A stale raw secret cached in the owner's stored argv never leaks
+        // through the collision response: sanitize re-redacts defensively.
+        let root = tmpdir("owner-reredact");
+        let owner = root.join("first");
+        std::fs::create_dir_all(&owner).unwrap();
+        std::fs::write(
+            owner.join("session.json"),
+            r#"{"name":"first","kind":"attach",
+                "targetIdentity":{
+                    "debuggee":{"kind":"process","pid":11,"confidence":"protocol-confirmed",
+                        "observedAt":1,"unavailable":[]},
+                    "endpoint":{"host":"h","port":9,"ownerPid":22,
+                        "argv":["python","--token","hunter2"],
+                        "confidence":"os-corroborated","observedAt":1,"unavailable":[]},
+                    "adapter":{"confidence":"unavailable","observedAt":1,
+                        "unavailable":[{"field":"pid","reason":"x"}]}}}"#,
+        )
+        .unwrap();
+        let ident = owner_target_identity(&root, "first");
+        let ser = ident.to_string();
+        assert!(!ser.contains("hunter2"), "{ser}");
+        assert!(ser.contains("[redacted]"), "{ser}");
+        assert_eq!(ident["debuggee"]["pid"], json!(11));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_collision_legacy_flat_is_all_unavailable() {
+        // Legacy owner (flat keys, no layered identity): all-unavailable —
+        // no pid is ever promoted from legacy state (on a wrapped server
+        // the listener-owner pid is the adapter, not the debuggee).
+        let root = tmpdir("owner-legacy");
+        let owner = root.join("first");
+        std::fs::create_dir_all(&owner).unwrap();
+        std::fs::write(
+            owner.join("session.json"),
+            r#"{"name":"first","kind":"attach",
+                "observedTarget":{"kind":"process","pid":4343,
+                    "executable":"python",
+                    "argv":["python","-m","debugpy","--listen","127.0.0.1:5678"],
+                    "cwd":"/work","source":"os-proc","observedAt":7,
+                    "unavailable":[],"warnings":[]}}"#,
+        )
+        .unwrap();
+        let ident = owner_target_identity(&root, "first");
+        assert!(is_layered_identity(&ident), "{ident}");
+        assert!(ident.get("pid").is_none(), "no flat top-level pid: {ident}");
+        let ser = ident.to_string();
+        assert!(!ser.contains("4343"), "legacy pid never promoted: {ser}");
+        for role in ["debuggee", "endpoint", "adapter"] {
+            assert_eq!(ident[role]["confidence"], json!("unavailable"), "{ident}");
+        }
+        assert_eq!(ident["debuggee"]["pid"], Value::Null);
+        // A layered null reads the same way.
+        std::fs::write(
+            owner.join("session.json"),
+            r#"{"name":"first","kind":"attach","targetIdentity":null}"#,
+        )
+        .unwrap();
+        let ident2 = owner_target_identity(&root, "first");
+        assert!(is_layered_identity(&ident2), "{ident2}");
+        assert_eq!(ident2["debuggee"]["pid"], Value::Null);
+        assert_eq!(ident2["debuggee"]["confidence"], json!("unavailable"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_collision_malformed_identity_carries_no_pid() {
+        // Malformed stored identities (flat shape under `targetIdentity`,
+        // wrong role types, non-object) normalize to all-unavailable: no
+        // pid is promoted anywhere, and the flat value is never forwarded.
+        let root = tmpdir("owner-malformed");
+        let owner = root.join("first");
+        std::fs::create_dir_all(&owner).unwrap();
+        for (tag, body) in [
+            (
+                "flat",
+                r#"{"targetIdentity":{"kind":"process","pid":4343,"argv":["x"]},
+                    "observedTarget":{"kind":"process","pid":4343,"argv":["python"]}}"#,
+            ),
+            (
+                "role-type",
+                r#"{"targetIdentity":{"debuggee":7,"endpoint":null,"adapter":null}}"#,
+            ),
+            (
+                "missing-role",
+                r#"{"targetIdentity":{"debuggee":null,"endpoint":null}}"#,
+            ),
+            ("array", r#"{"targetIdentity":[1,2]}"#),
+        ] {
+            std::fs::write(owner.join("session.json"), body).unwrap();
+            let ident = owner_target_identity(&root, "first");
+            assert!(is_layered_identity(&ident), "{tag}: {ident}");
+            let ser = ident.to_string();
+            assert!(!ser.contains("4343"), "{tag}: pid leaked: {ser}");
+            for role in ["debuggee", "endpoint", "adapter"] {
+                assert_eq!(
+                    ident[role]["confidence"],
+                    json!("unavailable"),
+                    "{tag}: {ident}"
+                );
+                assert!(
+                    ident[role]["unavailable"]
+                        .as_array()
+                        .is_some_and(|a| !a.is_empty()),
+                    "{tag}: {ident}"
+                );
+            }
+            assert!(ident.get("pid").is_none(), "{tag}: {ident}");
+        }
+        // Unknown owner (e.g. unpublished lock holder): same shape, no pid.
+        let ident = owner_target_identity(&root, "ghost");
+        assert!(is_layered_identity(&ident), "{ident}");
+        assert!(ident["debuggee"]["pid"].is_null(), "{ident}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4420,8 +5132,8 @@ mod tests {
             wait_secs: 1,
             stops: json!({}),
             requested: json!({"host": "127.0.0.1", "port": 9, "pid": Value::Null}),
-            observed: attach_observed("127.0.0.1", 9),
-            observed_hint: String::new(),
+            target_identity: attach_seed("127.0.0.1", 9),
+            identity_hint: String::new(),
         };
         let spec = mk_spec();
         let msg = "cannot reach debug session on port 61234: connection refused (stale?)";
@@ -4445,45 +5157,75 @@ mod tests {
     }
 
     #[test]
-    fn bridge_setup_error_parses_phase_backward_compatibly() {
+    fn bridge_setup_error_is_strict_v2() {
         let dir = tmpdir("phase-parse");
-        // Config phase: semantic error, routed without diagnosis.
+        // Config phase with schemaVersion 2: semantic error, no diagnosis.
         std::fs::write(
             dir.join("error.json"),
-            r#"{"error":"no method noSuchMethod() in IdleAttach","phase":"config"}"#,
+            r#"{"schemaVersion":2,"error":"no method noSuchMethod() in IdleAttach","phase":"config"}"#,
         )
         .unwrap();
         let e = read_bridge_error(&dir);
+        assert!(!e.corrupt);
         assert_eq!(e.message, "no method noSuchMethod() in IdleAttach");
         assert!(is_config_phase(e.phase.as_deref()));
-        // Transport phase: listener evidence decides.
+        // Transport phase with schemaVersion 2: listener evidence decides.
         std::fs::write(
             dir.join("error.json"),
-            r#"{"error":"attach failed: refused","phase":"transport"}"#,
+            r#"{"schemaVersion":2,"error":"attach failed: refused","phase":"transport"}"#,
         )
         .unwrap();
         let e = read_bridge_error(&dir);
+        assert!(!e.corrupt);
         assert!(!is_config_phase(e.phase.as_deref()));
-        // Missing phase (older bridges): conservative, never config.
-        std::fs::write(
-            dir.join("error.json"),
-            r#"{"error":"attach failed: refused"}"#,
-        )
-        .unwrap();
-        let e = read_bridge_error(&dir);
-        assert_eq!(e.message, "attach failed: refused");
-        assert!(e.phase.is_none());
-        assert!(!is_config_phase(e.phase.as_deref()));
-        // Unknown or non-string phases: conservative, never config.
-        std::fs::write(dir.join("error.json"), r#"{"error":"x","phase":"runtime"}"#).unwrap();
-        assert!(!is_config_phase(read_bridge_error(&dir).phase.as_deref()));
-        std::fs::write(dir.join("error.json"), r#"{"error":"x","phase":7}"#).unwrap();
-        assert!(!is_config_phase(read_bridge_error(&dir).phase.as_deref()));
-        // Corrupt or missing file: fallback message, no phase.
+        // Present + parseable but missing/bad version/phase: exact corrupt
+        // message (internal, never transport-diagnosed).
+        for (tag, body) in [
+            (
+                "missing-phase",
+                r#"{"schemaVersion":2,"error":"attach failed: refused"}"#,
+            ),
+            (
+                "missing-version",
+                r#"{"error":"attach failed: refused","phase":"transport"}"#,
+            ),
+            (
+                "bad-version",
+                r#"{"schemaVersion":1,"error":"x","phase":"transport"}"#,
+            ),
+            (
+                "bad-phase",
+                r#"{"schemaVersion":2,"error":"x","phase":"runtime"}"#,
+            ),
+            (
+                "nonstring-phase",
+                r#"{"schemaVersion":2,"error":"x","phase":7}"#,
+            ),
+        ] {
+            std::fs::write(dir.join("error.json"), body).unwrap();
+            let e = read_bridge_error(&dir);
+            assert!(e.corrupt, "{tag}");
+            assert!(
+                e.message.contains("corrupt setup error file")
+                    && e.message.contains("(schemaVersion/phase)")
+                    && e.message.contains("close and retry"),
+                "{tag}: {e:?}"
+            );
+            assert!(e.phase.is_none(), "{tag}");
+        }
+        // Absent/unparseable/error-less file: transport fallback, not corrupt.
         std::fs::write(dir.join("error.json"), "not json").unwrap();
         let e = read_bridge_error(&dir);
+        assert!(!e.corrupt);
         assert!(e.message.contains("see bridge.log"), "{e:?}");
         assert!(!is_config_phase(e.phase.as_deref()));
+        std::fs::write(
+            dir.join("error.json"),
+            r#"{"schemaVersion":2,"phase":"config"}"#,
+        )
+        .unwrap();
+        let e = read_bridge_error(&dir);
+        assert!(!e.corrupt, "no error string: fallback, not corrupt");
         std::fs::remove_file(dir.join("error.json")).unwrap();
         assert!(!is_config_phase(read_bridge_error(&dir).phase.as_deref()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -4494,10 +5236,10 @@ mod tests {
         // Semantic config error: the exact message stays top-level (never
         // rewritten to `attach failed:`), with no diagnosis and no cause
         // duplication — but the redacted identities still ride along.
-        let observed = attach_observed("127.0.0.1", 9);
+        let seed = attach_seed("127.0.0.1", 9);
         let requested = json!({"host": "127.0.0.1", "port": 9, "pid": Value::Null});
         let msg = "no method noSuchMethod() in IdleAttach";
-        let err = attach_config_failure(msg.to_string(), &observed, &requested);
+        let err = attach_config_failure(msg.to_string(), &seed, &requested);
         assert_eq!(format!("{err:#}"), msg);
         assert!(
             !format!("{err:#}").contains("attach failed"),
@@ -4515,7 +5257,7 @@ mod tests {
         let dir = tmpdir("phase-settle");
         std::fs::write(
             dir.join("error.json"),
-            r#"{"error":"no method x() in Y","phase":"config"}"#,
+            r#"{"schemaVersion":2,"error":"no method x() in Y","phase":"config"}"#,
         )
         .unwrap();
         let e = settle_for_bridge_error(&dir).expect("immediate hit, no wait");
@@ -4548,10 +5290,17 @@ mod tests {
             // Preflight owner errors name the session; the mapping helper
             // covers the other four codes.
             if code == "endpoint-already-attached" {
-                let observed = attach_observed("127.0.0.1", 9);
+                let owner_identity = unavailable_identity("test owner without state");
                 let requested = json!({"host": "h", "port": 1, "pid": Value::Null});
-                let err =
-                    endpoint_owned_failure("sess", false, "py", "h", 1, &observed, &requested);
+                let err = endpoint_owned_failure(
+                    "sess",
+                    false,
+                    "py",
+                    "h",
+                    1,
+                    &owner_identity,
+                    &requested,
+                );
                 let text = format!("{err:#}");
                 assert!(text.starts_with("attach failed:"), "{code}: {text}");
                 assert!(text.contains(phrase), "{code}: {text}");
@@ -4602,12 +5351,12 @@ mod tests {
         assert!(capped.contains("more chars"), "{capped}");
         // A cause identical to the concise error is dropped, never
         // duplicated into both fields.
-        let observed = attach_observed("127.0.0.1", 9);
+        let seed = attach_seed("127.0.0.1", 9);
         let requested = json!({"host": "h", "port": 1, "pid": Value::Null});
         let d = attach_diagnosis(Some(false), Some(false), "h:1");
         let code = d["code"].as_str().unwrap().to_string();
         let error = diagnosed_attach_error(&code, "h:1");
-        let err = attach_failure(error.clone(), Some(error.clone()), d, &observed, &requested);
+        let err = attach_failure(error.clone(), Some(error.clone()), d, &seed, &requested);
         assert!(err.downcast_ref::<BridgeFailure>().unwrap().cause.is_none());
     }
 
@@ -4622,5 +5371,253 @@ mod tests {
             "unbounded CLI host must not bloat the envelope: {shown}"
         );
         assert!(shown.contains("more chars"), "truncation must be marked");
+    }
+
+    // ---- schema v2 breaking cutover ----
+
+    /// Write v2 CLI-owned markers into a fake session dir.
+    fn write_v2_markers(dir: &std::path::Path, lang: &str) {
+        std::fs::write(
+            dir.join("lang.json"),
+            format!("{{\"lang\":\"{lang}\",\"schemaVersion\":2}}"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("stops.json"),
+            r#"{"breaks":[],"logpoints":[],"watches":[],"exits":[],
+                "sources":[],"timeout":7,"schemaVersion":2,
+                "target":{},"requestedTarget":{}}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn schema_gate_rejects_old_markers() {
+        // v2 markers pass.
+        let dir = tmpdir("gate-v2");
+        write_v2_markers(&dir, "py");
+        assert!(require_schema_v2(&dir, "gate-v2").is_ok());
+        // Missing markers, corrupt files, wrong version: actionable reject.
+        for (tag, lang, stops) in [
+            ("missing", None, None),
+            (
+                "corrupt-lang",
+                Some("not json"),
+                Some(r#"{"schemaVersion":2}"#),
+            ),
+            (
+                "v1-lang",
+                Some(r#"{"lang":"py"}"#),
+                Some(r#"{"schemaVersion":2}"#),
+            ),
+            (
+                "v1-stops",
+                Some(r#"{"lang":"py","schemaVersion":2}"#),
+                Some(r#"{}"#),
+            ),
+            (
+                "bad-version",
+                Some(r#"{"lang":"py","schemaVersion":1}"#),
+                Some(r#"{"schemaVersion":2}"#),
+            ),
+        ] {
+            let d = tmpdir(&format!("gate-{tag}"));
+            if let Some(l) = lang {
+                std::fs::write(d.join("lang.json"), l).unwrap();
+            }
+            if let Some(s) = stops {
+                std::fs::write(d.join("stops.json"), s).unwrap();
+            }
+            let err = require_schema_v2(&d, "old").expect_err(tag);
+            let text = format!("{err:#}");
+            assert!(text.contains("unsupported session 'old'"), "{tag}: {text}");
+            assert!(text.contains("close it and recreate"), "{tag}: {text}");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_row_marks_old_sessions_unsupported() {
+        // Legacy dir (v1 markers, old session file): frozen old row.
+        let dir = tmpdir("status-old");
+        std::fs::write(dir.join("lang.json"), r#"{"lang":"py"}"#).unwrap();
+        std::fs::write(
+            dir.join("stops.json"),
+            r#"{"breaks":["a.py:1"],"logpoints":[],"watches":[],"exits":[],
+                "target":{"program":"a.py"},
+                "requestedTarget":{"program":"a.py","pid":null}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("session.json"),
+            r#"{"name":"s","kind":"launch","port":0,"stopped":true,
+                "lastStop":null,"updatedAt":7,
+                "observedTarget":{"kind":"process","pid":1}}"#,
+        )
+        .unwrap();
+        let row = session_entry(&dir);
+        assert_eq!(row["unsupported"], json!(true));
+        assert_eq!(row["stale"], json!(true));
+        assert_eq!(
+            row["hint"],
+            json!("close 'agent-debugger-test-status-old' and recreate (unsupported schema v1)")
+        );
+        assert_eq!(row["lang"], json!("py"));
+        assert_eq!(row["port"], json!(0));
+        assert_eq!(row["alive"], json!(false));
+        assert!(row.get("observedTarget").is_none(), "{row}");
+        assert!(
+            row["targetIdentity"].is_null(),
+            "legacy flat never promoted: {row}"
+        );
+        assert_eq!(row["armed"]["breaks"], json!(1));
+        assert_eq!(row["requestedTarget"]["program"], json!("a.py"));
+        // Marker-less dir (no sidecars at all): same unsupported shape,
+        // lang unknown, everything null — never a crash, never current.
+        let bare = tmpdir("status-bare");
+        let row = session_entry(&bare);
+        assert_eq!(row["unsupported"], json!(true));
+        assert_eq!(row["lang"], json!("unknown"));
+        assert!(row["stopped"].is_null());
+        assert!(row["armed"].is_null());
+        assert!(row["requestedTarget"].is_null());
+        // Startup row (v2 markers, no session.json yet): current, not stale.
+        let starting = tmpdir("status-starting");
+        write_v2_markers(&starting, "node");
+        let row = session_entry(&starting);
+        assert_eq!(row["unsupported"], json!(false));
+        assert_eq!(row["stale"], json!(false));
+        assert!(row["hint"].is_null());
+        assert_eq!(row["alive"], json!(false));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&bare);
+        let _ = std::fs::remove_dir_all(&starting);
+    }
+
+    #[test]
+    fn legacy_reclaim_needs_proven_death() {
+        // Proven dead: parseable session.json, numeric nonzero port, daemon
+        // silent (port 1 refuses, no recent publish).
+        let dir = tmpdir("reclaim-dead");
+        std::fs::write(
+            dir.join("session.json"),
+            r#"{"name":"x","kind":"attach","port":1,"updatedAt":1}"#,
+        )
+        .unwrap();
+        assert!(legacy_proven_dead(&dir), "dead daemon + recorded port");
+        // Zero port, corrupt file, missing file: unprovable, never reclaim.
+        std::fs::write(
+            dir.join("session.json"),
+            r#"{"name":"x","kind":"attach","port":0}"#,
+        )
+        .unwrap();
+        assert!(!legacy_proven_dead(&dir));
+        std::fs::write(dir.join("session.json"), "not json").unwrap();
+        assert!(!legacy_proven_dead(&dir));
+        std::fs::remove_file(dir.join("session.json")).unwrap();
+        assert!(!legacy_proven_dead(&dir));
+        // Live daemon (bound socket): never reclaim.
+        let sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let live = sock.local_addr().unwrap().port();
+        std::fs::write(
+            dir.join("session.json"),
+            format!(r#"{{"name":"x","kind":"attach","port":{live}}}"#),
+        )
+        .unwrap();
+        assert!(!legacy_proven_dead(&dir), "live daemon must survive");
+        drop(sock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn intent_endpoint_reads_requested_target_only() {
+        // Numeric requestedTarget parses; the old `target` summary fallback
+        // (string ports) is gone.
+        assert_eq!(
+            intent_endpoint(&json!({
+                "requestedTarget": {"host": "h", "port": 5678},
+                "target": {"host": "other", "port": "1234"},
+            })),
+            Some(("h".to_string(), 5678))
+        );
+        assert_eq!(
+            intent_endpoint(&json!({"target": {"host": "h", "port": "1234"}})),
+            None,
+            "target-summary fallback removed"
+        );
+        assert_eq!(
+            intent_endpoint(&json!({"requestedTarget": {"host": "h", "port": "12"}})),
+            None,
+            "string ports removed"
+        );
+        assert_eq!(intent_endpoint(&json!({})), None);
+    }
+
+    #[test]
+    fn legacy_scan_blocks_live_legacy_only() {
+        let root = tmpdir("legacy-scan");
+        let sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let live = sock.local_addr().unwrap().port();
+        // Live legacy py owner (no schemaVersion anywhere): blocked.
+        // fake_owner writes v1 markers, which is exactly the legacy shape.
+        fake_owner(&root, "old", "py", "attach", "127.0.0.1", json!(5678), live);
+        // Live legacy browser: exempt (CDP multiplexes).
+        fake_owner(
+            &root,
+            "oldtab",
+            "browser",
+            "attach",
+            "127.0.0.1",
+            json!(9222),
+            live,
+        );
+        // Live v2 session: not legacy, never listed.
+        let v2 = root.join("new");
+        std::fs::create_dir_all(&v2).unwrap();
+        write_v2_markers(&v2, "py");
+        std::fs::write(
+            v2.join("session.json"),
+            format!(r#"{{"name":"new","kind":"attach","port":{live},"schemaVersion":2}}"#),
+        )
+        .unwrap();
+        // Dead legacy dir: never listed.
+        fake_owner(&root, "dead", "py", "attach", "127.0.0.1", json!(9999), 1);
+        // Unknown-lang live legacy: fail-closed, listed.
+        fake_owner(
+            &root,
+            "mystery",
+            "mystery",
+            "attach",
+            "h",
+            json!(1111),
+            live,
+        );
+        std::fs::write(root.join("mystery").join("lang.json"), "not json").unwrap();
+        let found = find_live_legacy_sessions_in(&root, "new");
+        assert_eq!(found, vec!["mystery".to_string(), "old".to_string()]);
+        assert!(find_live_legacy_sessions_in(&root, "old").contains(&"mystery".to_string()));
+        // The block error names the sessions with the legacy-live code and
+        // an all-unavailable layered identity (zero pids, no endpoint claim).
+        let err = legacy_live_failure("mystery', 'old", &json!({"host": "h", "port": 1}));
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("unsupported live legacy session(s)"),
+            "{text}"
+        );
+        assert!(text.contains("close them first and retry"), "{text}");
+        let bf = err.downcast_ref::<BridgeFailure>().expect("typed failure");
+        assert_eq!(
+            bf.diagnosis.as_ref().unwrap()["code"],
+            json!("unsupported-legacy-live")
+        );
+        let ident = bf.target_identity.as_ref().expect("identity carried");
+        assert!(is_layered_identity(ident), "{ident}");
+        assert!(
+            !ident.to_string().contains("5678"),
+            "no endpoint claim: {ident}"
+        );
+        drop(sock);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

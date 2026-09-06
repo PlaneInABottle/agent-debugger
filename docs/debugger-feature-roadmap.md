@@ -1,5 +1,10 @@
-# Debugger Feature Roadmap — Uygulama Planı
+# Debugger Feature Roadmap — Uygulama Planı (ARCHIVED)
 
+> ARCHIVED: all milestones through schema v2 are implemented. The live
+> contract is `docs/current-contract.md`; the v2 cleanup plan
+> (`docs/schema-v2-cleanup.md`) is the change record. This roadmap below
+> is history — do not implement from it.
+>
 > Dil: Türkçe (tanımlayıcılar/kod/komutlar İngilizce).
 > Durum: **M-T frozen — Batch2 implementasyonuna hazır.** M0 bulguları donduruldu (debugpy 1.8.21 child akışı + Node 26.8.1 NodeWorker); M3/M4 Batch2'de implemente edilir, ardından tek FULL review. M5 M3/M4 sonrasını bekler.
 > Kapsam: Başlangıçta istenen 5 yetenek (modül launch, Python child, Node worker, breakpoint kaldırma, eşzamanlılık) + sonradan eklenen 6. hedef-kimliği doğruluk milestone'u (M-I). Geniş refactoring yok. Bu plan dışında kod/test/runtime/process/bağımlılık/commit değişikliği yok.
