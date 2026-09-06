@@ -325,19 +325,23 @@ fn remove_confirmed_breaks_in(dir: &std::path::Path, raws: &[String]) -> anyhow:
         .map_err(|e| anyhow::anyhow!("cannot persist session intent: {e}"))?;
     Ok(())
 }
-/// A bridge-reported failure. `message` is the exact bridge error string
-/// (timeout prefixes like `timeout: no stop within Ns` are preserved
-/// verbatim for compatibility); `wait_context` carries the bridge's
-/// additive `waitContext` (wait/capture timeouts only) through the CLI to
-/// the JSON/human error envelope. Attach setup failures additionally carry
+/// A bridge-reported failure. `message` is the display string: for
+/// diagnosed attach setup failures this is the concise diagnosis-aligned
+/// `attach failed: …` statement (never the raw adapter text); the raw
+/// adapter message rides separately in sanitized `cause`. Undiagnosed
+/// failures keep the exact bridge error string verbatim (timeout prefixes
+/// like `timeout: no stop within Ns` are preserved verbatim for
+/// compatibility); `wait_context` carries the bridge's additive
+/// `waitContext` (wait/capture timeouts only) through the CLI to the
+/// JSON/human error envelope. Attach setup failures additionally carry
 /// `diagnosis` (`{code, confidence, evidence, recommendation}`), the
 /// redacted attempted `target_identity`, and the redacted
-/// `requested_target` endpoint — all additive, the message never changes
-/// shape for them. Display is the message alone so every existing string
-/// match keeps working.
+/// `requested_target` endpoint. Display is the message alone so every
+/// existing string match keeps working.
 #[derive(Debug)]
 pub struct BridgeFailure {
     pub message: String,
+    pub cause: Option<String>,
     pub wait_context: Option<Value>,
     pub diagnosis: Option<Value>,
     pub target_identity: Option<Value>,
@@ -364,6 +368,7 @@ fn bridge_failure(resp: &Value) -> anyhow::Error {
     let wait_context = resp.get("waitContext").filter(|v| v.is_object()).cloned();
     BridgeFailure {
         message,
+        cause: None,
         wait_context,
         diagnosis: None,
         target_identity: None,
@@ -2020,12 +2025,219 @@ fn display_endpoint(host: &str, port: u16) -> String {
     format!("{h}:{port}")
 }
 
+/// Cap (chars) for the sanitized attach-failure `cause` (raw adapter
+/// message preserved separately from the concise top-level `error`).
+pub const CAUSE_CAP: usize = 2048;
+
+/// Sanitize a raw bridge/adapter message for the additive `cause` field:
+/// bounded secret redaction (URL/query `token=`-style values, `Bearer`
+/// tokens, `--token` argv forms) then a hard char cap. Never fabricates:
+/// an empty input reads as empty, and useful line/class context survives.
+fn sanitize_cause(raw: &str) -> String {
+    let redacted = redact_cause_secrets(raw);
+    if redacted.chars().count() <= CAUSE_CAP {
+        return redacted;
+    }
+    trunc_chars(&redacted, CAUSE_CAP)
+}
+
+/// Bounded redaction over free-text adapter output (no regex dep): any
+/// `name=value` / `name:value` pair whose name is a secret flag keeps the
+/// name and masks the value; a `Bearer <token>` word masks the token; a
+/// bare secret `--flag <value>` masks the following word. Delimiters are
+/// whitespace, `&`, `;`, `,`, quotes — values never span them.
+fn redact_cause_secrets(raw: &str) -> String {
+    let masked_eq = mask_keyed_values(raw);
+    mask_bare_flag_values(&mask_bearer(&masked_eq))
+}
+
+/// Mask `name=value` / `name:value` (incl. URL `?token=abc&x=1`) whose name
+/// is a secret flag. Walks `=`/`:` sites, extracts the trailing name token,
+/// checks it with the argv redactor's predicate, and masks the value span.
+fn mask_keyed_values(s: &str) -> String {
+    let bytes: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == '=' || c == ':' {
+            // Extract the name token immediately before the separator:
+            // [A-Za-z0-9_.-]+ plus URL prefixes (? & ;). A leading run of
+            // `?`/`&`/`;`/`#` is skipped, then the name must be non-empty.
+            let mut j = out.len();
+            while j > 0 && matches!(out.as_bytes()[j - 1], b'?' | b'&' | b';' | b'#') {
+                j -= 1;
+            }
+            let mut k = j;
+            while k > 0 {
+                let b = out.as_bytes()[k - 1];
+                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') {
+                    k -= 1;
+                } else {
+                    break;
+                }
+            }
+            let head = out[k..j].to_string();
+            // Mask the value span: up to the next delimiter (whitespace,
+            // `&`, `;`, `,`, quote). `://` after a bare scheme (`http:`)
+            // is not a secret pair — its "value" starts with `//`, skip it.
+            let mut v = i + 1;
+            while v < bytes.len() && bytes[v].is_whitespace() {
+                v += 1;
+            }
+            let mut vend = v;
+            while vend < bytes.len()
+                && !bytes[vend].is_whitespace()
+                && !matches!(bytes[vend], '&' | ';' | ',' | '"' | '\'' | ')')
+            {
+                vend += 1;
+            }
+            let val: String = bytes[v..vend].iter().collect();
+            // A `Bearer <token>` value belongs to the bearer pass (which
+            // keeps the scheme and masks the token): masking the scheme word
+            // here would orphan the token into the clear.
+            if val.eq_ignore_ascii_case("bearer") {
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            if !head.is_empty()
+                && is_secret_flag(&head)
+                && !val.is_empty()
+                && !val.starts_with("//")
+            {
+                out.push(c);
+                // Preserve one skipped whitespace exactly when the input
+                // had `key: value` spacing.
+                if v > i + 1 {
+                    out.push(' ');
+                }
+                out.push_str("[redacted]");
+                i = vend;
+                continue;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Mask `Bearer <token>` (case-insensitive scheme): the token word becomes
+/// `[redacted]`; the scheme itself is kept.
+fn mask_bearer(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.to_ascii_lowercase().find("bearer ") {
+        let token_start = pos + "bearer ".len();
+        let mut vend = token_start;
+        while vend < rest.len() {
+            let b = rest.as_bytes()[vend];
+            if b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b',' | b';' | b')') {
+                break;
+            }
+            vend += 1;
+        }
+        // Keep the original scheme casing, mask only a non-empty token.
+        if vend > token_start {
+            out.push_str(&rest[..pos]);
+            out.push_str(&rest[pos..token_start]);
+            out.push_str("[redacted]");
+            rest = &rest[vend..];
+        } else {
+            out.push_str(&rest[..token_start]);
+            rest = &rest[token_start..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Mask the value word after a bare secret flag (`--token abc123` with no
+/// `=`/`:`). Words split on ASCII whitespace; a following word starting
+/// with `-` is another flag, never a value.
+fn mask_bare_flag_values(s: &str) -> String {
+    let mut out = String::new();
+    let mut pending_secret = false;
+    // Tokenize into alternating word/whitespace spans to preserve spacing.
+    let bytes = s.as_bytes();
+    let mut spans: Vec<(bool, &str)> = vec![]; // (is_word, text)
+    let mut start = 0;
+    while start < s.len() {
+        let word = !bytes[start].is_ascii_whitespace();
+        let mut end = start + 1;
+        while end < s.len() && (!bytes[end].is_ascii_whitespace()) == word {
+            end += 1;
+        }
+        spans.push((word, &s[start..end]));
+        start = end;
+    }
+    for (is_word, span) in spans {
+        if !is_word {
+            out.push_str(span);
+            continue;
+        }
+        if pending_secret {
+            pending_secret = false;
+            // A flag-looking word was never a value: keep it, re-arm when it
+            // is itself a bare secret flag.
+            if span.starts_with('-') && span.len() > 1 {
+                out.push_str(span);
+                if is_secret_flag(span) && !span.contains('=') && !span.contains(':') {
+                    pending_secret = true;
+                }
+                continue;
+            }
+            out.push_str("[redacted]");
+            continue;
+        }
+        out.push_str(span);
+        if is_secret_flag(span) && !span.contains('=') && !span.contains(':') {
+            pending_secret = true;
+        }
+    }
+    out
+}
+
+/// Concise diagnosis-aligned top-level error for a diagnosed attach
+/// failure. Same truth/confidence as the diagnosis code, always prefixed
+/// with `attach failed:` so existing prefix matches keep working. The raw
+/// adapter text never appears here — it rides in sanitized `cause`.
+fn diagnosed_attach_error(code: &str, endpoint: &str) -> String {
+    match code {
+        "endpoint-not-listening" => {
+            format!("attach failed: no debug listener found at {endpoint}")
+        }
+        "endpoint-closed-during-attach" => {
+            format!("attach failed: debug endpoint closed while attaching ({endpoint})")
+        }
+        "endpoint-rejected" => {
+            format!(
+                "attach failed: debug endpoint rejected the connection at {endpoint}; \
+                 it may already have another debugger client"
+            )
+        }
+        "endpoint-unreachable" => {
+            format!(
+                "attach failed: could not reach debug endpoint at {endpoint} \
+                 (unverified; check host/port)"
+            )
+        }
+        _ => format!("attach failed: could not attach to {endpoint}"),
+    }
+}
+
 /// One classification site for every attach setup failure (fast error.json,
 /// late-settling error.json, bridge exit, first-forward transport): probe
-/// the OS listener now, classify pre-vs-post, keep the bridge/transport
-/// message verbatim, and attach the redacted identities. The debuggee is
-/// never fabricated — on a failed attach the attempted identity keeps its
-/// `unavailable` entries as the bridge/lookup reported them.
+/// the OS listener now, classify pre-vs-post, derive the concise
+/// diagnosis-aligned top-level `error` from the code, keep the raw
+/// bridge/transport message as sanitized additive `cause`, and attach the
+/// redacted identities. The debuggee is never fabricated — on a failed
+/// attach the attempted identity keeps its `unavailable` entries as the
+/// bridge/lookup reported them.
 fn attach_setup_failure(
     host: &str,
     port: u16,
@@ -2034,22 +2246,41 @@ fn attach_setup_failure(
     spec: &SpawnSpec,
 ) -> anyhow::Error {
     let post = listener_present(host, port);
-    let diagnosis = attach_diagnosis(pre, post, &display_endpoint(host, port));
-    attach_failure(message, diagnosis, &spec.observed, &spec.requested)
+    let endpoint = display_endpoint(host, port);
+    let diagnosis = attach_diagnosis(pre, post, &endpoint);
+    let code = diagnosis
+        .get("code")
+        .and_then(|c| c.as_str())
+        .unwrap_or("endpoint-unreachable");
+    let error = diagnosed_attach_error(code, &endpoint);
+    let cause = sanitize_cause(&message);
+    attach_failure(
+        error,
+        Some(cause),
+        diagnosis,
+        &spec.observed,
+        &spec.requested,
+    )
 }
 
-/// Build the typed attach-setup failure: the bridge message stays verbatim
-/// (existing `attach failed` matches keep working); the diagnosis,
-/// redacted attempted identity, and redacted requested endpoint ride
-/// alongside into the outer envelope.
+/// Build the typed attach-setup failure: the top-level `error` is the
+/// concise diagnosis-aligned statement (always `attach failed:`-prefixed);
+/// the raw adapter text rides separately as sanitized `cause`; the
+/// diagnosis, redacted attempted identity, and redacted requested endpoint
+/// ride alongside into the outer envelope.
 fn attach_failure(
-    message: String,
+    error: String,
+    cause: Option<String>,
     diagnosis: Value,
     observed: &Value,
     requested: &Value,
 ) -> anyhow::Error {
+    // A cause identical to the concise error carries no information —
+    // drop it so JSON/human never duplicate the same string twice.
+    let cause = cause.filter(|c| !c.is_empty() && *c != error);
     BridgeFailure {
-        message,
+        message: error,
+        cause,
         wait_context: None,
         diagnosis: Some(diagnosis),
         target_identity: Some(observed.clone()),
@@ -2058,10 +2289,39 @@ fn attach_failure(
     .into()
 }
 
+/// Semantic attach-setup failure (bridge-reported `phase: "config"`): the
+/// debug connection was established and the failure is a configuration
+/// error (invalid breakpoint/method/line/condition/source). The semantic
+/// message stays the top-level error verbatim — no endpoint diagnosis, no
+/// cause duplication (there is no separate raw text). The redacted
+/// attempted identity and requested endpoint still ride along; they are
+/// spawn-time OS observations, never a diagnosis claim.
+fn attach_config_failure(message: String, observed: &Value, requested: &Value) -> anyhow::Error {
+    BridgeFailure {
+        message,
+        cause: None,
+        wait_context: None,
+        diagnosis: None,
+        target_identity: Some(observed.clone()),
+        requested_target: Some(requested.clone()),
+    }
+    .into()
+}
+
+/// True only for the bridge-reported config phase: the connection was
+/// established, so the message is semantic, not a transport symptom.
+/// Any other value (transport, unknown, non-string, missing — including
+/// older bridges that never wrote `phase`) takes the conservative
+/// transport path with endpoint diagnosis.
+fn is_config_phase(phase: Option<&str>) -> bool {
+    matches!(phase, Some("config"))
+}
+
 /// Preflight rejection when a live session already owns the endpoint.
 /// Names the confirmed owner and the redacted endpoint; tells the agent to
 /// reuse or close it. No bridge is ever spawned, so the first session's
-/// target is untouched.
+/// target is untouched. No adapter ran, so there is no raw `cause` — the
+/// concise `attach failed:` error plus the diagnosis carry everything.
 fn endpoint_owned_failure(
     owner: &str,
     in_progress: bool,
@@ -2074,13 +2334,13 @@ fn endpoint_owned_failure(
     let endpoint = display_endpoint(host, port);
     let message = if in_progress {
         format!(
-            "endpoint-already-attached: session '{owner}' is attaching to {lang} \
-             {endpoint} — use the existing session or wait and retry"
+            "attach failed: endpoint is already attached by session '{owner}' \
+             ({lang} {endpoint}) — use the existing session or wait and retry"
         )
     } else {
         format!(
-            "endpoint-already-attached: session '{owner}' already owns {lang} \
-             {endpoint} — use the existing session or close it first"
+            "attach failed: endpoint is already attached by session '{owner}' \
+             ({lang} {endpoint}) — use the existing session or close it first"
         )
     };
     let diagnosis = serde_json::json!({
@@ -2093,7 +2353,7 @@ fn endpoint_owned_failure(
         },
         "recommendation": "use the existing session for this endpoint, or close it first and retry",
     });
-    attach_failure(message, diagnosis, observed, requested)
+    attach_failure(message, None, diagnosis, observed, requested)
 }
 
 /// `spawn` with an explicit sessions root (unit tests pass a tmpdir so the
@@ -2239,17 +2499,32 @@ fn spawn_in(
         // behind (session.json from the death publish, error.json from
         // the throw) — the error is the truth, not the stale readiness.
         if dir.join("error.json").exists() {
-            let msg = read_bridge_error(&dir);
+            let failure = read_bridge_error(&dir);
             reap(&mut child);
             let _ = std::fs::remove_dir_all(&dir);
-            // Attach setup failure: classify from OS-observed listener
-            // state (pre-attach vs now). The bridge message stays verbatim;
-            // the diagnosis + redacted identities ride alongside.
+            // Attach setup failure: config phase (connection was
+            // established) keeps the semantic message top-level with no
+            // endpoint diagnosis; transport or missing phase (older
+            // bridges) classifies from OS-observed listener state
+            // (pre-attach vs now) with the raw text as sanitized cause.
             if let Some((host, port)) = &endpoint {
+                if is_config_phase(failure.phase.as_deref()) {
+                    return Err(attach_config_failure(
+                        failure.message,
+                        &spec.observed,
+                        &spec.requested,
+                    ));
+                }
                 let pre = pre_listener.flatten();
-                return Err(attach_setup_failure(host, *port, pre, msg, spec));
+                return Err(attach_setup_failure(
+                    host,
+                    *port,
+                    pre,
+                    failure.message,
+                    spec,
+                ));
             }
-            anyhow::bail!("{msg}");
+            anyhow::bail!("{}", failure.message);
         }
         if dir.join("session.json").exists() {
             // Retain the handle until the first request is validated.
@@ -2285,16 +2560,30 @@ fn spawn_in(
                     // The error file is the truth — re-check it first
                     // (immediate, then a bounded settle at the wait-loop
                     // cadence covering bridge-cleanup lag), never the logs.
-                    if let Some(msg) = settle_for_bridge_error(&dir) {
+                    if let Some(failure) = settle_for_bridge_error(&dir) {
                         reap(&mut child);
                         let _ = std::fs::remove_dir_all(&dir);
-                        // Late-settling attach failure: same envelope as the
-                        // fast path (message verbatim + fresh post probe).
+                        // Late-settling attach failure: same phase routing
+                        // as the fast path (config keeps the semantic
+                        // message; transport/missing takes a fresh probe).
                         if let Some((host, port)) = &endpoint {
+                            if is_config_phase(failure.phase.as_deref()) {
+                                return Err(attach_config_failure(
+                                    failure.message,
+                                    &spec.observed,
+                                    &spec.requested,
+                                ));
+                            }
                             let pre = pre_listener.flatten();
-                            return Err(attach_setup_failure(host, *port, pre, msg, spec));
+                            return Err(attach_setup_failure(
+                                host,
+                                *port,
+                                pre,
+                                failure.message,
+                                spec,
+                            ));
                         }
-                        anyhow::bail!("{msg}");
+                        anyhow::bail!("{}", failure.message);
                     }
                     // Fast program + logpoints-only: the target may exit before
                     // the first read, but its logs are already on disk. The
@@ -2441,8 +2730,8 @@ pub fn cmd_context_target(name: &str, target: Option<&str>) -> anyhow::Result<Va
 /// race). Immediate check first — no added latency when the files land in
 /// order — then a bounded re-poll at the wait-loop cadence. Only entered
 /// after a failed first forward, so the success path never sleeps.
-/// Returns the bridge message when the file lands in budget.
-fn settle_for_bridge_error(dir: &std::path::Path) -> Option<String> {
+/// Returns the bridge failure when the file lands in budget.
+fn settle_for_bridge_error(dir: &std::path::Path) -> Option<BridgeSetupError> {
     if dir.join("error.json").exists() {
         return Some(read_bridge_error(dir));
     }
@@ -2488,16 +2777,33 @@ fn read_logs_file(dir: &std::path::Path, tail: usize) -> Option<Value> {
     }))
 }
 
-fn read_bridge_error(dir: &std::path::Path) -> String {
-    std::fs::read_to_string(dir.join("error.json"))
+/// Bridge setup-failure file: the message plus the optional additive
+/// `phase` (`transport` = connection never established, `config` =
+/// connection established, semantic setup error). Old files without
+/// `phase` read as `None` — callers keep the conservative transport
+/// behavior, never a guess.
+#[derive(Debug)]
+struct BridgeSetupError {
+    message: String,
+    phase: Option<String>,
+}
+
+fn read_bridge_error(dir: &std::path::Path) -> BridgeSetupError {
+    let parsed: Option<Value> = std::fs::read_to_string(dir.join("error.json"))
         .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| {
-            v.get("error")
-                .and_then(|e| e.as_str())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| "bridge failed during setup (see bridge.log)".to_string())
+        .and_then(|raw| serde_json::from_str(&raw).ok());
+    let message = parsed
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .and_then(|e| e.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "bridge failed during setup (see bridge.log)".to_string());
+    let phase = parsed
+        .as_ref()
+        .and_then(|v| v.get("phase"))
+        .and_then(|p| p.as_str())
+        .map(|s| s.to_string());
+    BridgeSetupError { message, phase }
 }
 
 fn read_log_tail(dir: &std::path::Path) -> String {
@@ -4032,29 +4338,40 @@ mod tests {
     }
 
     #[test]
-    fn attach_failure_envelope_keeps_message_adds_context() {
-        // The bridge message stays verbatim (existing `attach failed`
-        // matches keep working); diagnosis + redacted identities ride
-        // alongside. No raw argv anywhere in the envelope.
-        let msg = "attach failed (127.0.0.1:9): Connection refused — is the target started \
+    fn attach_failure_envelope_aligns_error_preserves_cause() {
+        // Diagnosed attach failures: the top-level error is the concise
+        // diagnosis-aligned statement (always `attach failed:`-prefixed,
+        // never the raw adapter text); the raw message rides separately as
+        // sanitized `cause`; diagnosis + redacted identities ride alongside.
+        let raw = "attach failed (127.0.0.1:9): Connection refused — is the target started \
              with debugpy --listen 9 ?";
         let observed = attach_observed("127.0.0.1", 9);
         let requested = json!({"host": "127.0.0.1", "port": 9, "pid": Value::Null});
         let d = attach_diagnosis(Some(false), Some(false), "127.0.0.1:9");
-        let err = attach_failure(msg.to_string(), d, &observed, &requested);
-        assert_eq!(format!("{err:#}"), msg);
+        let code = d["code"].as_str().unwrap().to_string();
+        let error = diagnosed_attach_error(&code, "127.0.0.1:9");
+        let cause = sanitize_cause(raw);
+        let err = attach_failure(error.clone(), Some(cause.clone()), d, &observed, &requested);
+        let text = format!("{err:#}");
+        assert!(text.starts_with("attach failed:"), "{text}");
+        assert!(text.contains("no debug listener found"), "{text}");
+        assert!(!text.contains("is the target started"), "{text}");
         let bf = err.downcast_ref::<BridgeFailure>().expect("typed failure");
         assert_eq!(
             bf.diagnosis.as_ref().unwrap()["code"],
             json!("endpoint-not-listening")
         );
+        let kept = bf.cause.as_ref().expect("cause preserved");
+        assert!(kept.contains("Connection refused"), "{kept}");
+        assert_ne!(kept, &text, "cause must not duplicate error");
         assert!(bf.wait_context.is_none());
         assert_eq!(bf.requested_target.as_ref().unwrap()["port"], json!(9));
         // Redacted by construction: observed argv (if any) carries no
         // secrets and the envelope serializes within caps.
         let ser = serde_json::to_string(bf.target_identity.as_ref().unwrap()).unwrap();
         assert!(ser.len() <= OBSERVED_TOTAL_CAP);
-        // Preflight owner error names the session + endpoint, actionably.
+        // Preflight owner errors are also `attach failed:`-prefixed, name
+        // the session + endpoint actionably, and carry no adapter cause.
         let err = endpoint_owned_failure(
             "first",
             false,
@@ -4065,8 +4382,11 @@ mod tests {
             &requested,
         );
         let text = format!("{err:#}");
-        assert!(text.contains("endpoint-already-attached"), "{text}");
-        assert!(text.contains("'first'"), "{text}");
+        assert!(text.starts_with("attach failed:"), "{text}");
+        assert!(
+            text.contains("already attached by session 'first'"),
+            "{text}"
+        );
         assert!(text.contains("5678"), "{text}");
         assert!(text.contains("close it first"), "{text}");
         let bf = err.downcast_ref::<BridgeFailure>().expect("typed failure");
@@ -4074,19 +4394,25 @@ mod tests {
             bf.diagnosis.as_ref().unwrap()["evidence"]["ownerSession"],
             json!("first")
         );
+        assert!(bf.cause.is_none(), "preflight ran no adapter: no cause");
         let in_flight = endpoint_owned_failure("w", true, "py", "h", 1, &observed, &requested);
+        let in_text = format!("{in_flight:#}");
+        assert!(in_text.starts_with("attach failed:"), "{in_text}");
         assert!(
-            format!("{in_flight:#}").contains("is attaching"),
-            "in-flight wording"
+            in_text.contains("already attached by session 'w'"),
+            "in-flight wording keeps the same aligned phrase: {in_text}"
         );
+        assert!(in_text.contains("wait and retry"), "{in_text}");
     }
 
     #[test]
-    fn attach_setup_failure_classifies_with_verbatim_message() {
+    fn attach_setup_failure_aligns_error_preserves_cause() {
         // Shared helper behind all four setup-failure branches (fast
         // error.json, late settle, bridge exit, first-forward transport):
-        // the message stays byte-identical, the diagnosis reflects a
-        // fresh post probe, and the redacted identities ride along.
+        // the top-level error is the concise aligned statement, the raw
+        // transport message rides as sanitized `cause`, the diagnosis
+        // reflects a fresh post probe, and the redacted identities ride
+        // along.
         let mk_spec = || SpawnSpec {
             lang: "py",
             kind: "attach",
@@ -4100,15 +4426,189 @@ mod tests {
         let spec = mk_spec();
         let msg = "cannot reach debug session on port 61234: connection refused (stale?)";
         let err = attach_setup_failure("127.0.0.1", 9, Some(false), msg.to_string(), &spec);
-        assert_eq!(format!("{err:#}"), msg, "transport message verbatim");
+        let text = format!("{err:#}");
+        assert!(text.starts_with("attach failed:"), "{text}");
+        assert!(text.contains("no debug listener found"), "{text}");
+        assert!(
+            !text.contains("stale?"),
+            "raw transport text leaves error: {text}"
+        );
         let bf = err.downcast_ref::<BridgeFailure>().expect("typed failure");
         // Port 9 is dead pre and post: not-listening, with identities.
         assert_eq!(
             bf.diagnosis.as_ref().unwrap()["code"],
             json!("endpoint-not-listening")
         );
+        assert_eq!(bf.cause.as_deref(), Some(msg));
         assert!(bf.target_identity.is_some());
         assert_eq!(bf.requested_target.as_ref().unwrap()["port"], json!(9));
+    }
+
+    #[test]
+    fn bridge_setup_error_parses_phase_backward_compatibly() {
+        let dir = tmpdir("phase-parse");
+        // Config phase: semantic error, routed without diagnosis.
+        std::fs::write(
+            dir.join("error.json"),
+            r#"{"error":"no method noSuchMethod() in IdleAttach","phase":"config"}"#,
+        )
+        .unwrap();
+        let e = read_bridge_error(&dir);
+        assert_eq!(e.message, "no method noSuchMethod() in IdleAttach");
+        assert!(is_config_phase(e.phase.as_deref()));
+        // Transport phase: listener evidence decides.
+        std::fs::write(
+            dir.join("error.json"),
+            r#"{"error":"attach failed: refused","phase":"transport"}"#,
+        )
+        .unwrap();
+        let e = read_bridge_error(&dir);
+        assert!(!is_config_phase(e.phase.as_deref()));
+        // Missing phase (older bridges): conservative, never config.
+        std::fs::write(
+            dir.join("error.json"),
+            r#"{"error":"attach failed: refused"}"#,
+        )
+        .unwrap();
+        let e = read_bridge_error(&dir);
+        assert_eq!(e.message, "attach failed: refused");
+        assert!(e.phase.is_none());
+        assert!(!is_config_phase(e.phase.as_deref()));
+        // Unknown or non-string phases: conservative, never config.
+        std::fs::write(dir.join("error.json"), r#"{"error":"x","phase":"runtime"}"#).unwrap();
+        assert!(!is_config_phase(read_bridge_error(&dir).phase.as_deref()));
+        std::fs::write(dir.join("error.json"), r#"{"error":"x","phase":7}"#).unwrap();
+        assert!(!is_config_phase(read_bridge_error(&dir).phase.as_deref()));
+        // Corrupt or missing file: fallback message, no phase.
+        std::fs::write(dir.join("error.json"), "not json").unwrap();
+        let e = read_bridge_error(&dir);
+        assert!(e.message.contains("see bridge.log"), "{e:?}");
+        assert!(!is_config_phase(e.phase.as_deref()));
+        std::fs::remove_file(dir.join("error.json")).unwrap();
+        assert!(!is_config_phase(read_bridge_error(&dir).phase.as_deref()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attach_config_phase_preserves_semantic_error() {
+        // Semantic config error: the exact message stays top-level (never
+        // rewritten to `attach failed:`), with no diagnosis and no cause
+        // duplication — but the redacted identities still ride along.
+        let observed = attach_observed("127.0.0.1", 9);
+        let requested = json!({"host": "127.0.0.1", "port": 9, "pid": Value::Null});
+        let msg = "no method noSuchMethod() in IdleAttach";
+        let err = attach_config_failure(msg.to_string(), &observed, &requested);
+        assert_eq!(format!("{err:#}"), msg);
+        assert!(
+            !format!("{err:#}").contains("attach failed"),
+            "semantic errors keep no transport prefix"
+        );
+        let bf = err.downcast_ref::<BridgeFailure>().expect("typed failure");
+        assert!(bf.diagnosis.is_none(), "no misleading endpoint diagnosis");
+        assert!(bf.cause.is_none(), "no cause duplication");
+        assert!(bf.target_identity.is_some());
+        assert_eq!(bf.requested_target.as_ref().unwrap()["port"], json!(9));
+    }
+
+    #[test]
+    fn settle_returns_structured_phase() {
+        let dir = tmpdir("phase-settle");
+        std::fs::write(
+            dir.join("error.json"),
+            r#"{"error":"no method x() in Y","phase":"config"}"#,
+        )
+        .unwrap();
+        let e = settle_for_bridge_error(&dir).expect("immediate hit, no wait");
+        assert_eq!(e.message, "no method x() in Y");
+        assert!(is_config_phase(e.phase.as_deref()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnosed_attach_error_covers_every_code() {
+        // Every diagnosis code maps to a concise `attach failed:` statement
+        // carrying the required human phrase and the endpoint — and never
+        // the raw adapter text.
+        let cases = [
+            (
+                "endpoint-already-attached",
+                "h:1",
+                "already attached by session",
+            ),
+            ("endpoint-not-listening", "h:2", "no debug listener found"),
+            (
+                "endpoint-closed-during-attach",
+                "h:3",
+                "closed while attaching",
+            ),
+            ("endpoint-rejected", "h:4", "rejected the connection"),
+            ("endpoint-unreachable", "h:5", "could not reach"),
+        ];
+        for (code, endpoint, phrase) in cases {
+            // Preflight owner errors name the session; the mapping helper
+            // covers the other four codes.
+            if code == "endpoint-already-attached" {
+                let observed = attach_observed("127.0.0.1", 9);
+                let requested = json!({"host": "h", "port": 1, "pid": Value::Null});
+                let err =
+                    endpoint_owned_failure("sess", false, "py", "h", 1, &observed, &requested);
+                let text = format!("{err:#}");
+                assert!(text.starts_with("attach failed:"), "{code}: {text}");
+                assert!(text.contains(phrase), "{code}: {text}");
+                assert!(
+                    text.contains('\'') && text.contains("sess"),
+                    "{code}: {text}"
+                );
+                continue;
+            }
+            let text = diagnosed_attach_error(code, endpoint);
+            assert!(text.starts_with("attach failed:"), "{code}: {text}");
+            assert!(text.contains(phrase), "{code}: {text}");
+            assert!(text.contains(endpoint), "{code}: {text}");
+        }
+        // Rejected keeps the calibrated hedge (same truth as diagnosis).
+        let rejected = diagnosed_attach_error("endpoint-rejected", "h:4");
+        assert!(
+            rejected.contains("may already have another debugger client"),
+            "{rejected}"
+        );
+        // Unknown codes degrade to a generic prefixed error, never bare.
+        let generic = diagnosed_attach_error("mystery", "h:9");
+        assert!(generic.starts_with("attach failed:"), "{generic}");
+    }
+
+    #[test]
+    fn attach_cause_sanitizes_caps_and_dedupes() {
+        // Secrets in the raw adapter text never reach the envelope: URL
+        // query tokens, bearer tokens, and --flag values all mask.
+        let raw = "attach failed (h:1): ws://h:1/debug?token=hunter2&x=1 \
+             Authorization: Bearer ABCDEF --password hunter2";
+        let cause = sanitize_cause(raw);
+        assert!(!cause.contains("hunter2"), "{cause}");
+        assert!(!cause.contains("ABCDEF"), "{cause}");
+        assert!(cause.contains("[redacted]"), "{cause}");
+        assert!(cause.contains("x=1"), "non-secret values survive: {cause}");
+        // Non-secret `key: value` spacing and schemes survive untouched.
+        let plain = sanitize_cause("Connection refused (host h port 1)");
+        assert_eq!(plain, "Connection refused (host h port 1)");
+        // 2KB cap with the shared truncation marker.
+        let long = "y".repeat(CAUSE_CAP + 500);
+        let capped = sanitize_cause(&long);
+        assert!(
+            capped.chars().count() <= CAUSE_CAP + 30,
+            "{}",
+            capped.chars().count()
+        );
+        assert!(capped.contains("more chars"), "{capped}");
+        // A cause identical to the concise error is dropped, never
+        // duplicated into both fields.
+        let observed = attach_observed("127.0.0.1", 9);
+        let requested = json!({"host": "h", "port": 1, "pid": Value::Null});
+        let d = attach_diagnosis(Some(false), Some(false), "h:1");
+        let code = d["code"].as_str().unwrap().to_string();
+        let error = diagnosed_attach_error(&code, "h:1");
+        let err = attach_failure(error.clone(), Some(error.clone()), d, &observed, &requested);
+        assert!(err.downcast_ref::<BridgeFailure>().unwrap().cause.is_none());
     }
 
     #[test]

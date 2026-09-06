@@ -51,6 +51,16 @@ class BridgeErr(Exception):
     pass
 
 
+class ConfigErr(BridgeErr):
+    """Semantic setup failure: local/spec validation or a valid protocol
+    error response (the adapter refused the request itself — not a
+    socket/timeout/framing loss). Subclasses BridgeErr so every existing
+    `except BridgeErr` still catches; error.json `phase` derives from this
+    type, never from message text. DAP/CDP/JDI transport failures
+    (socket errors, timeouts, connection drops, target exit) stay plain
+    BridgeErr so the CLI keeps endpoint diagnosis for them."""
+
+
 class StopTimeout(BridgeErr):
     """First-stop wait timed out. Typed so attach can fall back to a live
     running session while launch still fails — never match by message.
@@ -218,11 +228,11 @@ class DapConn:
             raise BridgeErr(f"DAP send failed: {e}")
         return self.seq
 
-    def request(self, command, args=None, timeout=30):
+    def request(self, command, args=None, timeout=30, semantic=False):
         with self.mu:
-            return self._request_locked(command, args, timeout)
+            return self._request_locked(command, args, timeout, semantic)
 
-    def _request_locked(self, command, args=None, timeout=30):
+    def _request_locked(self, command, args=None, timeout=30, semantic=False):
         self.seq += 1
         mine = self.seq
         body = json.dumps({"seq": mine, "type": "request",
@@ -238,6 +248,12 @@ class DapConn:
                 if m.get("type") == "response" and m.get("request_seq") == mine:
                     del self.stash[i]
                     if not m.get("success", False):
+                        # Valid protocol refusal — semantic only when the
+                        # caller opted in (breakpoint installation); session
+                        # establishment (initialize/attach/configurationDone)
+                        # stays transport so endpoint diagnosis is kept.
+                        if semantic:
+                            raise ConfigErr(m.get("message", f"{command} failed"))
                         raise BridgeErr(m.get("message", f"{command} failed"))
                     return m.get("body", {})
             if time.time() > deadline:
@@ -249,6 +265,8 @@ class DapConn:
                 raise
             if msg.get("type") == "response" and msg.get("request_seq") == mine:
                 if not msg.get("success", False):
+                    if semantic:
+                        raise ConfigErr(msg.get("message", f"{command} failed"))
                     raise BridgeErr(msg.get("message", f"{command} failed"))
                 return msg.get("body", {})
             self.stash.append(msg)
@@ -1069,9 +1087,9 @@ class Session:
             del self.exited_targets[0]
             self.dropped_exited += 1
 
-    def dap_request(self, command, args=None, timeout=30):
+    def dap_request(self, command, args=None, timeout=30, semantic=False):
         try:
-            return self.dap.request(command, args or {}, timeout)
+            return self.dap.request(command, args or {}, timeout, semantic)
         except BridgeErr:
             raise
         except (socket.timeout, TimeoutError):
@@ -2204,9 +2222,14 @@ class Session:
                 {"line": line, "bp": {"line": line, "logMessage": template},
                  "kind": "logpoint", "template": template})
         for path, items in by_file.items():
+            # semantic=True: a valid adapter refusal here (bad condition/
+            # source the resolver accepted) is a spec error, not a
+            # connection loss. Socket/timeout/framing failures stay
+            # transport regardless of this flag.
             body = self.dap_request("setBreakpoints",
                                     {"source": {"path": path},
-                                     "breakpoints": [it["bp"] for it in items]})
+                                     "breakpoints": [it["bp"] for it in items]},
+                                    semantic=True)
             got_list = body.get("breakpoints", [])
             for idx, item in enumerate(items):
                 # Defensive: if the adapter returns fewer entries than
@@ -2245,7 +2268,8 @@ class Session:
             body = self.dap_request(
                 "setFunctionBreakpoints",
                 {"breakpoints": [{"name": func}
-                                 for func in self.cfg.methods]})
+                                 for func in self.cfg.methods]},
+                semantic=True)
             got_list = body.get("breakpoints", [])
             for idx, func in enumerate(self.cfg.methods):
                 # Defensive (same as line breaks): a short answer leaves
@@ -2263,7 +2287,8 @@ class Session:
                 self.stop_states.append(rec)
                 self._hitkeys.append(("method", func))
         if self.cfg.want_exc:
-            self.dap_request("setExceptionBreakpoints", {"filters": ["uncaught"]})
+            self.dap_request("setExceptionBreakpoints", {"filters": ["uncaught"]},
+                             semantic=True)
             self.stop_states.append(
                 {"spec": "exc", "kind": "exc", "state": "armed", "hits": 0})
             self._hitkeys.append(("exc",))
@@ -4450,6 +4475,58 @@ def format_unexpected(e):
     return f"internal: {body}"
 
 
+# Setup-failure phases for error.json (additive; `error` text unchanged).
+# "transport" = the failure is a connection/protocol loss or anything not
+# proven semantic (socket/connect/initialize/handshake loss, timeouts,
+# target exit, unexpected crashes); "config" = a genuine semantic
+# validation error (Usage/ConfigErr: bad method/class/line/source/
+# condition, unknown args, or a valid protocol error response). The CLI
+# routes on this type signal instead of matching message text. Default is
+# transport: a successful connection never globally flips later failures
+# to config.
+
+
+def phase_of_error(e):
+    """Validated setup phase for error.json `phase` — derived from the
+    exception type, never from message text or a stage timer. Only Usage
+    and ConfigErr read as config; everything else (unbound sessions,
+    unexpected values, transport losses) reads as transport."""
+    try:
+        if isinstance(e, (Usage, ConfigErr)):
+            return "config"
+    except Exception:
+        pass
+    return "transport"
+
+
+def setup_error_payload(exc, message):
+    """error.json body: the message verbatim plus the additive phase."""
+    return {"error": message, "phase": phase_of_error(exc)}
+
+
+def dir_from_argv(argv):
+    """--dir value from raw CLI args (parse_args failed, so scan manually)."""
+    for i, a in enumerate(argv):
+        if a == "--dir" and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--dir="):
+            return a[len("--dir="):]
+    return None
+
+
+def write_parse_error(argv, message):
+    """Best-effort error.json for CLI-arg failures: config by definition
+    (no connection was attempted), so the CLI preserves the semantic
+    message instead of diagnosing the endpoint."""
+    try:
+        d = dir_from_argv(argv)
+        if d:
+            write_file(os.path.join(d, "error.json"),
+                       json.dumps({"error": message, "phase": "config"}))
+    except Exception:
+        pass
+
+
 def write_owner(session_dir):
     """Claim the session dir; see nodebridge owner.json (same contract)."""
     import random
@@ -4688,6 +4765,7 @@ def main(argv):
     try:
         cfg = parse_args(argv)
     except Usage as e:
+        write_parse_error(argv, str(e))
         die(str(e), 2)
     except Exception as e:
         die(f"internal: {e}", 1)
@@ -4737,24 +4815,29 @@ def main(argv):
             serve(st, server, nonce)
         except (Usage, BridgeErr) as e:
             # Failed setup must not leak the spawned adapter/target:
-            # clean up first, then report (the CLI removes the dir).
+            # clean up first, then report (the CLI removes the dir). The
+            # phase derives from the exception type (Usage/ConfigErr read
+            # as config; transport losses stay transport) — never from
+            # message text or a stage timer.
             try:
                 st.cleanup()
             except Exception:
                 pass
             write_file(os.path.join(cfg.dir, "error.json"),
-                       json.dumps({"error": str(e)}))
+                       json.dumps(setup_error_payload(e, str(e))))
             raise
         except Exception as e:
             # Unexpected setup crash (never a silent exit-1): same cleanup,
             # then a sanitized error.json the CLI surfaces. The name stays
             # reusable — the CLI removes failed-setup dirs wholesale.
+            # Unexpected failures always report transport (the CLI keeps
+            # evidence-based endpoint diagnosis for them).
             try:
                 st.cleanup()
             except Exception:
                 pass
             write_file(os.path.join(cfg.dir, "error.json"),
-                       json.dumps({"error": format_unexpected(e)}))
+                       json.dumps(setup_error_payload(e, format_unexpected(e))))
             raise
         finally:
             try:
@@ -4766,7 +4849,7 @@ def main(argv):
     except Exception as e:
         if cfg_dir is not None:
             write_file(os.path.join(cfg_dir, "error.json"),
-                       json.dumps({"error": format_unexpected(e)}))
+                       json.dumps(setup_error_payload(e, format_unexpected(e))))
         die(format_unexpected(e), 1)
 
 

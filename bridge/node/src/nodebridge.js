@@ -50,12 +50,18 @@ class Usage extends Error {}
 // provisioned next to this bridge):
 //   ./cdp_conn.js  BridgeErr + CdpConn (id-matched CDP over ws)
 //   ./framing.js   readFrame + writeFrame (Content-Length + JSON)
-const { BridgeErr, CdpConn } = require('./cdp_conn.js');
+const { BridgeErr, ConfigError, CdpConn } = require('./cdp_conn.js');
 const { readFrame, writeFrame } = require('./framing.js');
 class CloseSession extends Error {}
 // Typed first-stop timeout: attach falls back to a live running session,
 // launch still fails. Never match timeout by message string.
 class StopTimeout extends BridgeErr {}
+// Setup-failure phase (error.json `phase`) derives from the exception
+// type — never from message text or a stage timer: Usage (spec validation,
+// conflicts, unknown args) and ConfigError (a valid CDP refusal of a
+// breakpoint install) read as config; every other failure (connect loss,
+// request IO/timeout, target exit, unexpected crashes) stays transport so
+// the CLI keeps evidence-based endpoint diagnosis for it.
 
 const MAX_STRING = 200;
 const MAX_FIELDS = 20;
@@ -638,6 +644,45 @@ function sanitizeUnexpected(e) {
   body = body.trim();
   if (body.length > MAX_ERROR_CHARS) body = body.slice(0, MAX_ERROR_CHARS - 1) + '…';
   return `internal: ${body}`;
+}
+
+// Setup-failure phase for error.json (additive; `error` text unchanged):
+// derived from the exception type, never from message text or a stage
+// timer. Usage (spec validation, conflicts, unknown args) and ConfigError
+// (a valid CDP refusal of a breakpoint install) read as config; every
+// other failure — connect loss, request IO/timeout, target exit,
+// unexpected crashes — stays transport so the CLI keeps evidence-based
+// endpoint diagnosis. Default is transport: a successful connection never
+// globally flips later failures to config.
+function phaseOfError(e) {
+  try {
+    if (e instanceof Usage || e instanceof ConfigError) return 'config';
+  } catch (_) { /* no verdict: fall through */ }
+  return 'transport';
+}
+
+function setupErrorPayload(exc, message) {
+  return { error: message, phase: phaseOfError(exc) };
+}
+
+function dirFromArgv(argv) {
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--dir' && i + 1 < argv.length) return argv[i + 1];
+    if (typeof argv[i] === 'string' && argv[i].startsWith('--dir=')) {
+      return argv[i].slice('--dir='.length);
+    }
+  }
+  return null;
+}
+
+// CLI-arg failures are config by definition (no connection attempted):
+// best-effort error.json so the CLI preserves the semantic message
+// instead of diagnosing the endpoint.
+function writeParseError(argv, message) {
+  try {
+    const d = dirFromArgv(argv);
+    if (d) writeFile(path.join(d, 'error.json'), JSON.stringify({ error: message, phase: 'config' }));
+  } catch (_) { /* best effort: die() below still reports */ }
 }
 
 function sleep(ms) {
@@ -1399,7 +1444,11 @@ class Session {
         lineNumber: spec.line - 1,
       };
       if (item.brk && item.brk.cond) params.condition = item.brk.cond;
-      const res = await this.cdp.request('Debugger.setBreakpointByUrl', params);
+      // semantic:true: a valid V8 refusal of this install is a spec error
+      // (config phase). IO/timeout/close failures stay transport, as do
+      // the enable/pause/runIfWaitingForDebugger handshake requests (they
+      // establish the session; they never validate a spec).
+      const res = await this.cdp.request('Debugger.setBreakpointByUrl', params, 30000, { semantic: true });
       const bpId = res.breakpointId;
       const rec = { spec: this.dispSpec(spec, kind), kind, hits: 0 };
       if (kind === 'logpoint') rec.detail = spec.template;
@@ -3849,7 +3898,7 @@ async function main(argv) {
   try {
     cfg = parseArgs(argv);
   } catch (e) {
-    if (e instanceof Usage) die(e.message, 2);
+    if (e instanceof Usage) { writeParseError(argv, e.message); die(e.message, 2); }
     die(`internal: ${(e && e.message) || e}`, 1);
   }
   try {
@@ -3955,7 +4004,7 @@ async function main(argv) {
     process.exit(0);
   } catch (e) {
     if (e instanceof Usage || e instanceof BridgeErr) {
-      writeFile(path.join(cfg.dir, 'error.json'), JSON.stringify({ error: e.message }));
+      writeFile(path.join(cfg.dir, 'error.json'), JSON.stringify(setupErrorPayload(e, e.message)));
       await st.cleanup().catch(() => {});
       try {
         server.close();
@@ -3965,9 +4014,10 @@ async function main(argv) {
     }
     // Unexpected setup crash (never a silent exit-1): same cleanup, then a
     // sanitized error.json the CLI surfaces. The name stays reusable — the
-    // CLI removes failed-setup dirs wholesale.
+    // CLI removes failed-setup dirs wholesale. Unexpected failures always
+    // report transport (the CLI keeps evidence-based endpoint diagnosis).
     const detail = sanitizeUnexpected(e);
-    writeFile(path.join(cfg.dir, 'error.json'), JSON.stringify({ error: detail }));
+    writeFile(path.join(cfg.dir, 'error.json'), JSON.stringify(setupErrorPayload(e, detail)));
     await st.cleanup().catch(() => {});
     try {
       server.close();

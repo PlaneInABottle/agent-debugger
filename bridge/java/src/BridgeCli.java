@@ -11,6 +11,28 @@ class BridgeCli {
         } catch (NumberFormatException ignored) {}
         throw new UsageException("timeout must be between 1 and 3600 seconds");
     }
+    static String dirFromArgv(String[] argv) {
+        for (int i = 0; i < argv.length; i++) {
+            if (argv[i].equals("--dir") && i + 1 < argv.length) return argv[i + 1];
+            if (argv[i].startsWith("--dir=")) return argv[i].substring("--dir=".length());
+        }
+        return null;
+    }
+
+    /** CLI-arg failures are config by definition (no connection attempted):
+     *  best-effort error.json so the CLI preserves the semantic message
+     *  instead of diagnosing the endpoint. Never throws; a missing or
+     *  empty --dir writes nothing (never the process cwd).
+     */
+    static void writeParseError(String[] argv, String message) {
+        try {
+            String dir = dirFromArgv(argv);
+            if (dir == null || dir.isEmpty()) return;
+            BridgeProto.writeFile(Paths.get(dir).resolve("error.json"),
+                    BridgeSession.setupErrorJson(message, "config"));
+        } catch (Exception ignored) {}
+    }
+
     static void run(String[] argv) throws Exception {
         if (argv.length == 0) throw new UsageException("usage: JdiBridge attach|launch|session [options]");
         Config cfg = new Config();
@@ -18,6 +40,7 @@ class BridgeCli {
         if (!cfg.mode.equals("attach") && !cfg.mode.equals("launch") && !cfg.mode.equals("session")) {
             throw new UsageException("first arg must be attach, launch or session");
         }
+        try {
         boolean dashdash = false;
         for (int i = 1; i < argv.length; i++) {
             String a = argv[i];
@@ -40,6 +63,10 @@ class BridgeCli {
                 case "--observed-hint": cfg.observedHint = next(argv, ++i, "--observed-hint"); break;
                 default: throw new UsageException("unknown arg: " + a);
             }
+        }
+        } catch (UsageException e) {
+            writeParseError(argv, e.getMessage());
+            throw e;
         }
         if (cfg.mode.equals("session")) {
             if (cfg.sessionDir == null) throw new UsageException("session needs --dir");

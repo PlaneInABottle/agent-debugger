@@ -211,11 +211,11 @@ class BridgeConn {
             try {
                 locs = rt.locationsOfLine(line);
             } catch (AbsentInformationException aie) {
-                throw new BridgeException("class " + rt.name()
+                throw new ConfigBridgeException("class " + rt.name()
                         + " has no line info — recompile with -g");
             }
             if (locs.isEmpty()) {
-                throw new BridgeException("no executable code at " + rt.name() + ":" + line);
+                throw new ConfigBridgeException("no executable code at " + rt.name() + ":" + line);
             }
             for (Location loc : locs) {
                 BreakpointRequest bp = vm.eventRequestManager().createBreakpointRequest(loc);

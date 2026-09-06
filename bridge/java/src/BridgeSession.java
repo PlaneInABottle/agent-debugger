@@ -52,6 +52,11 @@ class BridgeSession {
         BridgeProto.writeFile(dir.resolve("owner.json"),
                 "{\"pid\":" + ProcessHandle.current().pid()
                 + ",\"nonce\":" + JdiBridge.quote(st.ownerNonce) + "}");
+        // Setup-failure phase for error.json derives from the exception
+        // type (UsageException/ConfigBridgeException read as config; JDI
+        // transport losses and unexpected crashes stay transport) — never
+        // from message text or a stage timer. A successful connection never
+        // globally flips later failures to config.
         try {
             if (cfg.sessionKind.equals("attach")) {
                 st.vm = BridgeConn.attachVm(cfg);
@@ -91,15 +96,16 @@ class BridgeSession {
             serveLoop(st, dir);
         } catch (UsageException | BridgeException e) {
             cleanupVm(st);
-            BridgeProto.writeFile(dir.resolve("error.json"), "{\"error\":" + JdiBridge.quote(setupErrorText(e, st)) + "}");
+            BridgeProto.writeFile(dir.resolve("error.json"), setupErrorJson(e, setupErrorText(e, st)));
             throw e;
         } catch (RuntimeException e) {
             // JDI failures surface as unchecked VMDisconnectedException etc.
             // Map them to the same error file (never a bare "internal:"
-            // crash), e.g. a target that vanishes mid-handshake.
+            // crash), e.g. a target that vanishes mid-handshake or
+            // post-connect. Unexpected failures always report transport.
             BridgeException be = new BridgeException(JdiBridge.shortMsg(e));
             cleanupVm(st);
-            BridgeProto.writeFile(dir.resolve("error.json"), "{\"error\":" + JdiBridge.quote(setupErrorText(be, st)) + "}");
+            BridgeProto.writeFile(dir.resolve("error.json"), setupErrorJson(be, setupErrorText(be, st)));
             throw be;
         } catch (Throwable t) {
             // Any other setup crash (checked IO, linkage errors): same
@@ -109,7 +115,7 @@ class BridgeSession {
             // (M2 setup cleanup above is reused, never duplicated.)
             BridgeException be = new BridgeException(JdiBridge.sanitizeUnexpected(t));
             cleanupVm(st);
-            BridgeProto.writeFile(dir.resolve("error.json"), "{\"error\":" + JdiBridge.quote(setupErrorText(be, st)) + "}");
+            BridgeProto.writeFile(dir.resolve("error.json"), setupErrorJson(be, setupErrorText(be, st)));
             throw be;
         } finally {
             try { server.close(); } catch (Exception ignored) {}
@@ -149,7 +155,7 @@ class BridgeSession {
         }
         if (!cfg.exitMethods.isEmpty()) {
             if (!vm.canGetMethodReturnValues()) {
-                throw new BridgeException("target VM cannot provide method return values");
+                throw new ConfigBridgeException("target VM cannot provide method return values");
             }
             for (String cls : cfg.exitMethods.keySet()) {
                 com.sun.jdi.request.MethodExitRequest req =
@@ -213,7 +219,7 @@ class BridgeSession {
         for (Field f : rt.allFields()) {
             if (f.name().equals(w.field)) fields.add(f);
         }
-        if (fields.isEmpty()) throw new BridgeException("no field " + w.field + " in " + rt.name());
+        if (fields.isEmpty()) throw new ConfigBridgeException("no field " + w.field + " in " + rt.name());
         for (Field f : fields) {
             try {
                 if (w.onWrite) {
@@ -229,7 +235,7 @@ class BridgeSession {
                     req.enable();
                 }
             } catch (UnsupportedOperationException e) {
-                throw new BridgeException("target VM cannot watch field " + w.field);
+                throw new ConfigBridgeException("target VM cannot watch field " + w.field);
             }
         }
     }
@@ -238,13 +244,13 @@ class BridgeSession {
         for (String name : methods) {
             List<com.sun.jdi.Method> found = rt.methodsByName(name);
             if (found.isEmpty()) {
-                throw new BridgeException("no method " + name + "() in " + rt.name());
+                throw new ConfigBridgeException("no method " + name + "() in " + rt.name());
             }
             for (com.sun.jdi.Method m : found) {
                 if (m.isNative() || m.isAbstract()) continue;
                 Location loc = m.location();
                 if (loc == null || loc.codeIndex() < 0) {
-                    throw new BridgeException("method " + name + "() in " + rt.name()
+                    throw new ConfigBridgeException("method " + name + "() in " + rt.name()
                             + " has no code — recompile with -g");
                 }
                 BreakpointRequest bp = vm.eventRequestManager().createBreakpointRequest(loc);
@@ -1137,6 +1143,37 @@ class BridgeSession {
         if (suffix == null || suffix.isEmpty()) return base;
         if (base != null && base.contains("target output:")) return base;
         return base + suffix;
+    }
+
+    /** Validated setup-failure phase for error.json: only an exact "config"
+     *  stage passes — unknown, null, or missing stages read as transport
+     *  (conservative: the CLI keeps endpoint diagnosis instead of guessing).
+     */
+    static String setupPhaseOf(String stage) {
+        return "config".equals(stage) ? "config" : "transport";
+    }
+
+    /** Phase from the failure type: UsageException (CLI-arg/spec validation)
+     *  and ConfigBridgeException (arm-time semantic validation) read as
+     *  config; JDI transport losses, VM disconnects, target exits, and
+     *  unexpected crashes stay transport. Never message text, never a
+     *  stage timer.
+     */
+    static String phaseOfError(Throwable t) {
+        if (t instanceof UsageException || t instanceof ConfigBridgeException) return "config";
+        return "transport";
+    }
+
+    /** error.json body: the message verbatim plus the additive phase. */
+    static String setupErrorJson(String message, String stage) {
+        return "{\"error\":" + JdiBridge.quote(message)
+                + ",\"phase\":" + JdiBridge.quote(setupPhaseOf(stage)) + "}";
+    }
+
+    /** error.json body with the phase derived from the failure type. */
+    static String setupErrorJson(Throwable t, String message) {
+        return "{\"error\":" + JdiBridge.quote(message)
+                + ",\"phase\":" + JdiBridge.quote(phaseOfError(t)) + "}";
     }
 
     /** M5 immediate busy rejection (single target main): a second resume

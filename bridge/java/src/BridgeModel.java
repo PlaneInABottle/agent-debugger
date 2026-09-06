@@ -24,6 +24,15 @@ class BridgeException extends Exception {
             this.waitContextJson = waitContextJson;
         }
     }
+// Typed semantic setup failure: local/spec validation (bad method/class/
+// line/source/condition, unsupported watch/exit, conflicting specs).
+// Extends BridgeException so every existing catch still catches; setup
+// error.json `phase` derives from this type, never from message text or a
+// stage timer. JDI transport failures (attach loss, VM disconnect, target
+// exit) stay plain BridgeException so the CLI keeps endpoint diagnosis.
+class ConfigBridgeException extends BridgeException {
+        ConfigBridgeException(String m) { super(m); }
+    }
 class Config {
         String mode; // "attach" | "launch"
         String host = "localhost";

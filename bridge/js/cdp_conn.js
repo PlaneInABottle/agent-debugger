@@ -3,6 +3,15 @@
 // relatively so both adapters share protocol fixes.
 class BridgeErr extends Error {}
 
+// Valid protocol error response (the target answered and refused the
+// request itself — not a socket/timeout/framing loss). Extends BridgeErr
+// so every existing `instanceof BridgeErr` catch still catches. Thrown
+// only when the caller opts in via request(..., {semantic: true}) —
+// breakpoint installation, where a refusal means the spec was rejected.
+// Session establishment (enable/handshake/resume), IO, timeouts, and
+// connection drops always stay plain BridgeErr (transport).
+class ConfigError extends BridgeErr {}
+
 class CdpConn {
   constructor(ws, onClose) {
     this.ws = ws;
@@ -40,7 +49,7 @@ class CdpConn {
     ws.on('error', () => { /* close follows */ });
   }
 
-  request(method, params = {}, timeoutMs = 30000) {
+  request(method, params = {}, timeoutMs = 30000, opts = {}) {
     if (this.closed) return Promise.reject(new BridgeErr('CDP connection closed'));
     const id = ++this.seq;
     return new Promise((resolve, reject) => {
@@ -52,7 +61,12 @@ class CdpConn {
         resolve: (msg) => {
           clearTimeout(timer);
           if (msg.error) {
-            reject(new BridgeErr(`CDP ${method} failed: ${msg.error.message || JSON.stringify(msg.error)}`));
+            const text = `CDP ${method} failed: ${msg.error.message || JSON.stringify(msg.error)}`;
+            // A well-formed refusal over a live connection means the target
+            // processed and rejected the request (semantic) — but only when
+            // the caller opted in. Timeouts/closes/sends above stay
+            // transport unconditionally.
+            reject(opts.semantic ? new ConfigError(text) : new BridgeErr(text));
           } else {
             resolve(msg.result || {});
           }
@@ -79,4 +93,4 @@ class CdpConn {
   }
 }
 
-module.exports = { BridgeErr, CdpConn };
+module.exports = { BridgeErr, ConfigError, CdpConn };

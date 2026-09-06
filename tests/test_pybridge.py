@@ -318,7 +318,7 @@ class BridgeTests(unittest.TestCase):
             Path(b).write_text("".join(f"line {n}\n" for n in range(12)))
             st = self.add_session(tmp)
 
-            def fake(command, args=None, timeout=30):
+            def fake(command, args=None, timeout=30, semantic=False):
                 if args["source"]["path"] == a:
                     return {"breakpoints": [{"verified": False, "message": "pending"}]}
                 raise bridge.BridgeErr("adapter exploded")
@@ -703,7 +703,7 @@ class BridgeTests(unittest.TestCase):
         st.cfg.methods = ["fa", "fb"]
         calls = []
 
-        def fake(command, args=None, timeout=30):
+        def fake(command, args=None, timeout=30, semantic=False):
             calls.append((command, args))
             return {"breakpoints": [{"verified": True},
                                     {"verified": False,
@@ -1006,7 +1006,7 @@ class BridgeTests(unittest.TestCase):
                     seen["command"] = command
                     seen["args"] = args
 
-                def request(self, command, args=None, timeout=30):
+                def request(self, command, args=None, timeout=30, semantic=False):
                     return {}
 
             st.dap = FakeDap()
@@ -2106,6 +2106,135 @@ class TargetIdentityTests(unittest.TestCase):
         self.assertIsNotNone(det)
         self.assertEqual(det["confidence"], "os-corroborated")
         self.assertNotIn("environ", json.dumps(det))
+
+    # ---- setup-failure phase (error.json `phase`) ----
+    # Typed, never message-matched: Usage/ConfigErr read as config, every
+    # other failure (socket loss, timeout, target exit, unexpected) stays
+    # transport. A successful connection never flips later failures.
+
+    def test_phase_of_error_types(self):
+        self.assertEqual(bridge.phase_of_error(bridge.Usage("x")), "config")
+        self.assertEqual(bridge.phase_of_error(bridge.ConfigErr("x")), "config")
+        # ConfigErr is still a BridgeErr: existing catches keep working.
+        self.assertIsInstance(bridge.ConfigErr("x"), bridge.BridgeErr)
+        for e in [bridge.BridgeErr("boom"),
+                  bridge.StopTimeout("timeout: no stop within 2s"),
+                  ValueError("bug"), None, object(), "config"]:
+            self.assertEqual(bridge.phase_of_error(e), "transport",
+                             f"{e!r} must stay transport")
+
+    def test_setup_error_payload_from_exception(self):
+        self.assertEqual(
+            bridge.setup_error_payload(bridge.BridgeErr("boom"), "boom"),
+            {"error": "boom", "phase": "transport"})
+        self.assertEqual(
+            bridge.setup_error_payload(
+                bridge.ConfigErr("bad cond"), "bad cond"),
+            {"error": "bad cond", "phase": "config"})
+        self.assertEqual(
+            bridge.setup_error_payload(
+                bridge.Usage("no such line: x"), "no such line: x"),
+            {"error": "no such line: x", "phase": "config"})
+
+    def test_handshake_attach_refused_stays_transport(self):
+        # Nothing listens: socket/connect failure, phase transport, exact
+        # message preserved for the CLI's cause.
+        cfg = bridge.Config()
+        cfg.kind, cfg.host = "attach", "127.0.0.1"
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            cfg.port = s.getsockname()[1]
+        st = bridge.Session(cfg)
+        with self.assertRaises(bridge.BridgeErr) as cm:
+            st.handshake_attach()
+        self.assertIn("attach failed", str(cm.exception))
+        self.assertNotIsInstance(cm.exception, bridge.ConfigErr)
+        self.assertEqual(
+            bridge.setup_error_payload(cm.exception, str(cm.exception))["phase"],
+            "transport")
+
+    def test_dap_refusal_vs_transport_loss(self):
+        # A valid adapter error response is semantic (ConfigErr) only with
+        # the arm opt-in; socket timeouts and closed connections stay
+        # transport regardless.
+        refusal = {"type": "response", "request_seq": 1,
+                   "success": False, "message": "bad condition"}
+        conn = bridge.DapConn(Mock())
+        conn.stash = [dict(refusal)]
+        with self.assertRaises(bridge.ConfigErr):
+            conn.request("setBreakpoints", {}, timeout=2, semantic=True)
+        # Same refusal without the arm opt-in (initialize/attach/drain):
+        # transport, so endpoint diagnosis is kept.
+        conn.seq = 0
+        conn.stash = [dict(refusal)]
+        with self.assertRaises(bridge.BridgeErr) as cm:
+            conn.request("setBreakpoints", {}, timeout=2)
+        self.assertNotIsInstance(cm.exception, bridge.ConfigErr)
+        # Timeout and closed-connection losses stay transport even armed
+        # (exercised through dap_request, which wraps raw socket errors).
+        st = self.session()
+        st.dap = conn
+        conn.stash = []
+        conn.sock.recv = Mock(side_effect=socket.timeout())
+        with self.assertRaises(bridge.BridgeErr) as cm:
+            st.dap_request("setBreakpoints", {}, timeout=5, semantic=True)
+        self.assertNotIsInstance(cm.exception, bridge.ConfigErr)
+
+    def test_handshake_attach_arm_failure_types(self):
+        # Connected adapter, arming fails: a semantic refusal reports
+        # config; a transport loss during arming reports transport.
+        from unittest.mock import patch
+        for exc, want in [(bridge.ConfigErr("bad condition"), "config"),
+                          (bridge.BridgeErr("DAP connection closed"), "transport")]:
+            cfg = bridge.Config()
+            cfg.kind, cfg.host, cfg.port = "attach", "127.0.0.1", 1
+            st = bridge.Session(cfg)
+            st.dap_request = Mock(return_value={})
+            st.arm_breakpoints = Mock(side_effect=exc)
+            with patch.object(bridge.socket, "create_connection",
+                              return_value=Mock()), \
+                 patch.object(bridge, "DapConn", return_value=Mock()):
+                with self.assertRaises(bridge.BridgeErr):
+                    st.handshake_attach()
+            payload = bridge.setup_error_payload(exc, str(exc))
+            self.assertEqual(payload["phase"], want, f"{exc!r}")
+            self.assertEqual(payload["error"], str(exc))
+
+    def test_pump_target_exit_stays_transport(self):
+        # Initial-pump target exit is a transport loss, never semantic —
+        # even though the connection was established.
+        exc = bridge.BridgeErr("target exited")
+        self.assertEqual(bridge.phase_of_error(exc), "transport")
+        self.assertEqual(
+            bridge.setup_error_payload(exc, str(exc))["phase"], "transport")
+
+    def test_dir_from_argv_scans_without_parsing(self):
+        self.assertEqual(
+            bridge.dir_from_argv(["session", "--dir", "/s", "--break", "a:1"]),
+            "/s")
+        self.assertEqual(
+            bridge.dir_from_argv(["session", "--dir=/s"]),
+            "/s")
+        self.assertIsNone(bridge.dir_from_argv(["session", "--break", "a:1"]))
+        self.assertIsNone(bridge.dir_from_argv(["session", "--dir"]))
+        # Empty --dir= scans as empty and writes nothing (never the cwd).
+        self.assertEqual(bridge.dir_from_argv(["session", "--dir="]), "")
+        bridge.write_parse_error(["session", "--dir="], "x")
+
+    def test_write_parse_error_is_config_and_best_effort(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            bridge.write_parse_error(
+                ["session", "--dir", d, "--break", "x"],
+                "no such line: x")
+            body = json.loads(Path(d, "error.json").read_text())
+            self.assertEqual(body["error"], "no such line: x")
+            self.assertEqual(body["phase"], "config")
+        # No --dir, bad dir, or empty argv: never throws, nothing written.
+        bridge.write_parse_error(["session"], "x")
+        bridge.write_parse_error([], "x")
+        bridge.write_parse_error(
+            ["session", "--dir", "/definitely/not/a/real/dir/xyz"], "x")
 
 
 if __name__ == "__main__":

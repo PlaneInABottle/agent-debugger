@@ -118,6 +118,78 @@ public class M7JavaCheck {
         BridgeSession.StopTimeout plain = new BridgeSession.StopTimeout("busy: x outstanding");
         check(plain.waitContextJson == null, "continue/step timeouts carry no context");
 
+        // -- setup-failure phase (error.json `phase`): message verbatim,
+        // validated stage, conservative transport default.
+        String ej = BridgeSession.setupErrorJson("no method noSuchMethod() in IdleAttach", "config");
+        check(ej.contains("\"phase\":\"config\"") && ej.contains("no method noSuchMethod()"),
+                "config phase shape, got: " + ej);
+        check(BridgeSession.setupErrorJson("attach failed: refused", "transport")
+                .contains("\"phase\":\"transport\""), "transport phase shape");
+        check(BridgeSession.setupErrorJson("x", "runtime").contains("\"phase\":\"transport\""),
+                "unknown stage reads transport");
+        check(BridgeSession.setupErrorJson("x", null).contains("\"phase\":\"transport\""),
+                "null stage reads transport");
+
+        // -- phase derives from the exception type, never message text or
+        // a stage timer: UsageException and ConfigBridgeException read as
+        // config; transport losses, disconnects, and unexpected crashes
+        // stay transport.
+        check(BridgeSession.phaseOfError(new UsageException("bad line")).equals("config"),
+                "usage reads config");
+        check(BridgeSession.phaseOfError(
+                new ConfigBridgeException("no method noSuchMethod() in IdleAttach")).equals("config"),
+                "semantic arm failure reads config");
+        check(new ConfigBridgeException("x") instanceof BridgeException,
+                "config still catches as BridgeException");
+        check(BridgeSession.phaseOfError(
+                new BridgeException("attach failed (h:1): refused")).equals("transport"),
+                "connect loss stays transport");
+        check(BridgeSession.phaseOfError(
+                new BridgeException("lost connection to target VM: x")).equals("transport"),
+                "mid-handshake death stays transport");
+        check(BridgeSession.phaseOfError(
+                new BridgeException("target VM exited before any breakpoint hit")).equals("transport"),
+                "pump target-exit stays transport");
+        check(BridgeSession.phaseOfError(new RuntimeException("boom")).equals("transport"),
+                "unexpected reads transport");
+        check(BridgeSession.phaseOfError(null).equals("transport"),
+                "null reads transport");
+        String cej = BridgeSession.setupErrorJson(
+                new ConfigBridgeException("no method x() in Y"), "no method x() in Y");
+        check(cej.contains("\"phase\":\"config\"") && cej.contains("no method x()"),
+                "typed payload shape, got: " + cej);
+        String tej = BridgeSession.setupErrorJson(
+                new BridgeException("target exited"), "target exited");
+        check(tej.contains("\"phase\":\"transport\""), "transport payload shape");
+
+        // -- parse-error scan finds --dir without parsing; the file is config.
+        check("/s".equals(BridgeCli.dirFromArgv(
+                new String[]{"session", "--dir", "/s", "--break", "a:1"})), "dir scan");
+        check("/s".equals(BridgeCli.dirFromArgv(
+                new String[]{"session", "--dir=/s"})), "dir= scan");
+        check(BridgeCli.dirFromArgv(new String[]{"session", "--break", "a:1"}) == null,
+                "no dir reads null");
+        try {
+            java.nio.file.Path tmp =
+                    java.nio.file.Files.createTempDirectory("phase-parse");
+            BridgeCli.writeParseError(
+                    new String[]{"session", "--dir", tmp.toString(), "--break", "x"},
+                    "bad line in --break: x");
+            String body = new String(java.nio.file.Files.readAllBytes(
+                    tmp.resolve("error.json")), java.nio.charset.StandardCharsets.UTF_8);
+            check(body.contains("\"phase\":\"config\"") && body.contains("bad line"),
+                    "parse-error file is config, got: " + body);
+            // No --dir: never throws, nothing written.
+            BridgeCli.writeParseError(new String[]{"session"}, "x");
+            // Empty --dir (--dir=) scans as empty and writes nothing (never
+            // the process cwd): never throws.
+            check("".equals(BridgeCli.dirFromArgv(new String[]{"session", "--dir="})),
+                    "empty dir scans empty");
+            BridgeCli.writeParseError(new String[]{"session", "--dir="}, "x");
+        } catch (Exception e) {
+            check(false, "parse-error helpers threw: " + e);
+        }
+
         if (failures > 0) {
             System.out.println("M7JavaCheck: " + failures + " FAILURES");
             System.exit(1);

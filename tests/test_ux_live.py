@@ -202,6 +202,44 @@ class UxLiveTests(unittest.TestCase):
     def session_file(self, name):
         return self.home / ".agent-debugger/sessions" / name / "session.json"
 
+    def _wait_http_ok(self, url, timeout=25):
+        """Bounded readiness: the fixture answers 200. No break is armed
+        at this point, so no park is possible — a completion proves the
+        server itself is up, never a debugger state."""
+        deadline = time.monotonic() + timeout
+        last = None
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen(url, timeout=2) as r:
+                    if r.status == 200:
+                        return
+                    last = f"status {r.status}"
+            except Exception as e:  # noqa: BLE001 — not up yet, retry
+                last = str(e)
+            time.sleep(0.2)
+        self.fail(f"{url} never answered 200: {last}")
+
+    def http_target_spec(self, lang, port):
+        """Shared HTTP-target wiring (mirrors flow_http_recipe): returns
+        (start args, handler break spec, handler line, url)."""
+        fx = self.fixture
+        if lang == "py":
+            path = self.py_http
+            line = break_line(path, "# BREAK")
+            brk = f"{path}:{line}"
+            cli_args = ["py", "start", str(path), "--", str(port)]
+        elif lang == "node":
+            path = self.js_http
+            line = break_line(path, "// BREAK")
+            brk = f"{path}:{line}"
+            cli_args = ["node", "start", str(path), "--", str(port)]
+        else:
+            line = break_line(fx / "UxHttp.java", "// BREAK")
+            brk = f"UxHttp:{line}"
+            cli_args = ["java", "start", "--main", "UxHttp", "--cp", str(fx),
+                        "--", str(port)]
+        return cli_args, brk, line, f"http://127.0.0.1:{port}/"
+
     def wait_file_stopped(self, name, want=True, timeout=20):
         """Bounded readiness on the prompt session file (no bridge command)."""
         deadline = time.monotonic() + timeout
@@ -505,67 +543,74 @@ class UxLiveTests(unittest.TestCase):
             pass
 
     def flow_disconnect_resumes(self, lang):
-        """SIGKILL the capture client inside the park window: the bridge
-        still removes the ephemeral and resumes (only the response is
-        lost). The park-to-resume window is short, so poll the prompt
-        session file fast and retry the capture until the kill lands
-        inside a park (bounded attempts; every attempt is a real capture).
-        A kill that lands just after a natural resume is harmless: the
-        post-state assertions are identical."""
-        loop = self.loop_prog(lang)
-        brk = self.loop_break(lang)
+        """Kill-before-trigger disconnect cleanup (deterministic ordering,
+        no park-window polling): a background capture is proven outstanding
+        via a rival busy verdict, its CLI is SIGKILLed, and only then is
+        the handler triggered. The bridge must still settle the orphaned
+        capture (park, unplant, resume — only the response is lost): the
+        request completes and the session stays healthy with no leaked
+        ephemeral and no wedged slot."""
+        port = free_port()
+        cli_args, brk, line, url = self.http_target_spec(lang, port)
         name = self.track(f"ux-{lang}-disc")
-        self.cli(name, *self.start_spec(lang, loop), timeout=40)
-        killed = False
-        for _ in range(8):
-            proc = subprocess.Popen(
-                [str(BIN), "--session", name, "capture", "--break", brk,
-                 "--timeout", "30"],
-                env=self.env, cwd=ROOT, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL)
-            try:
-                deadline = time.monotonic() + 28
-                while time.monotonic() < deadline:
-                    if proc.poll() is not None:
-                        break  # finished before any kill: retry
-                    try:
-                        meta = json.loads(self.session_file(name).read_text())
-                    except OSError:
-                        meta = {}
-                    if meta.get("stopped"):
-                        proc.send_signal(signal.SIGKILL)
-                        killed = True
-                        break
-                    time.sleep(0.005)  # fast readiness poll, bounded above
-                proc.wait(timeout=15)
-            finally:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-            if killed:
-                break
-        self.assertTrue(killed, "never landed a kill inside the park window")
-        # The target is running again and the ephemeral is gone.
-        deadline = time.monotonic() + 20
-        while True:
-            try:
-                if self.cli(name, "threads", timeout=20).get("running"):
+        started = self.cli(name, *cli_args, timeout=40)
+        self.assertTrue(started.get("running", False) or "threads" in started)
+        # Readiness without arming anything: a free-running request proves
+        # the server is up (it cannot park — no break is armed yet).
+        self._wait_http_ok(url, timeout=25)
+        # Background capture plants the ephemeral and long-polls for the
+        # park. Output discarded: this client is killed below.
+        proc = subprocess.Popen(
+            [str(BIN), "--session", name, "capture", "--break", brk,
+             "--timeout", "30"],
+            env=self.env, cwd=ROOT, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            # Causal proof the capture holds the slot (bounded retry: the
+            # freshly spawned CLI may need a moment to register
+            # server-side; a free slot answers a typed timeout instead,
+            # never busy).
+            deadline = time.monotonic() + 15
+            while True:
+                rival = self.cli(name, "wait", "--timeout", "2", timeout=15,
+                                 ok=False)
+                err = rival.get("error", "")
+                if "busy" in err and "capture" in err:
                     break
-            except AssertionError:
+                self.assertIn(
+                    "timeout", err,
+                    f"rival must be busy or free, never parked: {rival}")
+                if time.monotonic() > deadline:
+                    self.fail(f"{lang} capture never held the slot: {err}")
+                # else: slot not yet registered — retry (bounded above)
+            # Kill BEFORE the trigger: the orphaned capture must still
+            # settle (park, unplant, resume) once the request arrives.
+            proc.send_signal(signal.SIGKILL)
+            self.assertIsNotNone(proc.wait(timeout=15), "killed CLI must die")
+            # Trigger after the kill: completes only if the bridge settles
+            # the park (or never parked — either way the session is usable).
+            got = {}
+            try:
+                with urllib.request.urlopen(url, timeout=25) as r:
+                    got["body"] = r.read()
+                    got["code"] = r.status
+            except Exception as e:  # noqa: BLE001 — recorded, asserted below
+                got["error"] = str(e)
+            self.assertEqual(got.get("code"), 200, got)
+            self.assertEqual(got.get("body"), b"ok", got)
+        finally:
+            try:
+                proc.kill()
+            except Exception:
                 pass
-            if time.monotonic() > deadline:
-                self.fail(f"{lang} capture did not resume after client death")
-            time.sleep(0.2)
+        # Healthy post-state: running, ephemeral gone, slot free. The
+        # killed capture's cleanup tail may still hold the slot briefly:
+        # bounded retry on the exact busy verdict only.
+        running = self.cli(name, "threads", timeout=20)
+        self.assertTrue(running["running"],
+                        f"{lang} target running after disconnect cleanup")
         stops = self.cli(name, "breaks", timeout=20)["stops"]
         self.assertEqual(stops, [], "ephemeral removed despite disconnect")
-        # No lingering park from the killed capture: with nothing armed the
-        # next wait is a clean typed timeout, never a stale suspended reuse.
-        # Latent race: `threads` above is synthetic-running while the killed
-        # capture's outstanding cleanup tail remains, so this wait may
-        # correctly busy-reject. Bounded retry on the exact outstanding
-        # verdict only (never a stopped/wait success); a persisting busy
-        # still fails.
         deadline = time.monotonic() + 20
         while True:
             live = self.cli(name, "wait", "--timeout", "2", timeout=15,
@@ -574,8 +619,7 @@ class UxLiveTests(unittest.TestCase):
             if "timeout" in err:
                 break
             # The killed op is capture, so `busy: capture outstanding ...`
-            # is the expected transient; any busy-outstanding verdict
-            # retries the same way (never a stopped/wait success).
+            # is the expected transient (never a stopped/wait success).
             self.assertIn("busy", err, live)
             self.assertIn("outstanding", err, live)
             if time.monotonic() > deadline:
