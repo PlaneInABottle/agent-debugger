@@ -54,6 +54,10 @@ const MAX_TABS_LISTED = 10;
 const MAX_STRING = 200;
 const MAX_FIELDS = 20;
 const MAX_VARS = 20;
+// Display-independent change tracking bound: top-level values scanned per
+// frame for changed/removed detection (same on all adapters). The vars
+// display cap (MAX_VARS=20 + sentinel) is unchanged and independent.
+const CHANGE_TRACK_MAX = 256;
 const MAX_FRAMES = 10;
 const MAX_LOG_LINES = 2000;
 const MAX_OUTPUT = 4000;
@@ -632,6 +636,15 @@ class Session {
     this.lastTop = null;
     this.lastFunc = null;
     this.lastChanged = '[]';
+    this.lastRemoved = '[]';
+    this.lastChangedComplete = false;
+    this.lastChangeTracking = {
+      complete: false, scanned: 0, total: null, truncated: false,
+      reason: 'first-snapshot',
+    };
+    this.lastTrackWarn = null;
+    this.lastTrackComplete = false; // was previous scan exhaustive
+    this.lastTrackReason = 'first-snapshot'; // reason when incomplete
     this.stopInfo = null;
     this.outputTail = '';
     this.logCount = 0;
@@ -1066,10 +1079,13 @@ class Session {
           await this.fireLogpoint(id, frames);
         }
         await this.trackChanges(frames);
-      } catch (_) {
-        // Still parked and published; change detail just goes quiet.
-        if (!this.cachedLocals) this.cachedLocals = [];
-        this.lastChanged = '[]';
+      } catch (e) {
+        // Still parked and published; change detail just goes quiet
+        // (class-only warning, never variable data). The display cache
+        // is cleared too — a logpoint failure before trackChanges ran
+        // must never leave the previous stop's locals at this location.
+        this.cachedLocals = [];
+        this.degradeTrack((e && e.constructor && e.constructor.name) || 'Error', null, frames);
       }
       this.publishState(true);
       return;
@@ -1086,9 +1102,10 @@ class Session {
           await this.fireLogpoint(id, frames);
         }
         await this.trackChanges(frames);
-      } catch (_) {
-        if (!this.cachedLocals) this.cachedLocals = [];
-        this.lastChanged = '[]';
+      } catch (e) {
+        // Same no-stale-locals rule as above.
+        this.cachedLocals = [];
+        this.degradeTrack((e && e.constructor && e.constructor.name) || 'Error', null, frames);
       }
       this.publishState(true);
       return;
@@ -1167,33 +1184,215 @@ class Session {
     throw last;
   }
 
-  async trackChanges(frames) {
-    // Resilient change tracking: only real local entries (object, string
-    // name, non-sentinel, with a value) are tracked — the truncation
-    // sentinel {name:'…',note} carries no value, and malformed entries
-    // are safely skipped (never a park crash). Stable formatted strings
-    // are retained. Callers (onPaused) additionally degrade to an empty
-    // baseline when the locals fetch itself throws.
-    const locals = await this.frameLocalsIn(frames, 0);
-    this.cachedLocals = locals;
-    const cur = {};
-    for (const l of locals || []) {
-      if (!l || typeof l !== 'object') continue;
-      const name = l.name;
-      if (typeof name !== 'string' || name === '…' || !('value' in l)) continue;
-      const v = l.value;
-      cur[name] = typeof v === 'string' ? v : String(v);
+  /** Full merged scope properties for change tracking (display-
+   *  independent): same scope-precedence merge as frameLocalsIn but WITHOUT
+   *  the MAX_VARS display slice. Uses the full Runtime.getProperties result
+   *  already returned (one fetch per scope, no accessor invocation, no
+   *  deep expansion). Throws on fetch failure (caller degrades). */
+  async trackingProps(frames) {
+    if (!frames || frames.length === 0) return [];
+    const chain = frames[0].scopeChain || [];
+    const seen = new Set();
+    const props = [];
+    for (const s of chain) {
+      if (s.type !== 'local' && s.type !== 'block' && s.type !== 'closure' && s.type !== 'module' && s.type !== 'catch' && s.type !== 'script') continue;
+      for (const pr of await this.scopeProps(s)) {
+        if (!pr || typeof pr !== 'object') continue;
+        if (typeof pr.name !== 'string') continue;
+        if (!seen.has(pr.name)) {
+          seen.add(pr.name);
+          props.push(pr);
+        }
+      }
     }
-    const func = frames.length > 0 ? (frames[0].functionName || '(anonymous)') : '?';
-    let changed;
-    if (this.lastTop === null || this.lastFunc !== func) {
-      changed = Object.keys(cur).sort();
-    } else {
-      changed = Object.keys(cur).filter((n) => this.lastTop[n] !== cur[n]).sort();
-    }
-    this.lastTop = cur;
+    return props;
+  }
+
+  trackWarnText(reason) {
+    return `change tracking incomplete (${reason}); changed lists only certain value changes`;
+  }
+
+  trackWarn(reason) {
+    try {
+      process.stderr.write(`warn: change tracking degraded (${reason})\n`);
+    } catch (_) { /* ignore */ }
+    return this.trackWarnText(reason);
+  }
+
+  /** Frame identity for change comparison: script (or url) + function
+   *  name. Same-named functions in different scripts must never compare
+   *  silently. Degrades gracefully when location data is missing. */
+  trackFuncId(frames) {
+    const f = (frames && frames.length > 0) ? frames[0] : null;
+    const func = (f && f.functionName) || '(anonymous)';
+    let loc = '';
+    try {
+      loc = (f && f.location && typeof f.location.scriptId === 'string') ? f.location.scriptId
+        : (f && typeof f.url === 'string') ? f.url : '';
+    } catch (_) { loc = ''; }
+    return loc ? `${loc}#${func}` : func;
+  }
+
+  storeTrack(cur, func, changed, removed, complete, scanned, total, truncated, reason, curComplete, scanReason, warn) {
+    this.lastTop = cur && typeof cur === 'object' ? cur : {};
     this.lastFunc = func;
-    this.lastChanged = JSON.stringify(changed);
+    try {
+      this.lastChanged = JSON.stringify(changed);
+    } catch (_) {
+      this.lastChanged = '[]';
+    }
+    try {
+      this.lastRemoved = JSON.stringify(removed);
+    } catch (_) {
+      this.lastRemoved = '[]';
+    }
+    this.lastChangedComplete = !!complete;
+    this.lastTrackComplete = !!curComplete;
+    this.lastTrackReason = scanReason !== null && scanReason !== undefined
+      ? scanReason : (curComplete ? null : reason);
+    // Incomplete branches always pass warn=true, so exactly one class-only
+    // warning is written here; complete scans stay quiet.
+    this.lastTrackWarn = warn ? this.trackWarn(reason) : null;
+    const tracking = {
+      complete: !!complete, scanned, total, truncated: !!truncated,
+    };
+    if (reason !== null && reason !== undefined && !complete) {
+      tracking.reason = reason;
+    }
+    this.lastChangeTracking = tracking;
+  }
+
+  compareTrack(cur, total, truncated, scanReason, degraded, frames) {
+    const useFrames = frames || (this.paused && this.paused.frames) || [];
+    const func = this.trackFuncId(useFrames);
+    const last = (this.lastTop !== null && typeof this.lastTop === 'object') ? this.lastTop : null;
+    const prevComplete = !!this.lastTrackComplete;
+    const prevReason = this.lastTrackReason || 'truncated';
+    const curComplete = (scanReason === null || scanReason === undefined) && !degraded;
+    const scanned = (typeof total === 'number') ? Math.min(total, CHANGE_TRACK_MAX) : 0;
+    if (last === null) {
+      // No previous snapshot means no change comparison. A problem with
+      // the CURRENT scan (truncated/error) dominates the reason — it
+      // describes the stored baseline the next stop compares against;
+      // first-snapshot only when the current scan is itself exhaustive.
+      const reason = (scanReason !== null && scanReason !== undefined) ? scanReason
+        : (curComplete ? 'first-snapshot' : 'tracking-error');
+      this.storeTrack(cur, func, [], [], false, scanned, total, truncated, reason, curComplete, scanReason, true);
+      return;
+    }
+    if (this.lastFunc !== func) {
+      const reason = (scanReason !== null && scanReason !== undefined) ? scanReason
+        : (curComplete ? 'function-changed' : 'tracking-error');
+      this.storeTrack(cur, func, [], [], false, scanned, total, truncated, reason, curComplete, scanReason, true);
+      return;
+    }
+    if (!prevComplete || !curComplete) {
+      let changed = [];
+      try {
+        changed = Object.keys(cur).filter((n) => (n in last) && last[n] !== cur[n]).sort();
+      } catch (_) {
+        changed = [];
+      }
+      const reason = !curComplete ? (scanReason || 'tracking-error') : (prevReason || 'truncated');
+      this.storeTrack(cur, func, changed, [], false, scanned, total, truncated, reason, curComplete, scanReason, true);
+      return;
+    }
+    let changed = [];
+    let removed = [];
+    try {
+      changed = Object.keys(cur).filter((n) => !(n in last) || last[n] !== cur[n]).sort();
+      removed = Object.keys(last).filter((n) => !(n in cur)).sort();
+    } catch (e) {
+      const cls = (e && e.constructor && e.constructor.name) || 'Error';
+      this.storeTrack(
+        (cur && typeof cur === 'object') ? cur : {}, func,
+        [], [], false, scanned, total, truncated, 'tracking-error', false, 'tracking-error', false);
+      // Single class-only warning (storeTrack stayed silent by design).
+      this.lastTrackWarn = this.trackWarn(cls);
+      return;
+    }
+    this.storeTrack(cur, func, changed, removed, true, scanned, total, truncated, null, true, null, false);
+  }
+
+  degradeTrack(clsName, total, frames) {
+    const useFrames = frames || (this.paused && this.paused.frames) || [];
+    const func = this.trackFuncId(useFrames);
+    this.storeTrack({}, func, [], [], false, 0, (total ?? null), false, 'tracking-error', false, 'tracking-error', false);
+    // Single class-only warning (storeTrack stayed silent by design), and
+    // it matches the response's trackingWarning.
+    this.lastTrackWarn = this.trackWarn(clsName || 'tracking-error');
+  }
+
+  /** Additive change-tracking response fields (uniform contract). Never
+   *  throws; empty changed with changedComplete=false is UNKNOWN. */
+  changeFields() {
+    let changed = [];
+    let removed = [];
+    try {
+      const c = JSON.parse(this.lastChanged);
+      if (Array.isArray(c)) changed = c;
+    } catch (_) { changed = []; }
+    try {
+      const r = JSON.parse(this.lastRemoved);
+      if (Array.isArray(r)) removed = r;
+    } catch (_) { removed = []; }
+    const complete = !!this.lastChangedComplete;
+    const tracking = (this.lastChangeTracking && typeof this.lastChangeTracking === 'object')
+      ? this.lastChangeTracking
+      : { complete, scanned: 0, total: null, truncated: false };
+    const out = { changed, removed, changedComplete: complete, changeTracking: tracking };
+    if (this.lastTrackWarn && !complete) out.trackingWarning = this.lastTrackWarn;
+    return out;
+  }
+
+  async trackChanges(frames) {
+    // Display-independent change tracking: the full merged scope props
+    // (up to CHANGE_TRACK_MAX=256) feed this path — never the
+    // display-capped frameLocalsIn slice. Accessor properties keep their
+    // honest placeholder (never invoked); malformed entries are skipped.
+    // This method never throws to the park: fetch failures degrade to an
+    // empty baseline with a class-only warning (no variable data).
+    let props;
+    try {
+      props = await this.trackingProps(frames);
+    } catch (e) {
+      const cls = (e && e.constructor && e.constructor.name) || 'Error';
+      // The fetch failed, so there is nothing to display either: clear
+      // instead of retaining the previous stop's locals.
+      this.cachedLocals = [];
+      this.degradeTrack(cls, null, frames);
+      return;
+    }
+    const names = {};
+    for (const pr of props || []) {
+      try {
+        if (!pr || typeof pr !== 'object') continue;
+        const name = pr.name;
+        if (typeof name !== 'string' || name === '…') continue;
+        if (name in names) continue;
+        const val = pr.value !== undefined ? this.fmtRemote(pr.value)
+          : (pr.get !== undefined ? '(getter — eval to read)' : '?');
+        names[name] = typeof val === 'string' ? val : String(val);
+      } catch (_) {
+        continue;
+      }
+    }
+    const total = Object.keys(names).length;
+    const truncated = total > CHANGE_TRACK_MAX;
+    const scanReason = truncated ? 'truncated' : null;
+    const cur = {};
+    for (const name of Object.keys(names).sort().slice(0, CHANGE_TRACK_MAX)) {
+      cur[name] = names[name];
+    }
+    // Display locals stay capped (MAX_VARS + sentinel) and independent.
+    // A display fetch failure clears the cache (never a stale previous
+    // stop's locals at the new location); tracking still compares below.
+    try {
+      this.cachedLocals = await this.frameLocalsIn(frames, 0);
+    } catch (_) {
+      this.cachedLocals = [];
+    }
+    this.compareTrack(cur, total, truncated, scanReason, false, frames);
   }
 
   onTargetOutput(text) {
@@ -1642,7 +1841,7 @@ class Session {
     const snapshot = await this.snapshot();
     return {
       ok: true, stopped: true, waited, target: 'main',
-      changed: JSON.parse(this.lastChanged),
+      ...this.changeFields(),
       stopInfo: JSON.parse(this.stopInfo || 'null'),
       snapshot, diag: this.stopDiag(snapshot.threads),
       warning: PARK_WARNING,
@@ -2094,7 +2293,7 @@ class Session {
       ok: true,
       stopped: true,
       target: 'main',
-      changed: JSON.parse(this.lastChanged),
+      ...this.changeFields(),
       stopInfo: JSON.parse(this.stopInfo || 'null'),
       snapshot,
       diag: this.stopDiag(snapshot.threads),

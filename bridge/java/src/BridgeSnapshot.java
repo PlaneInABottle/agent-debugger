@@ -324,6 +324,81 @@ class BridgeSnapshot {
         return formatValue(v, 2);
     }
 
+    /** Tracking-only top-level preview (uniform shallow contract): the
+     *  value's own summary capped at MAX_STRING chars — primitives and
+     *  strings by content, arrays by type+length, objects by
+     *  type+identity. No field walk (getValue), no element fetch
+     *  (getValues), no method invocation: object internals changing
+     *  without a top-level change are intentionally NOT detected, on
+     *  every adapter. The display formatValue above is untouched. */
+    static String formatTrackingValue(Value v) {
+        if (v == null) return "null";
+        if (v instanceof VoidValue) return "void";
+        if (v instanceof PrimitiveValue) {
+            String s;
+            try {
+                s = v.toString();
+            } catch (Exception e) {
+                return "?";
+            }
+            return capTrackStr(s);
+        }
+        if (v instanceof StringReference) {
+            String s;
+            try {
+                s = ((StringReference) v).value();
+            } catch (Exception e) {
+                return "?";
+            }
+            if (s == null) return "null";
+            return capTrackStr("\"" + s + "\"");
+        }
+        if (v instanceof ArrayReference) {
+            ArrayReference arr = (ArrayReference) v;
+            String t;
+            try {
+                t = arr.type().name();
+            } catch (Exception e) {
+                t = "Array";
+            }
+            int len;
+            try {
+                len = arr.length();
+            } catch (Exception e) {
+                len = -1;
+            }
+            return capTrackStr(t + "[" + len + "]");
+        }
+        if (v instanceof ObjectReference) {
+            ObjectReference obj = (ObjectReference) v;
+            String t;
+            try {
+                t = obj.referenceType().name();
+            } catch (Exception e) {
+                t = "?";
+            }
+            long id;
+            try {
+                id = obj.uniqueID();
+            } catch (Exception e) {
+                id = -1;
+            }
+            return capTrackStr(t + "@" + id);
+        }
+        try {
+            return capTrackStr(v.toString());
+        } catch (Exception e) {
+            return "?";
+        }
+    }
+
+    static String capTrackStr(String s) {
+        if (s == null) return "null";
+        if (s.length() <= JdiBridge.MAX_STRING) return s;
+        return s.substring(0, JdiBridge.MAX_STRING) + "… (+"
+                + (s.length() - JdiBridge.MAX_STRING) + " more chars)";
+    }
+
     // ---- session server (persistent VM connection over TCP) ----
     //
     // Protocol: DAP-style framing (Content-Length + JSON) on 127.0.0.1.

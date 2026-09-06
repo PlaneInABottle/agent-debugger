@@ -26,8 +26,7 @@ public class M7JavaCheck {
         }
     }
 
-    static SessionState state(String kind) {
-        Config cfg = new Config();
+    static SessionState state(String kind) {        Config cfg = new Config();
         cfg.sessionKind = kind;
         cfg.host = "127.0.0.1";
         cfg.port = 5005;
@@ -35,6 +34,26 @@ public class M7JavaCheck {
         SessionState st = new SessionState();
         st.cfg = cfg;
         return st;
+    }
+
+    /** JDI mirror stub without a VM: answers named methods, explodes on
+     *  anything else (proving no field walk / element fetch / invoke). */
+    static Object jdiProxy(Class<?> iface, java.util.Map<String, Object> answers) {
+        return java.lang.reflect.Proxy.newProxyInstance(
+                M7JavaCheck.class.getClassLoader(),
+                new Class<?>[]{iface},
+                (proxy, method, args) -> {
+                    if (answers.containsKey(method.getName())) {
+                        Object ans = answers.get(method.getName());
+                        if (ans instanceof Throwable) throw (Throwable) ans;
+                        return ans;
+                    }
+                    if (method.getName().equals("hashCode")) return 1;
+                    if (method.getName().equals("equals")) return Boolean.FALSE;
+                    if (method.getName().equals("toString")) return "proxy";
+                    throw new AssertionError(
+                            "unexpected JDI call: " + method.getName());
+                });
     }
 
     public static void main(String[] args) {
@@ -339,6 +358,167 @@ public class M7JavaCheck {
         } catch (Exception e) {
             check(false, "parse-error helpers threw: " + e);
         }
+
+        // -- display-independent change tracking (compareTrack/storeTrack
+        // unit parity, no VM): >20 locals complete, removal, >256
+        // truncated with intersection-only changes, first-baseline and
+        // function-change resets, and a null-thread scan degrading to
+        // tracking-error (never a park crash).
+        java.util.Map<String, String> base25 = new java.util.LinkedHashMap<>();
+        for (int i = 0; i < 25; i++) base25.put("v" + i, String.valueOf(i));
+        SessionState tc = state("launch");
+        BridgeSession.compareTrack(tc, new java.util.LinkedHashMap<>(base25),
+                "com.Foo#run", 25, false, null, true);
+        check("[]".equals(tc.lastChanged)
+                && !tc.lastChangedComplete
+                && tc.lastChangeTracking.contains("\"reason\":\"first-snapshot\""),
+                "first baseline empty+unknown, got: " + tc.lastChanged
+                + " / " + tc.lastChangeTracking);
+        check(tc.lastTrackWarn != null, "first baseline warns");
+        java.util.Map<String, String> next = new java.util.LinkedHashMap<>(base25);
+        next.put("v24", "changed");
+        next.put("fresh", "1");
+        next.remove("v0");
+        BridgeSession.compareTrack(tc, next, "com.Foo#run", 25, false, null, true);
+        check(tc.lastChanged.contains("\"v24\"") && tc.lastChanged.contains("\"fresh\"")
+                && tc.lastRemoved.contains("\"v0\"") && tc.lastChangedComplete
+                && !tc.lastChangeTracking.contains("reason"),
+                ">20 complete with change+removal, got: " + tc.lastChanged
+                + " / " + tc.lastRemoved);
+        check(tc.lastTrackWarn == null, "complete scan quiet");
+        // No-op stop: complete with empty changed (real no-change).
+        BridgeSession.compareTrack(tc, new java.util.LinkedHashMap<>(next),
+                "com.Foo#run", 25, false, null, true);
+        check("[]".equals(tc.lastChanged) && "[]".equals(tc.lastRemoved)
+                && tc.lastChangedComplete, "no-op complete empty");
+        // Function change resets to unknown.
+        BridgeSession.compareTrack(tc, new java.util.LinkedHashMap<>(next),
+                "com.Foo#other", 25, false, null, true);
+        check("[]".equals(tc.lastChanged) && !tc.lastChangedComplete
+                && tc.lastChangeTracking.contains("\"reason\":\"function-changed\""),
+                "function change resets, got: " + tc.lastChangeTracking);
+        // >256: truncated, intersection-only value changes, removed
+        // suppressed, never complete.
+        java.util.Map<String, String> trackBig = new java.util.LinkedHashMap<>();
+        for (int i = 0; i < 300; i++) trackBig.put("w" + i, "0");
+        SessionState tt = state("launch");
+        BridgeSession.compareTrack(tt, new java.util.LinkedHashMap<>(trackBig),
+                "com.Foo#run", 301, true, "truncated", false);
+        check(!tt.lastChangedComplete
+                && tt.lastChangeTracking.contains("\"reason\":\"truncated\"")
+                && tt.lastChangeTracking.contains("\"total\":301")
+                && tt.lastChangeTracking.contains("\"scanned\":256"),
+                "truncated baseline unknown, got: " + tt.lastChangeTracking);
+        java.util.Map<String, String> big2 = new java.util.LinkedHashMap<>(trackBig);
+        big2.put("w1", "1");
+        big2.put("added", "x");
+        big2.remove("w2");
+        BridgeSession.compareTrack(tt, big2, "com.Foo#run", 301, true,
+                "truncated", false);
+        check(tt.lastChanged.contains("\"w1\"")
+                && !tt.lastChanged.contains("\"added\"")
+                && "[]".equals(tt.lastRemoved) && !tt.lastChangedComplete,
+                "truncated intersection-only, got: " + tt.lastChanged
+                + " / " + tt.lastRemoved);
+        // Null-thread scan (no frames): tracking-error with unknown
+        // total (null, never 0), never throws.
+        SessionState te = state("launch");
+        te.thread = null;
+        try {
+            BridgeSession.trackChanges(te);
+            check("[]".equals(te.lastChanged) && !te.lastChangedComplete
+                    && te.lastChangeTracking.contains("\"reason\":\"tracking-error\"")
+                    && te.lastChangeTracking.contains("\"total\":null")
+                    && te.lastTrackWarn != null,
+                    "null-thread scan degrades, got: " + te.lastChangeTracking);
+        } catch (Throwable trackErr) {
+            check(false, "trackChanges threw: " + trackErr);
+        }
+        // Response fragment shape: changed/removed/changedComplete/
+        // changeTracking (+warning only when incomplete).
+        String frag = BridgeSession.changeFieldsJson(tc);
+        check(frag.contains("\"changed\":") && frag.contains("\"removed\":")
+                && frag.contains("\"changedComplete\":")
+                && frag.contains("\"changeTracking\":"),
+                "change fragment shape, got: " + frag);
+        // -- formatTrackingValue: shallow top-level preview, 200-cap, no
+        // field walk / element fetch / invocation (proxies explode on any
+        // such call, proving the contract without a VM).
+        check("null".equals(BridgeSnapshot.formatTrackingValue(null)),
+                "track preview null");
+        java.util.Map<String, Object> primAns = new java.util.HashMap<>();
+        primAns.put("toString", "42");
+        check("42".equals(BridgeSnapshot.formatTrackingValue(
+                (com.sun.jdi.Value) jdiProxy(com.sun.jdi.PrimitiveValue.class, primAns))),
+                "track preview primitive");
+        StringBuilder longStr = new StringBuilder();
+        for (int i = 0; i < 300; i++) longStr.append('x');
+        java.util.Map<String, Object> strAns = new java.util.HashMap<>();
+        strAns.put("value", longStr.toString());
+        String cappedPrev = BridgeSnapshot.formatTrackingValue(
+                (com.sun.jdi.Value) jdiProxy(com.sun.jdi.StringReference.class, strAns));
+        check(cappedPrev.startsWith("\"") && cappedPrev.contains("more chars")
+                && cappedPrev.length() < 302, "track preview long string capped");
+        java.util.Map<String, Object> arrTypeAns = new java.util.HashMap<>();
+        arrTypeAns.put("name", "int[]");
+        Object arrTypeProxy = jdiProxy(com.sun.jdi.ArrayType.class, arrTypeAns);
+        java.util.Map<String, Object> arrAns = new java.util.HashMap<>();
+        arrAns.put("type", arrTypeProxy);
+        arrAns.put("length", 5);
+        arrAns.put("getValues", new AssertionError("element fetch"));
+        check("int[][5]".equals(BridgeSnapshot.formatTrackingValue(
+                (com.sun.jdi.Value) jdiProxy(com.sun.jdi.ArrayReference.class, arrAns))),
+                "track preview array shallow, no fetch");
+        java.util.Map<String, Object> refTypeAns = new java.util.HashMap<>();
+        refTypeAns.put("name", "com.Foo");
+        Object refTypeProxy = jdiProxy(com.sun.jdi.ReferenceType.class, refTypeAns);
+        java.util.Map<String, Object> objAns = new java.util.HashMap<>();
+        objAns.put("referenceType", refTypeProxy);
+        objAns.put("uniqueID", 123L);
+        objAns.put("getValue", new AssertionError("field walk"));
+        objAns.put("invokeMethod", new AssertionError("invoke"));
+        check("com.Foo@123".equals(BridgeSnapshot.formatTrackingValue(
+                (com.sun.jdi.Value) jdiProxy(com.sun.jdi.ObjectReference.class, objAns))),
+                "track preview object shallow, no walk");
+        // -- frameIdentity: type+method+signature (overloads differ), nulls
+        // degrade to "?", never null.
+        check("com.Foo#run()V".equals(
+                BridgeSession.frameIdentity("com.Foo", "run", "()V")),
+                "identity with signature");
+        check("com.Foo#run".equals(
+                BridgeSession.frameIdentity("com.Foo", "run", null)),
+                "identity without signature");
+        check(!BridgeSession.frameIdentity("com.Foo", "run", "()V").equals(
+                BridgeSession.frameIdentity("com.Foo", "run", "(I)V")),
+                "identity distinguishes overloads");
+        check("?#?".equals(BridgeSession.frameIdentity(null, null, null)),
+                "identity nulls degrade");
+        // -- degradeTrack: unknown total (null), exactly one class-only
+        // stderr warning, and the warning matches the response fragment.
+        SessionState dg = state("launch");
+        dg.thread = null;
+        java.io.PrintStream keepErr = System.err;
+        java.io.ByteArrayOutputStream errBuf = new java.io.ByteArrayOutputStream();
+        System.setErr(new java.io.PrintStream(errBuf));
+        try {
+            BridgeSession.degradeTrack(dg, "IllegalStateException", null);
+        } finally {
+            System.setErr(keepErr);
+        }
+        String errText = errBuf.toString(java.nio.charset.StandardCharsets.UTF_8);
+        int warnLines = 0;
+        for (String ln : errText.split("\n")) {
+            if (ln.contains("warn: change tracking degraded")) warnLines++;
+        }
+        check(warnLines == 1, "degrade warns once, got: " + errText.trim());
+        check(dg.lastChangeTracking.contains("\"total\":null")
+                && dg.lastChangeTracking.contains("\"scanned\":0"),
+                "degrade total null, got: " + dg.lastChangeTracking);
+        check(dg.lastTrackWarn != null
+                && dg.lastTrackWarn.contains("IllegalStateException")
+                && BridgeSession.changeFieldsJson(dg).contains(
+                        JdiBridge.quote(dg.lastTrackWarn)),
+                "degrade warn matches response");
 
         if (failures > 0) {
             System.out.println("M7JavaCheck: " + failures + " FAILURES");

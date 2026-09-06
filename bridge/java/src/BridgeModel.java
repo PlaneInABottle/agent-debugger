@@ -115,6 +115,15 @@ class SessionState {
         volatile boolean closing = false; // close accepted: further cmds fail fast
         Map<String, String> lastTop; // top-frame locals at previous stop
         String lastChanged = "[]"; // JSON array of new/changed local names
+        String lastFunc = null; // frame identity of the previous scan
+        String lastRemoved = "[]"; // JSON array of removed names (complete scans only)
+        boolean lastChangedComplete = false; // both scans exhaustive, same frame
+        String lastChangeTracking = // pre-rendered {complete,scanned,total,truncated,reason?}
+                "{\"complete\":false,\"scanned\":0,\"total\":null,\"truncated\":false,"
+                + "\"reason\":\"first-snapshot\"}";
+        String lastTrackWarn = null; // class-only warning when incomplete
+        boolean lastTrackComplete = false; // was previous scan exhaustive
+        String lastTrackReason = "first-snapshot"; // reason when incomplete
         String stopInfo; // JSON object describing WHY we stopped (watch/exit/exception)
         java.util.Set<String> planted = new java.util.HashSet<>(); // classes already planted
         Path dir; // session dir (logs.jsonl lives here)

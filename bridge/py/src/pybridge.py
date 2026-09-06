@@ -32,6 +32,13 @@ import time
 MAX_STRING = 200
 MAX_FIELDS = 20
 MAX_VARS = 20
+# Display-independent change tracking bound: top-level values scanned per
+# frame for changed/removed detection (same on all adapters). The vars
+# display cap (MAX_VARS=20 + sentinel) is unchanged and independent.
+CHANGE_TRACK_MAX = 256
+# Shallow tracking preview cap (chars) for one value; no recursive child
+# fetch, no getters, no target eval.
+TRACK_PREVIEW = 200
 MAX_FRAMES = 10
 MAX_THREADS = 8
 MAX_OUTPUT = 4000
@@ -835,6 +842,14 @@ class ChildTarget:
         self.last_top = None
         self.last_func = None
         self.last_changed = "[]"
+        self.last_removed = "[]"
+        self.last_changed_complete = False
+        self.last_change_tracking = {"complete": False, "scanned": 0,
+                                      "total": None, "truncated": False,
+                                      "reason": "first-snapshot"}
+        self.last_track_warn = None
+        self.last_track_complete = False  # was previous scan exhaustive
+        self.last_track_reason = "first-snapshot"  # reason when incomplete
         self.logpoints = []  # inherited snapshot (resend companions)
         self._awaiting_continued = False
         self._suspects = []
@@ -858,6 +873,14 @@ class Session:
         self.last_top = None
         self.last_func = None
         self.last_changed = "[]"
+        self.last_removed = "[]"
+        self.last_changed_complete = False
+        self.last_change_tracking = {"complete": False, "scanned": 0,
+                                      "total": None, "truncated": False,
+                                      "reason": "first-snapshot"}
+        self.last_track_warn = None
+        self.last_track_complete = False  # was previous scan exhaustive
+        self.last_track_reason = "first-snapshot"  # reason when incomplete
         self.stop_info = None
         self.output_tail = ""
         self.log_count = 0
@@ -985,7 +1008,10 @@ class Session:
     def _swap_fields(self, dst, src):
         """Exchange park/DAP fields between main (self) and a child."""
         for f in ("dap", "thread_id", "frames", "suspended", "stop_info",
-                  "last_top", "last_func", "last_changed", "stop_states",
+                  "last_top", "last_func", "last_changed", "last_removed",
+                  "last_changed_complete", "last_change_tracking",
+                  "last_track_warn", "last_track_complete",
+                  "last_track_reason", "stop_states",
                   "_hitkeys", "_awaiting_continued", "_suspects", "_co_seen",
                   "_suspect_warned"):
             dst_v, src_v = getattr(dst, f), getattr(src, f)
@@ -1320,78 +1346,298 @@ class Session:
                 "frames": self.frames_json(True),
                 "output": self.output_tail[-MAX_OUTPUT:]}
 
-    def track_changes(self):
-        # Resilient change tracking: frame_locals() appends a truncation
-        # sentinel {"name": "…", "note": "+N more"} once locals exceed
-        # MAX_VARS — the sentinel carries no "value" key, and malformed
-        # entries must never crash the park (KeyError:'value' regression).
-        # Only real local entries (dict, string name, non-sentinel, with a
-        # value) are tracked; everything else is safely skipped. The
-        # stable formatted value string from frame_locals is retained.
-        # This method never raises: any failure degrades to an empty
-        # baseline with a sanitized class-only warning (no variable
-        # data/secrets), so _park_stop always completes.
+    def _track_preview(self, value):
+        """Shallow tracking preview: raw value string capped at
+        TRACK_PREVIEW chars. Never fetches children, never invokes."""
         try:
-            entries = self.frame_locals(0)
-        except BridgeErr:
-            entries = []
-        except Exception as e:
-            try:
-                sys.stderr.write(
-                    f"warn: change tracking degraded "
-                    f"({type(e).__name__})\n")
-            except Exception:
-                pass
-            entries = []
-        cur = {}
-        try:
-            for v in entries or []:
-                try:
-                    if not isinstance(v, dict):
-                        continue
-                    name = v.get("name")
-                    if (not isinstance(name, str) or name == "…"
-                            or "value" not in v):
-                        continue
-                    val = v.get("value")
-                    cur[name] = val if isinstance(val, str) else str(val)
-                except Exception:
-                    continue
-        except Exception as e:
-            try:
-                sys.stderr.write(
-                    f"warn: change tracking degraded "
-                    f"({type(e).__name__})\n")
-            except Exception:
-                pass
-            cur = {}
-        try:
-            func = self.frames[0].get("name", "?") if self.frames else "?"
+            s = value if isinstance(value, str) else str(value)
         except Exception:
-            func = "?"
+            s = "?"
+        if len(s) > TRACK_PREVIEW:
+            s = f"{s[:TRACK_PREVIEW]}… (+{len(s) - TRACK_PREVIEW} more chars)"
+        return s
+
+    @staticmethod
+    def _track_func_id(frame):
+        """Frame identity for change comparison: source path + function
+        name. Same-named functions in different files must never compare
+        silently (the stored baseline belongs to one frame identity).
+        Degrades gracefully when the frame or its source is missing."""
         try:
-            last = self.last_top if isinstance(self.last_top, dict) else None
-            if last is None or getattr(self, "last_func", None) != func:
-                changed = sorted(cur)
-            else:
-                changed = sorted(n for n, v in cur.items()
-                                 if last.get(n) != v)
-        except Exception as e:
+            name = frame.get("name", "?") if isinstance(frame, dict) else "?"
+        except Exception:
+            name = "?"
+        try:
+            src = frame.get("source") if isinstance(frame, dict) else None
+            path = src.get("path") if isinstance(src, dict) else None
+        except Exception:
+            path = None
+        if not isinstance(name, str) or not name:
+            name = "?"
+        if isinstance(path, str) and path:
+            return f"{path}#{name}"
+        return name
+
+    def _track_valid_names(self, raws):
+        """Valid tracking records: dict, string name, non-sentinel,
+        non-pseudo, carrying a value. Malformed records are skipped
+        safely (never a park crash)."""
+        names = {}
+        for v in raws or []:
             try:
-                sys.stderr.write(
-                    f"warn: change tracking degraded "
-                    f"({type(e).__name__})\n")
+                if not isinstance(v, dict):
+                    continue
+                name = v.get("name")
+                if (not isinstance(name, str) or name == "…"
+                        or name in self.PSEUDO_SCOPES
+                        or "value" not in v):
+                    continue
+                if name in names:
+                    continue
+                names[name] = self._track_preview(v.get("value"))
             except Exception:
-                pass
-            changed = []
-            cur = {}
-        # Coherent baseline so the next change is not a false explosion.
+                continue
+        return names
+
+    def _track_globals_raws(self, scopes):
+        """One-level Globals expansion with the display's precedence:
+        pseudo containers expand one level, `special variables` skipped,
+        dunder names filtered. Raises BridgeErr on fetch failure (the
+        scan degrades to tracking-error, never partial silence)."""
+        ref = scopes["Globals"].get("variablesReference", 0)
+        top = self.fetch_variables(ref)
+        raws = []
+        for v in top or []:
+            if not isinstance(v, dict):
+                continue
+            name = v.get("name", "")
+            if name == "special variables":
+                continue
+            is_pseudo = (isinstance(name, str)
+                         and name in self.PSEUDO_SCOPES)
+            if is_pseudo and v.get("variablesReference"):
+                kids = self.fetch_variables(v["variablesReference"])
+                raws.extend(
+                    c for c in (kids or [])
+                    if isinstance(c, dict)
+                    and (not isinstance(c.get("name"), str)
+                         or c.get("name") not in self.PSEUDO_SCOPES))
+            elif not is_pseudo:
+                raws.append(v)
+        return [v for v in raws
+                if not (isinstance(v.get("name"), str)
+                        and v.get("name", "").startswith("__"))]
+
+    def track_snapshot(self):
+        """Display-independent tracking scan of frame 0.
+
+        Mirrors the display scope precedence (Locals, falling back to
+        Globals only when Locals yields zero valid tracking entries —
+        empty, all pseudo, or all malformed) with the same one-level
+        pseudo expansion, but scans up to CHANGE_TRACK_MAX valid
+        top-level values with shallow previews — never the
+        display-capped frame_locals path, never fmt_dap_value child
+        fetches, never target eval. Only the chosen scope feeds the
+        scan (no double counting); total/scanned describe that scope.
+
+        Returns (ordered_map, total, truncated, reason_or_None). reason is
+        None when the scan is exhaustive, else "truncated" (total over the
+        cap) or "tracking-error". total is None when the scan itself
+        failed (unknown, never 0). Malformed records are skipped safely.
+        Raises nothing: fetch failures return ({}, None, False,
+        "tracking-error") — callers still warn class-only."""
+        valid = {}
+        total = None
+        truncated = False
+        reason = None
+        try:
+            try:
+                fid = self.top_frame_id(0)
+            except BridgeErr:
+                return {}, None, False, "tracking-error"
+            body = self.dap_request("scopes", {"frameId": fid})
+            raw_scopes = body.get("scopes", []) if isinstance(body, dict) else []
+            if not isinstance(raw_scopes, list):
+                raw_scopes = []
+            scopes = {s.get("name"): s for s in raw_scopes
+                      if isinstance(s, dict)}
+            raws = None
+            if "Locals" in scopes:
+                try:
+                    ref = scopes["Locals"].get("variablesReference", 0)
+                    locals_raws = self.fetch_variables(ref)
+                except BridgeErr:
+                    return {}, None, False, "tracking-error"
+                if self._track_valid_names(locals_raws):
+                    raws = locals_raws
+            if raws is None and "Globals" in scopes:
+                try:
+                    raws = self._track_globals_raws(scopes)
+                except BridgeErr:
+                    return {}, None, False, "tracking-error"
+            if raws is None:
+                raws = locals_raws if "Locals" in scopes else []
+            # Valid records: dict, string name, non-sentinel, non-pseudo.
+            # Raw DAP variables carry "value"; a missing value is skipped
+            # (malformed) rather than crashing the park.
+            names = self._track_valid_names(raws)
+            total = len(names)
+            truncated = total > CHANGE_TRACK_MAX
+            if truncated:
+                reason = "truncated"
+            for name in sorted(names)[:CHANGE_TRACK_MAX]:
+                valid[name] = names[name]
+            return valid, total, truncated, reason
+        except Exception:
+            return {}, None, False, "tracking-error"
+
+    def track_changes(self):
+        # Display-independent change tracking (MAX_VARS display cap and its
+        # value-less "…" sentinel never feed this path — the scanner above
+        # reads raw DAP variables up to CHANGE_TRACK_MAX=256 with shallow
+        # previews, one scope/variables fetch level, no child expansion).
+        #
+        # Contract (uniform on all adapters):
+        # - changed: sorted value-changes + new names on complete scans.
+        # - removed: sorted names missing from the current scan, complete
+        #   scans only; never asserted under incomplete tracking.
+        # - changedComplete: both previous and current scans exhaustive,
+        #   same function identity, no tracking error.
+        # - changeTracking {complete, scanned, total, truncated, reason?}:
+        #   reason in first-snapshot|function-changed|truncated|
+        #   tracking-error. Empty changed with complete=false is UNKNOWN
+        #   (not "no change").
+        # - First baseline / function change: changed=[] + complete=false
+        #   (no previous snapshot means no change comparison; never report
+        #   all locals as changed).
+        # - Incomplete/error: only value changes over the name intersection
+        #   of the scanned maps; added/removed suppressed; complete=false.
+        # - A baseline stored while incomplete can never make the NEXT
+        #   comparison complete; after a complete current baseline lands,
+        #   the following stop can become complete.
+        # Never raises: failures degrade to an empty baseline with a
+        # class-only warning (no variable data/secrets).
+        try:
+            cur, total, truncated, scan_reason = self.track_snapshot()
+        except Exception as e:
+            self._track_degraded(type(e).__name__, {}, None, False,
+                                 "tracking-error")
+            return
+        if scan_reason is not None and scan_reason != "truncated":
+            # Fetch-level failure inside the scan already returned {}; the
+            # warn below names the class only.
+            self._track_compare({}, total, truncated, scan_reason,
+                                degraded=True)
+            return
+        self._track_compare(cur, total, truncated, scan_reason,
+                            degraded=False)
+
+    def _track_warn(self, reason):
+        try:
+            sys.stderr.write(
+                f"warn: change tracking degraded ({reason})\n")
+        except Exception:
+            pass
+        return f"change tracking incomplete ({reason}); changed lists only certain value changes"
+
+    def _track_degraded(self, reason, cur, total, truncated, track_reason):
+        warn = self._track_warn(reason)
         self.last_top = cur
+        self.last_func = self._track_func_id(
+            self.frames[0] if self.frames else None)
+        self.last_changed = "[]"
+        self.last_removed = "[]"
+        self.last_changed_complete = False
+        self.last_track_complete = False
+        self.last_track_reason = track_reason
+        self.last_track_warn = warn
+        scanned = min(total, CHANGE_TRACK_MAX) if isinstance(total, int) else 0
+        tracking = {"complete": False, "scanned": scanned, "total": total,
+                    "truncated": truncated, "reason": track_reason}
+        self.last_change_tracking = tracking
+
+    def _track_compare(self, cur, total, truncated, scan_reason, degraded):
+        func = self._track_func_id(self.frames[0] if self.frames else None)
+        last = self.last_top if isinstance(self.last_top, dict) else None
+        prev_complete = bool(getattr(self, "last_track_complete", False))
+        prev_reason = getattr(self, "last_track_reason", "first-snapshot")
+        cur_complete = (scan_reason is None) and not degraded
+        scanned = min(total, CHANGE_TRACK_MAX) if isinstance(total, int) else 0
+        if last is None:
+            # No previous snapshot means no change comparison. A problem
+            # with the CURRENT scan (truncated/error) dominates the
+            # reason — it describes the stored baseline the next stop
+            # will compare against; first-snapshot only when the current
+            # scan itself is exhaustive.
+            reason = scan_reason if scan_reason is not None else (
+                "first-snapshot" if cur_complete else "tracking-error")
+            self._track_store(cur, func, [], [], False, scanned, total,
+                              truncated, reason, cur_complete, scan_reason,
+                              warn=True)
+            return
+        if getattr(self, "last_func", None) != func:
+            reason = scan_reason if scan_reason is not None else (
+                "function-changed" if cur_complete else "tracking-error")
+            self._track_store(cur, func, [], [], False, scanned, total,
+                              truncated, reason, cur_complete, scan_reason,
+                              warn=True)
+            return
+        if not prev_complete or not cur_complete:
+            # Intersection-only value changes; added/removed suppressed.
+            try:
+                changed = sorted(n for n, v in cur.items()
+                                 if n in last and last.get(n) != v)
+            except Exception:
+                changed = []
+            if not cur_complete:
+                reason = scan_reason or "tracking-error"
+            else:
+                reason = prev_reason or "truncated"
+            self._track_store(cur, func, changed, [], False, scanned, total,
+                              truncated, reason, cur_complete, scan_reason,
+                              warn=True)
+            return
+        try:
+            changed = sorted(n for n, v in cur.items()
+                             if not (n in last and last.get(n) == v))
+            removed = sorted(n for n in last if n not in cur)
+        except Exception as e:
+            self._track_degraded(type(e).__name__, cur if isinstance(
+                cur, dict) else {}, total, truncated, "tracking-error")
+            return
+        self._track_store(cur, func, changed, removed, True, scanned, total,
+                          truncated, None, True, None, warn=False)
+
+    def _track_store(self, cur, func, changed, removed, complete, scanned,
+                     total, truncated, reason, cur_complete, scan_reason,
+                     warn):
+        self.last_top = cur if isinstance(cur, dict) else {}
         self.last_func = func
         try:
             self.last_changed = json.dumps(changed)
         except Exception:
             self.last_changed = "[]"
+            changed = []
+        try:
+            self.last_removed = json.dumps(removed)
+        except Exception:
+            self.last_removed = "[]"
+        self.last_changed_complete = bool(complete)
+        self.last_track_complete = bool(cur_complete)
+        self.last_track_reason = scan_reason if scan_reason is not None else (
+            None if cur_complete else reason)
+        # Any incomplete state carries the class-only warning (unknown,
+        # never "no change"); complete scans stay quiet. Every incomplete
+        # branch passes warn=True, so exactly one warning is written here.
+        if warn:
+            self.last_track_warn = self._track_warn(reason)
+        else:
+            self.last_track_warn = None
+        tracking = {"complete": bool(complete), "scanned": scanned,
+                    "total": total, "truncated": bool(truncated)}
+        if reason is not None and not complete:
+            tracking["reason"] = reason
+        self.last_change_tracking = tracking
 
     def count_hits(self, reason, frame=None):
         """Attribute a stop to the records it fired (served as `hits` by
@@ -2739,20 +2985,26 @@ class Session:
         try:
             self.track_changes()
         except Exception as e:
-            try:
-                func = (self.frames[0].get("name", "?")
-                        if self.frames else "?")
-            except Exception:
-                func = "?"
             self.last_top = {}
-            self.last_func = func
+            self.last_func = self._track_func_id(
+                self.frames[0] if self.frames else None)
             self.last_changed = "[]"
+            self.last_removed = "[]"
+            self.last_changed_complete = False
+            self.last_track_complete = False
+            self.last_track_reason = "tracking-error"
+            self.last_change_tracking = {"complete": False, "scanned": 0,
+                                          "total": None, "truncated": False,
+                                          "reason": "tracking-error"}
             try:
                 sys.stderr.write(
                     f"warn: change tracking degraded "
                     f"({type(e).__name__})\n")
             except Exception:
                 pass
+            self.last_track_warn = (
+                "change tracking incomplete (tracking-error); "
+                "changed lists only certain value changes")
         self.count_hits(reason)
         self.publish_state(True)
         self._stop_seq += 1
@@ -3046,6 +3298,38 @@ class Session:
                         and n not in noise})
         return f"{path}: held by {clean} (direct referrer types)"
 
+    def _change_fields(self):
+        """Additive change-tracking response fields (uniform contract).
+
+        changed stays sorted/deterministic; removed is sorted (complete
+        scans only, else []); changedComplete names certainty; empty
+        changed with changedComplete=false is UNKNOWN, not no-change.
+        trackingWarning rides only when incomplete (class-only, no
+        values/secrets). Never raises."""
+        try:
+            changed = json.loads(self.last_changed)
+            if not isinstance(changed, list):
+                changed = []
+        except Exception:
+            changed = []
+        try:
+            removed = json.loads(getattr(self, "last_removed", "[]"))
+            if not isinstance(removed, list):
+                removed = []
+        except Exception:
+            removed = []
+        complete = bool(getattr(self, "last_changed_complete", False))
+        tracking = getattr(self, "last_change_tracking", None)
+        if not isinstance(tracking, dict):
+            tracking = {"complete": complete, "scanned": 0, "total": None,
+                        "truncated": False}
+        out = {"changed": changed, "removed": removed,
+               "changedComplete": complete, "changeTracking": tracking}
+        warn = getattr(self, "last_track_warn", None)
+        if warn and not complete:
+            out["trackingWarning"] = warn
+        return out
+
     def _resume_and_wait(self, timeout, tid="main"):
         """Resume one target after step/continue and wait for the next stop
         on ANY target. The response names the target that actually parked
@@ -3092,11 +3376,11 @@ class Session:
             with self._TargetScope(self, stopped):
                 snap = self.snapshot()
                 resp = {"ok": True, "stopped": True,
-                        "changed": json.loads(self.last_changed),
                         "stopInfo": json.loads(self.stop_info or "null"),
                         "snapshot": snap,
                         "diag": self._stop_diag(stopped, snap.get("threads")),
                         "warning": PARK_WARNING}
+                resp.update(self._change_fields())
             return self.stamp(resp, stopped)
         finally:
             self._pending_target = None
@@ -3182,11 +3466,11 @@ class Session:
         this helper issues zero DAP resume traffic)."""
         snap = self.snapshot()
         resp = {"ok": True, "stopped": True, "waited": waited,
-                "changed": json.loads(self.last_changed),
                 "stopInfo": json.loads(self.stop_info or "null"),
                 "snapshot": snap,
                 "diag": self._stop_diag(tid, snap.get("threads")),
                 "warning": PARK_WARNING}
+        resp.update(self._change_fields())
         return self.stamp(resp, tid)
 
     def _parked_now(self):

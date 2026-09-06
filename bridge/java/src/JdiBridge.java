@@ -74,6 +74,11 @@ public class JdiBridge {
     static final int MAX_VARS = 20;
     static final int MAX_FRAMES = 10;
     static final int MAX_OUTPUT = 4000;
+    // Display-independent change tracking bound: top-level values scanned
+    // per frame for changed/removed detection (same on all adapters). The
+    // vars display cap (MAX_VARS=20 + sentinel) is unchanged and
+    // independent.
+    static final int CHANGE_TRACK_MAX = 256;
 
     public static void main(String[] argv) {
         try {

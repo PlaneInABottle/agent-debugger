@@ -248,21 +248,192 @@ test('node capture: collection failure still resumes', async () => {
   assert.ok(order.includes('Debugger.resume'));
 });
 
-test('node trackChanges skips sentinel and malformed, keeps stable strings', async () => {
-  const st = nodeSession(tmpdir('wc-node-'));
-  st.frameLocalsIn = async () => ([
-    { name: 'a', type: 'int', value: '1' },
-    { name: '…', note: '+9 more' },
-    { name: 'novalue', type: 'int' },
-    { name: 42, value: 'x' },
-    null,
-    'junk',
-    { name: 'n', type: 'null', value: null },
-  ]);
-  await st.trackChanges([{ functionName: 'handler' }]);
-  assert.deepEqual(JSON.parse(st.lastChanged).sort(), ['a', 'n']);
-  assert.ok(!('…' in st.lastTop));
-});
+for (const [name, mkSession] of [['node', nodeSession], ['browser', browserSession]]) {
+  const cdNum = (n, v) => ({ name: n, value: { type: 'number', value: v, description: String(v) } });
+  const framesFor = (fn = 'handler') => [{ functionName: fn }];
+
+  test(`${name} trackChanges: first baseline empty+unknown, skips malformed`, async () => {
+    const st = mkSession(tmpdir('wc-tc-'));
+    st.trackingProps = async () => ([
+      cdNum('a', 1),
+      { name: '…', value: { type: 'number', value: 0, description: '0' } },
+      { name: 42, value: { type: 'number', value: 0, description: '0' } },
+      null,
+      'junk',
+      { name: 'acc', get: { type: 'function' } },
+      { name: 'n', value: null },
+    ]);
+    st.frameLocalsIn = async () => ([{ name: 'a', type: 'number', value: '1' }]);
+    await st.trackChanges(framesFor());
+    assert.deepEqual(JSON.parse(st.lastChanged), []);
+    assert.deepEqual(JSON.parse(st.lastRemoved), []);
+    assert.equal(st.lastChangedComplete, false);
+    assert.equal(st.lastChangeTracking.reason, 'first-snapshot');
+    assert.equal(st.lastChangeTracking.scanned, 3);
+    assert.equal(st.lastChangeTracking.total, 3);
+    assert.deepEqual(Object.keys(st.lastTop).sort(), ['a', 'acc', 'n']);
+    assert.ok(!('…' in st.lastTop));
+    assert.ok(st.changeFields().trackingWarning);
+  });
+
+  test(`${name} trackChanges: second stop detects change+removal, complete`, async () => {
+    const st = mkSession(tmpdir('wc-tc-'));
+    let props = [cdNum('a', 1), cdNum('gone', 9)];
+    st.trackingProps = async () => props;
+    st.frameLocalsIn = async () => [];
+    await st.trackChanges(framesFor());
+    assert.equal(st.lastChangedComplete, false);
+    props = [cdNum('a', 2), cdNum('b', 3)];
+    await st.trackChanges(framesFor());
+    assert.deepEqual(JSON.parse(st.lastChanged), ['a', 'b']);
+    assert.deepEqual(JSON.parse(st.lastRemoved), ['gone']);
+    assert.equal(st.lastChangedComplete, true);
+    assert.ok(!('reason' in st.lastChangeTracking));
+    assert.ok(!('trackingWarning' in st.changeFields()));
+    // No-op third stop: complete with empty changed (real no-change).
+    await st.trackChanges(framesFor());
+    assert.deepEqual(JSON.parse(st.lastChanged), []);
+    assert.equal(st.lastChangedComplete, true);
+  });
+
+  test(`${name} trackChanges: outside display window still detected, complete`, async () => {
+    const st = mkSession(tmpdir('wc-tc-'));
+    let totalVal = 11;
+    st.trackingProps = async () => ([
+      ...Array.from({ length: 30 }, (_, k) => cdNum(`v${k}`, k)),
+      cdNum('total', totalVal),
+    ]);
+    // Display stays capped at MAX_VARS + sentinel, independent of tracking.
+    st.frameLocalsIn = async () => ([
+      ...Array.from({ length: 20 }, (_, k) => ({ name: `v${k}`, type: 'number', value: `${k}` })),
+      { name: '…', note: '+11 more' },
+    ]);
+    const frames = framesFor();
+    await st.trackChanges(frames);
+    assert.deepEqual(JSON.parse(st.lastChanged), []);
+    totalVal = 12;
+    await st.trackChanges(frames);
+    assert.deepEqual(JSON.parse(st.lastChanged), ['total']);
+    assert.equal(st.lastChangedComplete, true);
+    assert.equal(st.lastChangeTracking.total, 31);
+    assert.deepEqual(st.cachedLocals[st.cachedLocals.length - 1].name, '…');
+  });
+
+  test(`${name} trackChanges: over 256 truncated, intersection only`, async () => {
+    const st = mkSession(tmpdir('wc-tc-'));
+    let v000 = 0;
+    st.trackingProps = async () => ([
+      ...Array.from({ length: 300 }, (_, k) => cdNum(`v${String(k).padStart(3, '0')}`, k === 0 ? v000 : k)),
+      cdNum('wobble', 0),
+    ]);
+    st.frameLocalsIn = async () => [];
+    await st.trackChanges(framesFor());
+    assert.equal(st.lastChangedComplete, false);
+    assert.equal(st.lastChangeTracking.reason, 'truncated');
+    assert.equal(st.lastChangeTracking.total, 301);
+    assert.equal(st.lastChangeTracking.scanned, 256);
+    assert.deepEqual(JSON.parse(st.lastChanged), []);
+    // v000 sorts inside the scanned window: its change is reported, but
+    // added/removed stay suppressed and tracking stays incomplete.
+    v000 = 1;
+    await st.trackChanges(framesFor());
+    assert.deepEqual(JSON.parse(st.lastChanged), ['v000']);
+    assert.deepEqual(JSON.parse(st.lastRemoved), []);
+    assert.equal(st.lastChangedComplete, false);
+    assert.equal(st.lastChangeTracking.reason, 'truncated');
+  });
+
+  test(`${name} trackChanges: function change resets baseline`, async () => {
+    const st = mkSession(tmpdir('wc-tc-'));
+    st.trackingProps = async () => ([cdNum('a', 1)]);
+    st.frameLocalsIn = async () => [];
+    await st.trackChanges(framesFor('handler'));
+    st.trackingProps = async () => ([cdNum('a', 2)]);
+    await st.trackChanges(framesFor('other'));
+    assert.deepEqual(JSON.parse(st.lastChanged), []);
+    assert.equal(st.lastChangedComplete, false);
+    assert.equal(st.lastChangeTracking.reason, 'function-changed');
+    await st.trackChanges(framesFor('other'));
+    assert.deepEqual(JSON.parse(st.lastChanged), []);
+    assert.equal(st.lastChangedComplete, true);
+  });
+
+  test(`${name} trackChanges: fetch error degrades class-only, park fields intact`, async () => {
+    const st = mkSession(tmpdir('wc-tc-'));
+    st.trackingProps = async () => { throw new TypeError('synthetic secret=zzz'); };
+    st.frameLocalsIn = async () => [];
+    await st.trackChanges(framesFor());
+    assert.deepEqual(JSON.parse(st.lastChanged), []);
+    assert.equal(st.lastChangedComplete, false);
+    assert.equal(st.lastChangeTracking.reason, 'tracking-error');
+    // Unknown scan: total null (not 0), scanned 0.
+    assert.equal(st.lastChangeTracking.total, null);
+    assert.equal(st.lastChangeTracking.scanned, 0);
+    const warn = st.changeFields().trackingWarning;
+    assert.ok(warn);
+    assert.ok(!warn.includes('synthetic') && !warn.includes('zzz'));
+    // Display cache cleared too (no stale previous-stop locals).
+    assert.deepEqual(st.cachedLocals, []);
+  });
+
+  test(`${name} trackChanges: display failure clears cache, tracking still true`, async () => {
+    const st = mkSession(tmpdir('wc-tc-'));
+    let aval = 1;
+    st.trackingProps = async () => ([cdNum('a', aval)]);
+    st.frameLocalsIn = async () => ([{ name: 'a', type: 'number', value: String(aval) }]);
+    const frames = framesFor();
+    await st.trackChanges(frames);
+    assert.equal(st.cachedLocals.length, 1);
+    // Second stop at a new location: tracking fetch succeeds but the
+    // display fetch fails — the cache must be empty, never the previous
+    // stop's locals, while tracking still compares truthfully.
+    st.frameLocalsIn = async () => { throw new Error('CDP display flake'); };
+    aval = 2;
+    await st.trackChanges(frames);
+    assert.deepEqual(st.cachedLocals, []);
+    assert.deepEqual(JSON.parse(st.lastChanged), ['a']);
+    assert.equal(st.lastChangedComplete, true);
+    assert.equal(st.lastChangeTracking.total, 1);
+  });
+
+  test(`${name} trackChanges: exactly one stderr warning per failure`, async () => {
+    const st = mkSession(tmpdir('wc-tc-'));
+    const writes = [];
+    const orig = process.stderr.write;
+    process.stderr.write = (s) => { writes.push(String(s)); return true; };
+    try {
+      st.trackingProps = async () => { throw new Error('boom'); };
+      st.frameLocalsIn = async () => [];
+      await st.trackChanges(framesFor());
+      st.degradeTrack('Error', null, framesFor());
+    } finally {
+      process.stderr.write = orig;
+    }
+    const warns = writes.filter((s) => s.includes('warn: change tracking degraded'));
+    assert.equal(warns.length, 2, JSON.stringify(writes));
+    // lastTrackWarn matches the response's trackingWarning.
+    assert.equal(st.changeFields().trackingWarning, st.lastTrackWarn);
+  });
+
+  test(`${name} trackChanges: same function name, different script is a change`, async () => {
+    const st = mkSession(tmpdir('wc-tc-'));
+    st.trackingProps = async () => ([cdNum('a', 1)]);
+    st.frameLocalsIn = async () => [];
+    const at = (scriptId) => ([{ functionName: 'handler', url: 'u', location: { scriptId } }]);
+    await st.trackChanges(at('s1'));
+    // Same functionName in another script: unknown, never a silent
+    // cross-function comparison.
+    st.trackingProps = async () => ([cdNum('a', 2)]);
+    await st.trackChanges(at('s2'));
+    assert.deepEqual(JSON.parse(st.lastChanged), []);
+    assert.equal(st.lastChangedComplete, false);
+    assert.equal(st.lastChangeTracking.reason, 'function-changed');
+    // Same script again: compares truthfully.
+    await st.trackChanges(at('s2'));
+    assert.deepEqual(JSON.parse(st.lastChanged), []);
+    assert.equal(st.lastChangedComplete, true);
+  });
+}
 
 test('node onPaused degrades when change tracking throws, park stands', async () => {
   const dir = tmpdir('wc-node-');
@@ -699,21 +870,9 @@ test('browser setupFailurePayload maps the real setup catch', () => {
   assert.match(p.error, /^internal: Error: bug/);
 });
 
-test('browser trackChanges skips sentinel and malformed, keeps stable strings', async () => {
-  const st = browserSession(tmpdir('wc-br-'));
-  st.frameLocalsIn = async () => ([
-    { name: 'a', type: 'string', value: '1' },
-    { name: '…', note: '+9 more' },
-    { name: 'novalue', type: 'int' },
-    { name: 42, value: 'x' },
-    null,
-    'junk',
-    { name: 'n', type: 'null', value: null },
-  ]);
-  await st.trackChanges([{ functionName: 'handler' }]);
-  assert.deepEqual(JSON.parse(st.lastChanged).sort(), ['a', 'n']);
-  assert.ok(!('…' in st.lastTop));
-});
+// (Node/browser parity suite above covers trackChanges: first-baseline,
+// change/removal, outside-window, truncation, function-change, and error
+// paths for both bridges.)
 
 test('browser onPaused degrades when change tracking throws, park stands', async () => {
   const st = browserSession(tmpdir('wc-br-'));

@@ -2452,6 +2452,74 @@ class LiveTests(unittest.TestCase):
             except KeyError:
                 pass
 
+    def test_36_track_outside_display_window_py_and_node(self):
+        """Display-independent change tracking, live: 30 frame locals
+        (past the MAX_VARS=20 display cap) with `total` outside the
+        first-20 window changing 11 -> 12 between two stops. The second
+        stop reports total in changed with changedComplete=true, while
+        vars/capture stay capped 20 + sentinel. First baseline is []
+        + first-snapshot (unknown, never all-locals-as-changed)."""
+        if shutil.which("node") is None:
+            raise unittest.SkipTest("node unavailable")
+        cases = []
+        py_prog = self.fixture / "track30.py"
+        py_lines = ["import time"]
+        for k in range(30):
+            py_lines.append(f"v{k:02d} = {k}")
+        py_lines += ['total = 11', 'print("ready", flush=True)',
+                     'total = 12', 'print(total, flush=True)',
+                     'time.sleep(30)']
+        py_prog.write_text("\n".join(py_lines) + "\n")
+        cases.append(("py", "track36-py", str(py_prog),
+                      len(py_lines) - 3, len(py_lines) - 1))
+        js_prog = self.fixture / "track30.js"
+        js_lines = []
+        for k in range(30):
+            js_lines.append(f"let v{k:02d} = {k};")
+        js_lines += ['let total = 11;', 'console.log("ready");',
+                     'total = 12;', 'console.log(total);',
+                     'setTimeout(() => {}, 30000);']
+        js_prog.write_text("\n".join(js_lines) + "\n")
+        cases.append(("node", "track36-node", str(js_prog),
+                      len(js_lines) - 3, len(js_lines) - 1))
+        for lang, name, prog, b1, b2 in cases:
+            self.sessions.add(name)
+            try:
+                data = self.cli(name, lang, "start", prog,
+                                "--break", f"{prog}:{b1}",
+                                "--break", f"{prog}:{b2}", "--timeout", "20")
+                self.assertEqual(data["location"]["line"], b1)
+                locs = data["frames"][0]["locals"]
+                self.assertEqual(locs[-1]["name"], "\u2026")
+                self.assertEqual(len([v for v in locs
+                                      if v["name"] != "\u2026"]), 20)
+                parked = self.cli(name, "wait", "--timeout", "5")
+                self.assertEqual(parked["changed"], [])
+                self.assertFalse(parked["changedComplete"])
+                self.assertEqual(parked["changeTracking"]["reason"],
+                                 "first-snapshot")
+                self.assertIn("trackingWarning", parked)
+                resumed = self.cli(name, "continue", "--timeout", "20")
+                self.assertEqual(resumed["snapshot"]["location"]["line"], b2)
+                self.assertEqual(resumed["changed"], ["total"])
+                self.assertEqual(resumed["removed"], [])
+                self.assertTrue(resumed["changedComplete"])
+                self.assertFalse(
+                    resumed["changeTracking"]["truncated"])
+                self.assertNotIn("trackingWarning", resumed)
+                cap = self.cli(name, "capture", "--timeout", "10")
+                cap_locs = cap["snapshot"]["frames"][0]["locals"]
+                self.assertEqual(cap_locs[-1]["name"], "\u2026")
+            finally:
+                try:
+                    self.cli(name, "close", timeout=85)
+                except Exception:
+                    pass
+                try:
+                    self.sessions.remove(name)
+                except KeyError:
+                    pass
+
     def _m1_target(self, lang, port):
         if lang == "py":
             return [str(VENV_PY), "-Xfrozen_modules=off", "-m", "debugpy",

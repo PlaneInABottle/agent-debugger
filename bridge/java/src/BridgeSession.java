@@ -273,42 +273,296 @@ class BridgeSession {
     // Read-only allowlist for calls inside conditions (a mutating call run on
     // every loop iteration would corrupt state silently).
 
+    /** Frame identity for change comparison: declaring type + method +
+     *  signature. Same-named overloads (or same-named methods in
+     *  different types) must never compare silently. Pure string
+     *  function for unit tests; the JDI extraction below degrades to
+     *  "?" when metadata is unreadable. */
+    static String frameIdentity(String type, String method, String sig) {
+        String t = type != null ? type : "?";
+        String m = method != null ? method : "?";
+        String id = t + "#" + m;
+        if (sig != null) id += sig;
+        return id;
+    }
+
+    /** Best-effort identity of a live frame ("?" when unreadable). */
+    static String frameIdentityOf(StackFrame f) {
+        try {
+            Location loc = f.location();
+            String t = loc.declaringType().name();
+            com.sun.jdi.Method mm = loc.method();
+            return frameIdentity(t, mm != null ? mm.name() : null,
+                    mm != null ? mm.signature() : null);
+        } catch (Exception ignored) {
+            return "?";
+        }
+    }
+
     static void trackChanges(SessionState st) {
+        // Display-independent change tracking (MAX_VARS display cap and
+        // its "…" sentinel never feed this path — visibleVariables are
+        // scanned up to CHANGE_TRACK_MAX=256 with shallow top-level
+        // previews (formatTrackingValue: no field walk, no element
+        // fetch, never invoke target code).
+        //
+        // Contract (uniform on all adapters): changed holds sorted
+        // value-changes + new names on complete scans; removed holds
+        // sorted missing names on complete scans only (never asserted
+        // under incomplete tracking); changedComplete is true only when
+        // both previous and current scans are exhaustive with the same
+        // frame identity and no tracking error; changeTracking carries
+        // {complete,scanned,total,truncated,reason?} with reason in
+        // first-snapshot|function-changed|truncated|tracking-error. Empty
+        // changed with complete=false is UNKNOWN, not no-change. First
+        // baseline / function change stores changed=[] + complete=false
+        // (no previous snapshot means no change comparison — never report
+        // all locals as changed). Incomplete/error reports only value
+        // changes over the name intersection; added/removed suppressed. A
+        // baseline stored while incomplete can never make the NEXT
+        // comparison complete; after a complete current baseline lands,
+        // the following stop can become complete. Never throws: failures
+        // degrade to an empty baseline with a class-only stderr warning
+        // (no variable data/secrets), so the park always completes.
+        Map<String, String> cur = new LinkedHashMap<>();
+        Integer total = null;
+        boolean truncated = false;
+        String scanReason = null;
+        String func = "?";
+        boolean fetchOk = true;
         try {
             List<StackFrame> frames = BridgeSnapshot.safeFrames(st.thread);
-            Map<String, String> cur = new LinkedHashMap<>();
             if (!frames.isEmpty()) {
                 StackFrame f = frames.get(0);
+                func = frameIdentityOf(f);
                 try {
                     List<LocalVariable> vars = f.visibleVariables();
-                    for (Map.Entry<LocalVariable, Value> ve : f.getValues(vars).entrySet()) {
-                        cur.put(ve.getKey().name(), BridgeSnapshot.formatValue(ve.getValue(), 1));
+                    Map<LocalVariable, Value> vals = f.getValues(vars);
+                    java.util.TreeMap<String, String> sorted = new java.util.TreeMap<>();
+                    for (Map.Entry<LocalVariable, Value> ve : vals.entrySet()) {
+                        String name;
+                        try {
+                            name = ve.getKey().name();
+                        } catch (Exception ignored) {
+                            continue;
+                        }
+                        if (name == null) continue;
+                        String v;
+                        try {
+                            v = BridgeSnapshot.formatTrackingValue(ve.getValue());
+                        } catch (Throwable t) {
+                            v = "?";
+                        }
+                        sorted.put(name, v);
                     }
-                } catch (AbsentInformationException ignored) {}
-            }
-            StringBuilder sb = new StringBuilder("[");
-            boolean first = true;
-            if (st.lastTop == null) {
-                for (String name : cur.keySet()) {
-                    if (!first) sb.append(',');
-                    first = false;
-                    sb.append(JdiBridge.quote(name));
+                    total = sorted.size();
+                    truncated = total > JdiBridge.CHANGE_TRACK_MAX;
+                    scanReason = truncated ? "truncated" : null;
+                    int n = 0;
+                    for (Map.Entry<String, String> e : sorted.entrySet()) {
+                        if (n >= JdiBridge.CHANGE_TRACK_MAX) break;
+                        cur.put(e.getKey(), e.getValue());
+                        n++;
+                    }
+                } catch (AbsentInformationException aie) {
+                    fetchOk = false;
+                    scanReason = "tracking-error";
                 }
             } else {
+                fetchOk = false;
+                scanReason = "tracking-error";
+            }
+        } catch (Throwable t) {
+            // No explicit warning here: compareTrack below stores with
+            // warn=true, which writes exactly one class-only line.
+            fetchOk = false;
+            cur = new LinkedHashMap<>();
+            scanReason = "tracking-error";
+        }
+        boolean curComplete = fetchOk && scanReason == null;
+        try {
+            compareTrack(st, cur, func, total, truncated, scanReason, curComplete);
+        } catch (Throwable t) {
+            try {
+                System.err.println("warn: change tracking degraded ("
+                        + t.getClass().getSimpleName() + ")");
+            } catch (Exception ignored) {}
+            st.lastTop = new LinkedHashMap<>();
+            st.lastChanged = "[]";
+            st.lastRemoved = "[]";
+            st.lastChangedComplete = false;
+            st.lastTrackComplete = false;
+            st.lastTrackReason = "tracking-error";
+            st.lastTrackWarn = "change tracking incomplete (tracking-error); "
+                    + "changed lists only certain value changes";
+            st.lastChangeTracking = "{\"complete\":false,\"scanned\":0,"
+                    + "\"total\":" + jsonTotal(total) + ",\"truncated\":" + truncated
+                    + ",\"reason\":\"tracking-error\"}";
+        }
+    }
+
+    /** Class-only tracking warning (never variable data/secrets). */
+    static String trackWarn(String reason) {
+        try {
+            System.err.println("warn: change tracking degraded (" + reason + ")");
+        } catch (Exception ignored) {}
+        return "change tracking incomplete (" + reason
+                + "); changed lists only certain value changes";
+    }
+
+    /** Render a tracking total: a failed scan is unknown (null, never 0). */
+    static String jsonTotal(Integer total) {
+        return total == null ? "null" : String.valueOf(total);
+    }
+
+    static void storeTrack(SessionState st, Map<String, String> cur,
+            String func, List<String> changed, List<String> removed,
+            boolean complete, int scanned, Integer total, boolean truncated,
+            String reason, boolean curComplete, String scanReason,
+            boolean warn) {
+        st.lastTop = cur != null ? cur : new LinkedHashMap<>();
+        st.lastFunc = func;
+        st.lastChanged = jsonStrings(changed);
+        st.lastRemoved = jsonStrings(removed);
+        st.lastChangedComplete = complete;
+        st.lastTrackComplete = curComplete;
+        st.lastTrackReason = scanReason != null ? scanReason
+                : (curComplete ? null : reason);
+        // Incomplete branches always pass warn=true, so exactly one
+        // class-only warning is written here; complete scans stay quiet.
+        st.lastTrackWarn = warn ? trackWarn(reason) : null;
+        StringBuilder sb = new StringBuilder("{\"complete\":").append(complete)
+                .append(",\"scanned\":").append(scanned)
+                .append(",\"total\":").append(jsonTotal(total))
+                .append(",\"truncated\":").append(truncated);
+        if (reason != null && !complete) {
+            sb.append(",\"reason\":").append(JdiBridge.quote(reason));
+        }
+        st.lastChangeTracking = sb.append('}').toString();
+    }
+
+    static String jsonStrings(List<String> names) {
+        StringBuilder sb = new StringBuilder("[");
+        boolean first = true;
+        if (names != null) {
+            for (String name : names) {
+                if (!first) sb.append(',');
+                first = false;
+                sb.append(JdiBridge.quote(name));
+            }
+        }
+        return sb.append(']').toString();
+    }
+
+    static void compareTrack(SessionState st, Map<String, String> cur,
+            String func, Integer total, boolean truncated, String scanReason,
+            boolean curComplete) {
+        int scanned = total == null ? 0
+                : Math.min(total, JdiBridge.CHANGE_TRACK_MAX);
+        Map<String, String> last = st.lastTop;
+        boolean prevComplete = st.lastTrackComplete;
+        String prevReason = st.lastTrackReason != null ? st.lastTrackReason
+                : "truncated";
+        if (last == null) {
+            // No previous snapshot means no change comparison. A problem
+            // with the CURRENT scan (truncated/error) dominates the
+            // reason — it describes the stored baseline the next stop
+            // compares against; first-snapshot only when the current scan
+            // is itself exhaustive.
+            String reason = scanReason != null ? scanReason
+                    : (curComplete ? "first-snapshot" : "tracking-error");
+            storeTrack(st, cur, func, new ArrayList<>(), new ArrayList<>(),
+                    false, scanned, total, truncated, reason,
+                    curComplete, scanReason, true);
+            return;
+        }
+        if (st.lastFunc == null || !st.lastFunc.equals(func)) {
+            String reason = scanReason != null ? scanReason
+                    : (curComplete ? "function-changed" : "tracking-error");
+            storeTrack(st, cur, func, new ArrayList<>(), new ArrayList<>(),
+                    false, scanned, total, truncated, reason,
+                    curComplete, scanReason, true);
+            return;
+        }
+        if (!prevComplete || !curComplete) {
+            List<String> changed = new ArrayList<>();
+            try {
                 for (Map.Entry<String, String> e : cur.entrySet()) {
-                    String old = st.lastTop.get(e.getKey());
-                    if (!e.getValue().equals(old)) {
-                        if (!first) sb.append(',');
-                        first = false;
-                        sb.append(JdiBridge.quote(e.getKey()));
+                    String old = last.get(e.getKey());
+                    if (old != null && !e.getValue().equals(old)) {
+                        changed.add(e.getKey());
                     }
                 }
+                java.util.Collections.sort(changed);
+            } catch (Exception ignored) {
+                changed = new ArrayList<>();
             }
-            st.lastChanged = sb.append(']').toString();
-            st.lastTop = cur;
-        } catch (Throwable e) {
-            st.lastChanged = "[]";
+            String reason = !curComplete
+                    ? (scanReason != null ? scanReason : "tracking-error")
+                    : (prevReason != null ? prevReason : "truncated");
+            storeTrack(st, cur, func, changed, new ArrayList<>(),
+                    false, scanned, total, truncated, reason,
+                    curComplete, scanReason, true);
+            return;
         }
+        List<String> changed = new ArrayList<>();
+        List<String> removed = new ArrayList<>();
+        try {
+            for (Map.Entry<String, String> e : cur.entrySet()) {
+                String old = last.get(e.getKey());
+                if (old == null || !e.getValue().equals(old)) {
+                    changed.add(e.getKey());
+                }
+            }
+            for (String name : last.keySet()) {
+                if (!cur.containsKey(name)) removed.add(name);
+            }
+            java.util.Collections.sort(changed);
+            java.util.Collections.sort(removed);
+        } catch (Exception e) {
+            storeTrack(st, cur, func, new ArrayList<>(), new ArrayList<>(),
+                    false, scanned, total, truncated, "tracking-error",
+                    false, "tracking-error", true);
+            return;
+        }
+        storeTrack(st, cur, func, changed, removed,
+                true, scanned, total, truncated, null, true, null, false);
+    }
+
+    static void degradeTrack(SessionState st, String clsName, Integer total) {
+        List<StackFrame> frames = BridgeSnapshot.safeFrames(st.thread);
+        String func = "?";
+        if (!frames.isEmpty()) {
+            func = frameIdentityOf(frames.get(0));
+        }
+        storeTrack(st, new LinkedHashMap<>(), func,
+                new ArrayList<>(), new ArrayList<>(),
+                false, 0, total, false, "tracking-error",
+                false, "tracking-error", false);
+        // Single class-only warning (storeTrack stayed silent by design),
+        // matching the response's trackingWarning.
+        st.lastTrackWarn = trackWarn(clsName != null ? clsName : "tracking-error");
+    }
+
+    /** Additive change-tracking response fragment (uniform contract):
+     *  `"changed":…,"removed":…,"changedComplete":…,"changeTracking":…`
+     *  plus `"trackingWarning":…` only when incomplete. The stored strings
+     *  are bridge-rendered JSON, so this never throws. */
+    static String changeFieldsJson(SessionState st) {
+        StringBuilder sb = new StringBuilder("\"changed\":");
+        sb.append(st.lastChanged != null ? st.lastChanged : "[]");
+        sb.append(",\"removed\":");
+        sb.append(st.lastRemoved != null ? st.lastRemoved : "[]");
+        sb.append(",\"changedComplete\":").append(st.lastChangedComplete);
+        sb.append(",\"changeTracking\":");
+        sb.append(st.lastChangeTracking != null ? st.lastChangeTracking
+                : "{\"complete\":false,\"scanned\":0,\"total\":null,"
+                + "\"truncated\":false}");
+        if (st.lastTrackWarn != null && !st.lastChangedComplete) {
+            sb.append(",\"trackingWarning\":")
+                    .append(JdiBridge.quote(st.lastTrackWarn));
+        }
+        return sb.toString();
     }
 
     /**
@@ -1532,7 +1786,7 @@ class BridgeSession {
                 // pump (the serve loop skips its idle pump while outstanding).
                 String snap = awaitStop(st, timeout);
                 synchronized (st.sessionLock) {
-                    return "{\"ok\":true,\"stopped\":true,\"changed\":" + st.lastChanged + ",\"stopInfo\":" + stopInfoJson(st) + ",\"snapshot\":" + snap
+                    return "{\"ok\":true,\"stopped\":true," + changeFieldsJson(st) + ",\"stopInfo\":" + stopInfoJson(st) + ",\"snapshot\":" + snap
                             + ",\"diag\":" + stopDiagJson(st)
                             + ",\"warning\":" + JdiBridge.quote(PARK_WARNING)
                             + ",\"target\":\"main\"}";
@@ -1573,7 +1827,7 @@ class BridgeSession {
                 try {
                     String snap = awaitStop(st, timeout);
                     synchronized (st.sessionLock) {
-                        return "{\"ok\":true,\"stopped\":true,\"changed\":" + st.lastChanged + ",\"stopInfo\":" + stopInfoJson(st) + ",\"snapshot\":" + snap
+                        return "{\"ok\":true,\"stopped\":true," + changeFieldsJson(st) + ",\"stopInfo\":" + stopInfoJson(st) + ",\"snapshot\":" + snap
                                 + ",\"diag\":" + stopDiagJson(st)
                                 + ",\"warning\":" + JdiBridge.quote(PARK_WARNING)
                                 + ",\"target\":\"main\"}";
@@ -1932,7 +2186,7 @@ class BridgeSession {
 
     static String waitJson(SessionState st, String snap, boolean waited) {
         return "{\"ok\":true,\"stopped\":true,\"waited\":" + waited
-                + ",\"changed\":" + st.lastChanged
+                + "," + changeFieldsJson(st)
                 + ",\"stopInfo\":" + stopInfoJson(st)
                 + ",\"snapshot\":" + snap
                 + ",\"diag\":" + stopDiagJson(st)

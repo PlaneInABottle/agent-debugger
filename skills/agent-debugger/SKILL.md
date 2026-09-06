@@ -227,6 +227,9 @@ iterations cost zero LLM roundtrips.
   Node: unsupported — no gc walk via CDP). Heap references only — a purely
   stack-held object honestly reports 0 referrers.
 - After `step`/`continue`, read `changed[]` first — inspect only those.
+  Empty `changed` with `changedComplete=false` is UNKNOWN (truncated or
+  degraded tracking — see `changeTracking.reason`), not "no change";
+  `removed[]` names dropped locals on complete scans only.
 - Every stop carries `stopInfo` when the cause isn't a plain breakpoint:
   `watch`/`exit` (Java: field/access/value, method/returns), `exception`
   (all three: class). Read it before the frames — it names the event.
@@ -357,6 +360,9 @@ bridges long-poll for you:
 - `eval` paths support fields, `[i]` (arrays AND `List.get(i)`),
   zero/literal-arg calls (`orders.size()`, `get(0)`). Literals pass through.
 - After `step`/`continue`, read `changed[]` first — inspect only those.
+  Empty `changed` with `changedComplete=false` is UNKNOWN (truncated or
+  degraded tracking — see `changeTracking.reason`), not "no change";
+  `removed[]` names dropped locals on complete scans only.
 - `+N more` notes (threads, fields, items) are pull cues, not noise:
   target them with `eval` instead of re-dumping state.
 

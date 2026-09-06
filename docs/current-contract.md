@@ -81,6 +81,48 @@ any remaining live old session (exclusive or unknown lang, fail-closed)
 blocks with `unsupported live legacy session(s) '<names>'; close them
 first and retry` (`unsupported-legacy-live`).
 
+## Change tracking (continue/step/wait responses)
+
+Display-independent and bounded: `vars`/frame-0 locals stay capped at 20
+(`+N more` sentinel), while change tracking scans up to
+`CHANGE_TRACK_MAX=256` top-level values per frame with shallow previews
+(~200 chars, no child expansion, no getters, no target eval).
+
+- `changed: string[]` (sorted, kept for compatibility): value changes +
+  new names on complete scans.
+- `removed: string[]` (sorted): names missing from the current scan on
+  complete scans only; `[]` (never asserted) while incomplete.
+- `changedComplete: boolean`: true only when both previous and current
+  scans are exhaustive with the same function/frame identity and no
+  tracking error. Empty `changed` with `changedComplete=false` is
+  UNKNOWN (not "no change").
+- `changeTracking: {complete, scanned, total, truncated, reason?}`:
+  `scanned=min(valid,256)`, `total` = valid top-level values in the
+  current scan (`null` when the current scan itself failed — unknown,
+  never 0), `reason` in
+  `first-snapshot|function-changed|truncated|tracking-error`.
+- Frame identity for comparison (same-named frames in different code
+  never compare silently; a mismatch resets to unknown): Python
+  source-path + function name, Node/Browser scriptId (else url) +
+  function name, Java declaring-type + method + signature (overloads
+  differ). Object previews are top-level shallow summaries
+  (type+identity/length, no field walk, no element fetch, no invoke):
+  an object whose internals change without a top-level change is not
+  reported in `changed`, on every adapter.
+- First baseline and function change store `changed=[]` + complete=false
+  (no previous snapshot means no change comparison — all locals are never
+  reported as changed). A truncated/errored current scan reports its own
+  reason (`truncated`/`tracking-error`) instead, since it describes the
+  stored baseline the next stop compares against; `first-snapshot` /
+  `function-changed` only when the current scan itself is exhaustive. A baseline
+  stored while incomplete can never make the next comparison complete;
+  after a complete current baseline lands, the following stop can become
+  complete.
+- Incomplete/error: only value changes over the name intersection of the
+  scanned maps; added/removed suppressed; complete=false.
+- `trackingWarning` rides only when incomplete (class-only, no
+  values/secrets). Tracking failure never crashes the park.
+
 ## Install / upgrade
 
 `cargo install --path .` updates CLI + adapters together (binary:
