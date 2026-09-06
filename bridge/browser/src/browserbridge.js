@@ -665,6 +665,7 @@ class Session {
     // 'main': one tab per session); live reads bypass it entirely.
     this.outstanding = new Map(); // tid -> resume cmd in flight
     this.activeConns = 0;         // live connection handlers (bounded)
+    this._mutationTail = null;    // breaks-mutation mutex chain (adds only)
     // -- layered target identity (M-ID): the attached tab (debuggee,
     // protocol-confirmed) plus the debugger listener (endpoint). Built at
     // handshake; published redacted + capped in session.json.
@@ -1732,9 +1733,35 @@ class Session {
     return { ok: true, frames: await this.framesJson(false) };
   }
 
+  /** Uniform frame validation shared by vars/eval (same contract on
+   *  all four bridges): absent/null reads as 0; a finite integer number
+   *  ≥ 0 or 1–15 ASCII digits read as the index. Malformed, fractional,
+   *  negative, over-long, or mistyped input is `<what> needs integer
+   *  frame` (never coerced to 0); a well-formed index past the end is
+   *  `no frame N (have M)`. requireStopped still runs first at the
+   *  call sites. */
+  parseFrameIndex(raw, total, what) {
+    if (raw === undefined || raw === null) return 0;
+    if (typeof raw === 'number') {
+      if (!Number.isFinite(raw) || !Number.isInteger(raw) || raw < 0) {
+        throw new BridgeErr(`${what} needs integer frame`);
+      }
+      if (raw >= total) throw new BridgeErr(`no frame ${raw} (have ${total})`);
+      return raw;
+    }
+    if (typeof raw === 'string') {
+      if (!/^[0-9]{1,15}$/.test(raw)) throw new BridgeErr(`${what} needs integer frame`);
+      const v = Number(raw);
+      if (v >= total) throw new BridgeErr(`no frame ${v} (have ${total})`);
+      return v;
+    }
+    throw new BridgeErr(`${what} needs integer frame`);
+  }
+
   async cmdVars(req) {
     this.requireStopped();
-    const frame = parseInt(req.frame || 0, 10) || 0;
+    const frames = (this.paused && this.paused.frames) || [];
+    const frame = this.parseFrameIndex(req.frame, frames.length, 'vars');
     return { ok: true, frame, locals: await this.frameLocals(frame) };
   }
 
@@ -1742,11 +1769,8 @@ class Session {
     this.requireStopped();
     const expr = req.expr;
     if (expr === undefined || expr === null) throw new BridgeErr('eval needs an expr');
-    const frame = parseInt(req.frame || 0, 10) || 0;
     const frames = (this.paused && this.paused.frames) || [];
-    if (frame < 0 || frame >= frames.length) {
-      throw new BridgeErr(`no frame ${frame} (have ${frames.length})`);
-    }
+    const frame = this.parseFrameIndex(req.frame, frames.length, 'eval');
     if (typeof expr === 'string' && expr.trim().startsWith('refs(') && expr.trim().endsWith(')')) {
       throw new BridgeErr('refs() unsupported on browser yet (no gc walk via CDP)');
     }
@@ -2355,7 +2379,29 @@ class Session {
    * same line with a different condition — or any same-line logpoint —
    * rejects the batch before anything mutates.
    */
+  /** Serialize breaks mutations (promise-chain mutex): concurrent
+   *  identical adds recheck under the chain, so the second sees the
+   *  first's state (empty-added, no duplicate records). */
+  async _mutationRun(fn) {
+    let release;
+    const willLock = new Promise((resolve) => {
+      release = resolve;
+    });
+    const waitsFor = this._mutationTail || Promise.resolve();
+    this._mutationTail = waitsFor.then(() => willLock);
+    await waitsFor;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
   async cmdBreaksAdd(req) {
+    return this._mutationRun(() => this._cmdBreaksAddInner(req));
+  }
+
+  async _cmdBreaksAddInner(req) {
     await this.verifyTab();
     if (this.exited) throw new BridgeErr(EXITED_MSG);
     const raws = req.breaks;

@@ -817,6 +817,7 @@ class Session {
     this.outstanding = new Map();
     this.activeConns = 0;         // live connection handlers (bounded)
     this._swapTail = null;        // swap/tracking-field mutex chain
+    this._mutationTail = null;    // breaks-mutation mutex chain (adds only)
     this.mainDead = false;        // main session over; workers may live on
     this.sender = null;           // per-target CDP sender (null = main cdp)
     this.nodeWorkerEnabled = false;
@@ -903,6 +904,26 @@ class Session {
 
   async _swapRun(fn) {
     const release = await this._lockSwap();
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  /** Serialize breaks mutations (same promise-chain idiom as _swapRun, own
+   *  tail so swap traffic never waits on a plant): concurrent identical
+   *  adds recheck under the chain, so the second sees the first's state
+   *  (empty-added, no duplicate records). Mutation paths never swap shared
+   *  fields, so this never nests with _swapRun in either order. */
+  async _mutationRun(fn) {
+    let release;
+    const willLock = new Promise((resolve) => {
+      release = resolve;
+    });
+    const waitsFor = this._mutationTail || Promise.resolve();
+    this._mutationTail = waitsFor.then(() => willLock);
+    await waitsFor;
     try {
       return await fn();
     } finally {
@@ -2497,6 +2518,14 @@ class Session {
     return msg;
   }
 
+  stopTimeoutErr(timeout, withWaitContext, startedAt) {
+    const err = new StopTimeout(this.timeoutText(timeout));
+    // wait/capture only (never continue/step): the honest trigger-
+    // unknown context rides structurally; the prefix is unchanged.
+    if (withWaitContext) err.waitContext = this.waitContext(timeout, startedAt);
+    return err;
+  }
+
   async pump(timeout, withWaitContext = false) {
     const startedAt = Date.now();
     const deadline = startedAt + timeout * 1000;
@@ -2510,12 +2539,67 @@ class Session {
       if (this.paused || this.liveWorkers().some((w) => w.paused)) return 'stopped';
       if (this.exited) throw new BridgeErr('target exited');
       if (Date.now() > deadline) {
-        const err = new StopTimeout(this.timeoutText(timeout));
-        // wait/capture only (never continue/step): the honest trigger-
-        // unknown context rides structurally; the prefix is unchanged.
-        if (withWaitContext) err.waitContext = this.waitContext(timeout, startedAt);
-        throw err;
+        throw this.stopTimeoutErr(timeout, withWaitContext, startedAt);
       }
+      await sleep(50);
+    }
+  }
+
+  /** Freshness baseline for one resume/wait/capture wait: the paused
+   *  objects observed at entry. A park counts as fresh only when its
+   *  target's paused object differs (re-parks install a new object;
+   *  untouched pre-existing parks keep theirs). */
+  freshBase() {
+    const workers = new Map();
+    for (const [id, w] of this.workerTable) workers.set(id, w.paused || null);
+    return { main: this.paused || null, workers };
+  }
+
+  isFreshPark(id, base) {
+    if (id === 'main') return !!this.paused && this.paused !== base.main;
+    const w = this.workerTable.get(id);
+    return !!(w && w.paused && w.paused !== base.workers.get(id));
+  }
+
+  /** One waiter's park selection after a pump return: explicit waits
+   *  (req carried a target) serve only their own target's fresh park;
+   *  omitted waits keep any-target semantics but never consume a stale
+   *  pre-existing park as a new stop. Returns the serving target id or
+   *  null (keep waiting). Nothing is unparked or discarded — an ignored
+   *  park stays served via its own target reads/roster. */
+  selectFreshStop(tid, explicit, base) {
+    if (explicit) return this.isFreshPark(tid, base) ? tid : null;
+    if (this.isFreshPark(this.lastParkTarget, base)) return this.lastParkTarget;
+    if (this.isFreshPark('main', base)) return 'main';
+    for (const id of this.workerOrder) {
+      if (this.isFreshPark(id, base)) return id;
+    }
+    return null;
+  }
+
+  /** Wait for a selectable stop: loops the (stub-compatible) pump until
+   *  selectFreshStop names a target or the original budget is spent.
+   *  Pump errors propagate at once (a slice timeout with nothing parked
+   *  is rebuilt with the exact original envelope so wait/capture
+   *  enrichment keeps working); exits and owner loss pass through
+   *  untouched. */
+  async pumpForStop(timeout, tid, explicit, withWaitContext) {
+    const startedAt = Date.now();
+    const deadline = startedAt + timeout * 1000;
+    const base = this.freshBase();
+    for (;;) {
+      const remaining = (deadline - Date.now()) / 1000;
+      if (remaining <= 0) throw this.stopTimeoutErr(timeout, withWaitContext, startedAt);
+      try {
+        await this.pump(remaining, withWaitContext);
+      } catch (e) {
+        if (e instanceof StopTimeout) throw this.stopTimeoutErr(timeout, withWaitContext, startedAt);
+        throw e;
+      }
+      const hit = this.selectFreshStop(tid, explicit, base);
+      if (hit) return hit;
+      // A stale or other-target park only: leave it parked and keep
+      // waiting for our own stop.
       await sleep(50);
     }
   }
@@ -2805,9 +2889,35 @@ class Session {
     return { ok: true, frames: this.framesJson(false) };
   }
 
+  /** Uniform frame validation shared by vars/eval (same contract on
+   *  all four bridges): absent/null reads as 0; a finite integer number
+   *  ≥ 0 or 1–15 ASCII digits read as the index. Malformed, fractional,
+   *  negative, over-long, or mistyped input is `<what> needs integer
+   *  frame` (never coerced to 0); a well-formed index past the end is
+   *  `no frame N (have M)`. requireStopped still runs first at the
+   *  call sites. */
+  parseFrameIndex(raw, total, what) {
+    if (raw === undefined || raw === null) return 0;
+    if (typeof raw === 'number') {
+      if (!Number.isFinite(raw) || !Number.isInteger(raw) || raw < 0) {
+        throw new BridgeErr(`${what} needs integer frame`);
+      }
+      if (raw >= total) throw new BridgeErr(`no frame ${raw} (have ${total})`);
+      return raw;
+    }
+    if (typeof raw === 'string') {
+      if (!/^[0-9]{1,15}$/.test(raw)) throw new BridgeErr(`${what} needs integer frame`);
+      const v = Number(raw);
+      if (v >= total) throw new BridgeErr(`no frame ${v} (have ${total})`);
+      return v;
+    }
+    throw new BridgeErr(`${what} needs integer frame`);
+  }
+
   async cmdVars(req) {
     this.requireStopped();
-    const frame = parseInt(req.frame || 0, 10) || 0;
+    const frames = (this.paused && this.paused.frames) || [];
+    const frame = this.parseFrameIndex(req.frame, frames.length, 'vars');
     return { ok: true, frame, locals: await this.frameLocals(frame) };
   }
 
@@ -2815,11 +2925,8 @@ class Session {
     this.requireStopped();
     const expr = req.expr;
     if (expr === undefined || expr === null) throw new BridgeErr('eval needs an expr');
-    const frame = parseInt(req.frame || 0, 10) || 0;
     const frames = (this.paused && this.paused.frames) || [];
-    if (frame < 0 || frame >= frames.length) {
-      throw new BridgeErr(`no frame ${frame} (have ${frames.length})`);
-    }
+    const frame = this.parseFrameIndex(req.frame, frames.length, 'eval');
     if (typeof expr === 'string' && expr.trim().startsWith('refs(') && expr.trim().endsWith(')')) {
       throw new BridgeErr('refs() unsupported on Node yet (no gc walk via CDP)');
     }
@@ -2923,7 +3030,8 @@ class Session {
 
   /** Pure long-poll: NEVER resumes. Immediate success when the selected
    *  target is already parked; otherwise waits for the next fresh stop
-   *  (any target — the response stamps the actual one). Timeout preserves
+   *  (any target when omitted — the response stamps the actual one;
+   *  only the requested target when explicit). Timeout preserves
    *  session/intents (typed message). */
   async cmdWait(req, timeout) {
     const tid = this.resolveTarget(req);
@@ -2934,9 +3042,8 @@ class Session {
     if (parked) {
       return this.withTarget(tid, async () => this.waitSnapshot(tid, false));
     }
-    await this.pump(timeout, true);
-    let stopped = this.lastParkTarget || 'main';
-    if (stopped !== 'main' && !this.workerTable.has(stopped)) stopped = tid;
+    const stopped = await this.pumpForStop(
+      timeout, tid, typeof req.target === 'string', true);
     return this.withTarget(stopped, async () => this.waitSnapshot(stopped, true));
   }
 
@@ -3198,8 +3305,13 @@ class Session {
       } catch (_) { /* best effort */ }
       return wrapped;
     };
+    // Single wait, single budget: the park below is the one collected,
+    // unplanted, and resumed. (A second pump would discard the first park
+    // and demand another stop.)
+    let stopped;
     try {
-      await this.pump(timeout, true);
+      stopped = await this.pumpForStop(
+        timeout, tid, typeof req.target === 'string', true);
     } catch (e) {
       // Timeout/exit: nothing parked by us — no resume — but the ephemeral
       // must not leak. A removal failure on a dead target must not mask
@@ -3242,8 +3354,6 @@ class Session {
       if (staged) throw staged;
       throw e;
     }
-    let stopped = this.lastParkTarget || 'main';
-    if (stopped !== 'main' && !this.workerTable.has(stopped)) stopped = tid;
     const parkMs = (this.lastDiag && this.lastDiag.target === stopped && this.lastDiag.atMs) || Date.now();
     return this.withTarget(stopped, async () => {
       let snapErr = null, removeErr = null, resumeErr = null;
@@ -3341,7 +3451,7 @@ class Session {
         throw e;
       }
     });
-    return this.resumeAndWait(timeout, tid);
+    return this.resumeAndWait(timeout, tid, typeof req.target === 'string');
   }
 
   async cmdContinue(req, timeout) {
@@ -3369,7 +3479,7 @@ class Session {
       // Running already: nothing to resume (a bare resume errors on some
       // targets) — just wait for the next stop.
     });
-    return this.resumeAndWait(timeout, tid);
+    return this.resumeAndWait(timeout, tid, typeof req.target === 'string');
   }
 
   /** Clear a resume flag on exactly the resumed holder (main or one
@@ -3383,11 +3493,16 @@ class Session {
     if (w && !w.paused) w.awaitingStep = false;
   }
 
-  async resumeAndWait(timeout, tid = 'main') {
+  /** Resume one target after step/continue and wait for a selectable
+   *  stop: only the requested target's fresh park when explicit, any
+   *  fresh park when omitted (stale pre-existing parks never satisfy).
+   *  The response names the target that actually parked. */
+  async resumeAndWait(timeout, tid = 'main', explicit = false) {
     this.pendingTarget = tid;
     try {
+      let stopped;
       try {
-        await this.pump(timeout);
+        stopped = await this.pumpForStop(timeout, tid, explicit, false);
       } catch (e) {
         // Pump timeout (or target exit) must clear the step flag — otherwise
         // the NEXT real stop misreports as a step landing and breakpoint hits
@@ -3396,8 +3511,6 @@ class Session {
         this.clearResumeFlag(tid);
         throw e;
       }
-      let stopped = this.lastParkTarget || 'main';
-      if (stopped !== 'main' && !this.workerTable.has(stopped)) stopped = tid;
       const resp = await this.withTarget(stopped, async () => {
         const snap = this.snapshot();
         return {
@@ -3416,26 +3529,25 @@ class Session {
     }
   }
 
-  cmdThreads(req = {}) {
-    // Bare threads stays main-focused (unchanged single-target shape);
-    // --target X dumps that target instead. Served straight from published
-    // parks (M5): never swaps shared fields, never waits behind an
-    // outstanding resume, and issues zero CDP traffic while its target has
-    // a resume outstanding (no second reader on the wire).
-    const tid = this.resolveTarget(req);
+  /** One target's live thread dump as { target, running, threads }.
+   *  Served straight from published parks (M5): never swaps shared fields,
+   *  never waits behind an outstanding resume, and issues zero CDP traffic
+   *  while its target has a resume outstanding (no second reader on the
+   *  wire). Busy targets report the published running truth. */
+  threadsDumpFor(tid) {
     if (tid === 'main') {
       if (this.exited || this.mainDead) {
         throw new BridgeErr('target main has exited — close this session');
       }
       if (this.outstanding.has('main')) {
-        return this.withStamp({ ok: true, running: true, threads: [] }, tid);
+        return { target: 'main', running: true, threads: [] };
       }
       const frames = this.framesJson(false);
-      return this.withStamp({
-        ok: true,
+      return {
+        target: 'main',
         running: !this.paused,
         threads: [{ id: 1, name: 'main', status: this.paused ? 'paused' : 'running', frames }],
-      }, tid);
+      };
     }
     const w = this.workerTable.get(tid);
     if (!w || w.exited || w.state === 'exited') {
@@ -3445,14 +3557,69 @@ class Session {
       throw new BridgeErr(`target ${tid} was released (over budget)`);
     }
     if (this.outstanding.has(tid)) {
-      return this.withStamp({ ok: true, running: true, threads: [] }, tid);
+      return { target: tid, running: true, threads: [] };
     }
     const frames = this.framesJsonFor(w.paused, w.cachedLocals, false);
-    return this.withStamp({
-      ok: true,
+    return {
+      target: tid,
       running: !w.paused,
       threads: [{ id: 1, name: 'worker', status: w.paused ? 'paused' : 'running', frames }],
-    }, tid);
+    };
+  }
+
+  async cmdThreads(req = {}) {
+    // Explicit --target X (including main) dumps that target only
+    // (unchanged single-target shape). Bare threads aggregates main plus
+    // every live non-ignored non-exited worker in targets/breaks order
+    // (main first, then creation order); exited history is excluded.
+    // Top-level running/threads stay the auto-selected target's dump and
+    // the per-target entries ride additively under `targets` with a
+    // `selected` stamp, so single-target sessions read byte-identical.
+    // Every dump runs inside the swap mutex: the published paused/cached
+    // fields must never be read mid-swap by a concurrent withTarget (the
+    // dumps themselves issue no CDP, so the mutex is held microtask-
+    // briefly — never over unrelated long work).
+    if (req && typeof req.target === 'string') {
+      const tid = this.resolveTarget(req);
+      const entry = await this._swapRun(() => this.threadsDumpFor(tid));
+      return this.withStamp({ ok: true, running: entry.running, threads: entry.threads }, tid);
+    }
+    const selected = this.resolveTarget(req);
+    if (this.exited) throw new BridgeErr('target VM has exited — close this session');
+    const roster = ['main'];
+    for (const id of this.workerOrder) {
+      const w = this.workerTable.get(id);
+      if (!w || w.exited || w.state === 'ignored' || w.state === 'exited') continue;
+      if (w.state !== 'running' && w.state !== 'stopped') continue;
+      roster.push(id);
+    }
+    if (roster.length === 1) {
+      const entry = await this._swapRun(() => this.threadsDumpFor(selected));
+      return this.withStamp({ ok: true, running: entry.running, threads: entry.threads }, selected);
+    }
+    // A target that exits or is released between the roster snapshot and
+    // its dump is skipped — never failing the whole call; the survivors
+    // stay attributable. Anything else (e.g. a DAP read failure) still
+    // propagates.
+    const entries = [];
+    for (const tid of roster) {
+      try {
+        entries.push(await this._swapRun(() => this.threadsDumpFor(tid)));
+      } catch (e) {
+        if (e instanceof BridgeErr && /has exited|was released/.test(e.message)) continue;
+        throw e;
+      }
+    }
+    if (entries.length === 0) {
+      // Everything churned: serve the selected target honestly (raises).
+      const entry = await this._swapRun(() => this.threadsDumpFor(selected));
+      return this.withStamp({ ok: true, running: entry.running, threads: entry.threads }, selected);
+    }
+    const sel = entries.find((e) => e.target === selected) || entries[0];
+    return this.withStamp({
+      ok: true, running: sel.running, threads: sel.threads,
+      targets: entries, selected: sel.target,
+    }, sel.target);
   }
 
   cmdBreaks(req = {}) {
@@ -3483,12 +3650,21 @@ class Session {
    * `--target X` (worker only) plants an ephemeral target-scoped break:
    * same validation, no global intent change, no stops.json persistence,
    * no inheritance. `--target main` is the global path.
+   *
+   * Serialized on the mutation chain (concurrent identical adds converge
+   * to a single record; rivals report empty-added).
    */
   async cmdBreaksAdd(req) {
+    return this._mutationRun(() => this._cmdBreaksAddInner(req));
+  }
+
+  async _cmdBreaksAddInner(req) {
     const scope = req && typeof req.target === 'string' ? req.target : null;
     if (scope !== null && scope !== 'main') {
       const tid = this.resolveTarget(req);
-      return this.addWorkerEphemeral(tid, req.breaks);
+      // Already inside the mutation chain (outer wrapper): call the inner
+      // form directly — the chain is not reentrant.
+      return this._addWorkerEphemeralInner(tid, req.breaks);
     }
     if (this.exited) throw new BridgeErr('target VM has exited — close this session');
     const raws = req.breaks;
@@ -3708,8 +3884,13 @@ class Session {
 
   /** Ephemeral target-scoped add on one worker: same validation as global,
    *  but matches only that worker's planted lines and never touches the
-   *  global intent (no inheritance, no stops.json). */
+   *  global intent (no inheritance, no stops.json). Serialized on the
+   *  mutation chain like global adds (capture plants funnel here too). */
   async addWorkerEphemeral(tid, raws) {
+    return this._mutationRun(() => this._addWorkerEphemeralInner(tid, raws));
+  }
+
+  async _addWorkerEphemeralInner(tid, raws) {
     const w = this.workerTable.get(tid);
     if (!w || w.exited) throw new BridgeErr(`target ${tid} has exited — close this session`);
     const { parsed } = this.parseLiveBreaks(raws);

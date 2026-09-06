@@ -270,7 +270,12 @@ test('node cmdContinue: publishes running before resume, restores on failure', a
       return {};
     },
   };
-  st.pump = async () => 'stopped';
+  st.pump = async () => {
+    // Honest wait: the resume above unparked main, so re-park it fresh —
+    // a lying 'stopped' with nothing parked can no longer satisfy a wait.
+    st.paused = { frames: [jsFrame('file:///app.js')], stopInfo: null };
+    return 'stopped';
+  };
   await st.cmdContinue({}, 5);
   assert.equal(atCall, false, 'session.json must show running BEFORE the resume request');
   // Synchronous request failure: park restored, file truthful again.
@@ -294,7 +299,11 @@ test('node cmdStep: publishes running before step, restores on failure', async (
       return {};
     },
   };
-  st.pump = async () => 'stopped';
+  st.pump = async () => {
+    // Honest wait: the step above unparked main, so re-park it fresh.
+    st.paused = { frames: [jsFrame('file:///app.js')], stopInfo: null };
+    return 'stopped';
+  };
   await st.cmdStep({ mode: 'over' }, 5);
   assert.equal(atCall, false, 'session.json must show running BEFORE the step request');
   const dir2 = tmpdir('m3-node-');

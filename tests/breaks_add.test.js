@@ -203,3 +203,46 @@ test('browser: same-line startup logpoint conflicts', async () => {
   await assert.rejects(st.cmdBreaksAdd({ breaks: ['app.js:15'] }), /logpoint/);
   assert.equal(calls, 0);
 });
+
+test('node: eight concurrent identical adds converge to one record', async () => {
+  const dir = tmpdir('m2-node-race-');
+  const st = nodeSession(dir);
+  let calls = 0;
+  st.cdp = {
+    request: async () => {
+      calls += 1;
+      return { breakpointId: `bp-${calls}`, locations: [{ lineNumber: 4 }] };
+    },
+  };
+  const raw = `${writeJs(dir)}:5`;
+  const resps = await Promise.all(
+    Array.from({ length: 8 }, () => st.cmdBreaksAdd({ breaks: [raw] })));
+  // Exactly one plant, one live record, one intent entry; the seven
+  // rivals report coherent empty-added instead of duplicating.
+  assert.equal(calls, 1, 'a single setBreakpointByUrl plant');
+  assert.equal(st.stopStates.length, 1);
+  assert.equal(st.cfg.breaks.length, 1);
+  assert.equal(st.breakKeys.size, 1);
+  assert.equal(resps.filter((r) => r.added.length === 1).length, 1);
+  assert.equal(resps.filter((r) => r.added.length === 0).length, 7);
+  for (const r of resps) assert.equal(r.target, 'main');
+});
+
+test('browser: eight concurrent identical adds converge to one record', async () => {
+  const dir = tmpdir('m2-browser-race-');
+  const st = browserSession(dir);
+  let calls = 0;
+  st.cdp = {
+    request: async () => {
+      calls += 1;
+      return { breakpointId: `b${calls}`, locations: [{ lineNumber: 7 }] };
+    },
+  };
+  const resps = await Promise.all(
+    Array.from({ length: 8 }, () => st.cmdBreaksAdd({ breaks: ['app.js:8'] })));
+  assert.equal(calls, 1, 'a single setBreakpointByUrl plant');
+  assert.equal(st.stopStates.length, 1);
+  assert.equal(st.cfg.breaks.length, 1);
+  assert.equal(resps.filter((r) => r.added.length === 1).length, 1);
+  assert.equal(resps.filter((r) => r.added.length === 0).length, 7);
+});

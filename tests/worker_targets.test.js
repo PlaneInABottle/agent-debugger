@@ -412,3 +412,252 @@ test('worker bridge: every served response names its target', async () => {
   const targets = st.cmdTargets();
   assert.equal(targets.target, 'main');
 });
+
+test('bare threads aggregates main plus live workers; explicit stays single', async () => {
+  const dir = tmpdir('wt-threads-agg-');
+  const st = workerSession(dir);
+  st.cdp = { request: async () => ({ threads: [] }) };
+  // Single-target bare: legacy shape, no aggregation keys.
+  let resp = await st.cmdThreads({});
+  assert.equal(resp.ok, true);
+  assert.equal(resp.target, 'main');
+  assert.ok(!('targets' in resp), 'no aggregation without workers');
+  assert.ok(!('selected' in resp), 'no selected without workers');
+
+  const mk = (sid, state = 'running', paused = null) => ({
+    id: `worker:${sid}`, sessionId: sid, state, paused,
+    stopInfo: null, lastStop: null, stopStates: [], targetRaws: new Map(),
+    inheritedKeys: new Set(), breakKeys: new Map(), breakRecByKey: new Map(),
+    logpoints: [], scripts: new Map(), urls: new Map(), seq: 0, stopSeq: 0,
+    cachedLocals: [], lastChanged: '[]', lastTop: null, lastFunc: null,
+    awaitingStep: false, exited: false,
+    observed: { url: `file:///w${sid}.js`, type: 'worker', endpoint: 'ws://x' },
+  });
+  // Parked worker newer than main: auto-select serves the worker.
+  const w = mk('a', 'stopped', { frames: [workerFrame()], stopInfo: null });
+  st.stopSeq += 1;
+  w.stopSeq = st.stopSeq;
+  st.workerTable.set(w.id, w);
+  st.workerOrder.push(w.id);
+  st.seenWorkerIds.add(w.id);
+  // Ignored releases never join the aggregate.
+  const ign = mk('b', 'ignored');
+  st.workerTable.set(ign.id, ign);
+  st.workerOrder.push(ign.id);
+  st.seenWorkerIds.add(ign.id);
+  st.ignoredWorkers = 1;
+
+  resp = await st.cmdThreads({});
+  assert.equal(resp.ok, true);
+  assert.equal(resp.selected, w.id);
+  assert.equal(resp.target, w.id);
+  assert.deepEqual(resp.targets.map((e) => e.target), ['main', w.id]);
+  const [mainE, workE] = resp.targets;
+  assert.equal(mainE.running, true);
+  assert.equal(workE.running, false);
+  assert.equal(workE.threads.length, 1);
+  assert.equal(workE.threads[0].name, 'worker');
+  // Top-level stays the selected target's dump.
+  assert.equal(resp.running, workE.running);
+  assert.deepEqual(resp.threads, workE.threads);
+
+  // Busy worker appears truthfully running without blocking.
+  st.outstanding.set(w.id, 'continue');
+  resp = await st.cmdThreads({});
+  const got = Object.fromEntries(resp.targets.map((e) => [e.target, e]));
+  assert.equal(got[w.id].running, true);
+  assert.deepEqual(got[w.id].threads, []);
+  assert.ok(got.main, 'main still listed');
+  st.outstanding.delete(w.id);
+
+  // Explicit main pins main even though the worker stopped later.
+  const one = await st.cmdThreads({ target: 'main' });
+  assert.equal(one.target, 'main');
+  assert.ok(!('targets' in one), 'explicit main keeps the single shape');
+  assert.ok(!('selected' in one), 'explicit main keeps the single shape');
+  assert.equal(one.threads[0].name, 'main');
+
+  // Explicit worker still serves only that worker.
+  const two = await st.cmdThreads({ target: w.id });
+  assert.equal(two.target, w.id);
+  assert.ok(!('targets' in two), 'explicit worker keeps the single shape');
+
+  // Exited history never joins the aggregate.
+  st.noteWorkerExit(w.id);
+  resp = await st.cmdThreads({});
+  assert.ok(!('targets' in resp), 'lone main reads byte-identical');
+  assert.equal(resp.target, 'main');
+});
+
+function scopedWorker(st, sid) {
+  // A live worker entry with everything withTarget/snapshot needs.
+  const w = {
+    id: `worker:${sid}`, sessionId: sid, state: 'stopped',
+    paused: {
+      frames: [{
+        callFrameId: 'w1', functionName: 'work', scopeChain: [],
+        location: { scriptId: 'ws1', lineNumber: 4 },
+      }],
+      stopInfo: null,
+    },
+    stopInfo: null, lastStop: null, stopStates: [], targetRaws: new Map(),
+    inheritedKeys: new Set(), breakKeys: new Map(), breakRecByKey: new Map(),
+    logpoints: [], scripts: new Map(), urls: new Map(), seq: 0, stopSeq: 0,
+    cachedLocals: [], lastChanged: '[]', lastTop: null, lastFunc: null,
+    awaitingStep: false, exited: false,
+    observed: { url: `file:///w${sid}.js`, type: 'worker', endpoint: 'ws://x' },
+  };
+  st.workerTable.set(w.id, w);
+  st.workerOrder.push(w.id);
+  st.seenWorkerIds.add(w.id);
+  return w;
+}
+
+function mainPark(st) {
+  st.paused = {
+    frames: [{
+      callFrameId: 'm1', functionName: 'main', scopeChain: [],
+      location: { scriptId: 's1', lineNumber: 1 },
+    }],
+    stopInfo: null,
+  };
+}
+
+test('explicit waits never serve another target; stale parks never satisfy', async () => {
+  // Main running, worker parked BEFORE the wait (stale): explicit main
+  // waits must time out main-scoped, never serve the worker, and leave
+  // the worker parked and untouched.
+  const dir = tmpdir('wt-wait-scope-');
+  const st = workerSession(dir);
+  st.cdp = { request: async () => ({}) };
+  const w = scopedWorker(st, 's');
+  // Faithful stale simulation: like the real pump with a pre-existing
+  // park, the stub returns at once without parking anything new. (The
+  // real pump would exit(0) on an unowned test dir — owner-guard — so
+  // waiting loops are tested against this stub; live runs cover the
+  // real pump.)
+  st.pump = async () => 'stopped';
+  await assert.rejects(st.cmdContinue({ target: 'main' }, 1),
+    /timeout: no stop within 1/);
+  assert.ok(w.paused, 'stale worker park untouched by explicit continue');
+  assert.equal(st.paused, null);
+  await assert.rejects(st.cmdWait({ target: 'main' }, 1),
+    /timeout: no stop within 1/);
+  assert.ok(w.paused, 'stale worker park untouched by explicit wait');
+  // Omitted resume/step with only the stale park: no instant stale serve.
+  await assert.rejects(st.cmdContinue({}, 1), /timeout: no stop within 1/);
+  assert.ok(w.paused, 'stale park not consumed by omitted continue');
+});
+
+test('explicit continue skips a fresh other-target stop, serves its own', async () => {
+  // Worker stops fresh mid-wait, then main stops: the explicit main
+  // waiter must skip the worker park (left parked, never resumed) and
+  // serve only main's own stop.
+  const dir = tmpdir('wt-wait-fresh-');
+  const st = workerSession(dir);
+  st.cdp = { request: async () => ({}) };
+  const w = scopedWorker(st, 'f');
+  w.paused = null;
+  w.state = 'running';
+  let n = 0;
+  st.pump = async () => {
+    n++;
+    if (n === 1) {
+      w.paused = {
+        frames: [{
+          callFrameId: 'w1', functionName: 'work', scopeChain: [],
+          location: { scriptId: 'ws1', lineNumber: 4 },
+        }],
+        stopInfo: null,
+      };
+      w.state = 'stopped';
+    } else {
+      mainPark(st);
+    }
+    return 'stopped';
+  };
+  const resp = await st.cmdContinue({ target: 'main' }, 5);
+  assert.equal(resp.target, 'main');
+  assert.ok(w.paused, 'fresh worker park left for its own target');
+  assert.equal(w.state, 'stopped');
+});
+
+test('explicit capture waits for its own target only', async () => {
+  const dir = tmpdir('wt-cap-scope-');
+  const st = workerSession(dir);
+  st.cdp = { request: async () => ({}) };
+  const w = scopedWorker(st, 'c');
+  st.pump = async () => {
+    // Stale worker park present the whole time; only main newly parks.
+    mainPark(st);
+    return 'stopped';
+  };
+  const resp = await st.cmdCapture({ target: 'main' }, 5);
+  assert.equal(resp.target, 'main');
+  assert.equal(resp.resumed, true);
+  assert.ok(w.paused, 'stale worker park untouched by explicit capture');
+});
+
+test('bare threads never reads mid-swap: serializes with withTarget', async () => {
+  // Hold the swap mutex inside withTarget(worker) across an await (main
+  // fields currently show the worker park); a concurrent bare threads
+  // must wait for it — not attribute worker frames to main.
+  const dir = tmpdir('wt-swap-');
+  const st = workerSession(dir);
+  st.cdp = { request: async () => ({}) };
+  st.paused = {
+    frames: [{
+      callFrameId: 'm1', functionName: 'main', scopeChain: [],
+      location: { scriptId: 's1', lineNumber: 1 },
+    }],
+    stopInfo: null,
+  };
+  const w = scopedWorker(st, 'sw');
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const holderP = st.withTarget(w.id, async () => {
+    await gate;
+    return 'held';
+  });
+  await new Promise((r) => setTimeout(r, 20)); // holder has swapped now
+  const guard = new Promise((_, rej) =>
+    setTimeout(() => rej(new Error('threads deadlocked behind swap')), 5000));
+  const aggP = st.cmdThreads({});
+  release();
+  const agg = await Promise.race([aggP, guard]);
+  assert.equal(await holderP, 'held');
+  const got = Object.fromEntries(
+    agg.targets.map((e) => [e.target, e.threads[0].frames[0].method]));
+  assert.deepEqual(got, { main: 'main', 'worker:sw': 'work' });
+});
+
+test('bare threads skips a worker that exits mid-dump', async () => {
+  // Deterministic churn: the worker exits between the roster snapshot
+  // and its own dump. It is skipped (never fails the call), the exit
+  // stays recorded, and the served entry is coherent.
+  const dir = tmpdir('wt-churn-');
+  const st = workerSession(dir);
+  st.cdp = { request: async () => ({}) };
+  st.paused = {
+    frames: [{
+      callFrameId: 'm1', functionName: 'main', scopeChain: [],
+      location: { scriptId: 's1', lineNumber: 1 },
+    }],
+    stopInfo: null,
+  };
+  const w = scopedWorker(st, 'ch');
+  w.stopSeq = 1;
+  st.stopSeq = 1;
+  const realSwap = st._swapRun.bind(st);
+  let n = 0;
+  st._swapRun = async (fn) => {
+    n += 1;
+    if (n === 1) st.noteWorkerExit(w.id); // churn between snapshot and dump
+    return realSwap(fn);
+  };
+  const resp = await st.cmdThreads({});
+  assert.deepEqual(resp.targets.map((e) => e.target), ['main']);
+  assert.equal(resp.selected, 'main');
+  assert.equal(resp.target, 'main');
+  assert.ok(st.exitedWorkers.some((e) => e.id === w.id), 'exit still recorded');
+});

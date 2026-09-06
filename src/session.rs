@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use crate::{bridge, client};
+use crate::{bridge, client, dap};
 
 pub fn sessions_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -84,8 +84,10 @@ fn session_port(name: &str) -> anyhow::Result<u16> {
 /// round-trip is bounded server-side). Transport failure persists nothing —
 /// the bridge may still have applied, so the error points at bare `breaks`.
 /// Bridge ok:false also persists nothing (zero confirmed by contract).
-/// A `target` selects an ephemeral target-scoped break: forwarded verbatim,
-/// never persisted to stops.json (no inheritance).
+/// Only a non-main `target` selects an ephemeral target-scoped break:
+/// forwarded verbatim, never persisted to stops.json (no inheritance).
+/// Explicit `--target main` is the global path (same persistence as
+/// omitted) — bridges treat `main` as global intent, never ephemeral.
 pub fn cmd_breaks_add(
     name: &str,
     breaks: &[String],
@@ -110,7 +112,7 @@ pub fn cmd_breaks_add(
     if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
         return Err(bridge_failure(&resp));
     }
-    if target.is_some() {
+    if is_ephemeral_target(target.as_deref()) {
         return Ok(stamp_main(resp));
     }
     let confirmed: Vec<String> = resp
@@ -132,8 +134,9 @@ pub fn cmd_breaks_add(
 /// Same transport contract as add: transport failure persists nothing (the
 /// bridge may still have applied — bare `breaks` reconciles), ok:false
 /// persists nothing. Partial success persists the confirmed subset and
-/// keeps the bridge's warning. A `target` scopes removal to that target's
-/// target-scoped records only and never touches stops.json.
+/// keeps the bridge's warning. Only a non-main `target` scopes removal to
+/// that target's target-scoped records (never touching stops.json);
+/// explicit `--target main` is the global path like omitted.
 pub fn cmd_breaks_remove(
     name: &str,
     breaks: &[String],
@@ -158,7 +161,7 @@ pub fn cmd_breaks_remove(
     if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
         return Err(bridge_failure(&resp));
     }
-    if target.is_some() {
+    if is_ephemeral_target(target.as_deref()) {
         return Ok(stamp_main(resp));
     }
     let removed = confirmed_removed(&resp);
@@ -172,9 +175,10 @@ pub fn cmd_breaks_remove(
 /// Persistence mirrors remove: only the bridge-confirmed `removed` raws
 /// leave stops.json. Forward bound matches remove policy (min(10 + 5*N,
 /// 65)s over the persisted line-break count — logpoints/watches/exits are
-/// not clear scope and never inflate the bound). A `target` drops only that
-/// target's ephemeral target-scoped records (no stops.json change); bare
-/// clear is the full line-break reset.
+/// not clear scope and never inflate the bound). Only a non-main `target`
+/// drops that target's ephemeral target-scoped records (no stops.json
+/// change); omitted and explicit `--target main` are the full line-break
+/// reset.
 pub fn cmd_breaks_clear(name: &str, target: Option<&str>) -> anyhow::Result<Value> {
     check_name(name)?;
     let dir = checked_session_dir(name)?;
@@ -195,7 +199,7 @@ pub fn cmd_breaks_clear(name: &str, target: Option<&str>) -> anyhow::Result<Valu
     if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
         return Err(bridge_failure(&resp));
     }
-    if target.is_some() {
+    if is_ephemeral_target(target.as_deref()) {
         return Ok(stamp_main(resp));
     }
     let removed = confirmed_removed(&resp);
@@ -203,6 +207,13 @@ pub fn cmd_breaks_clear(name: &str, target: Option<&str>) -> anyhow::Result<Valu
         remove_confirmed_breaks(name, &removed).map_err(|e| applied_live_err("clear", e))?;
     }
     Ok(stamp_main(resp))
+}
+
+/// True when a normalized target selects ephemeral target-scoped records
+/// (persisted intent untouched). Only non-main targets are ephemeral:
+/// omitted and explicit `main` are the global path on every bridge.
+fn is_ephemeral_target(target: Option<&str>) -> bool {
+    matches!(target, Some(t) if t != "main")
 }
 
 /// Count of persisted line breaks for the clear forward bound. Reads the
@@ -264,6 +275,76 @@ fn applied_live_err(op: &str, e: anyhow::Error) -> anyhow::Error {
     )
 }
 
+/// Short-held file guard serializing stops.json read-modify-write across
+/// concurrent CLI invocations (same create_new + nonce + stale-steal idiom
+/// as the startup lock, but scoped to the breaks file section only — never
+/// across bridge forwards, which the bridges serialize themselves). Lives
+/// inside the session dir so `close` reaps it; a crashed holder is
+/// recoverable after a seconds-scale bound (the section itself is ms).
+fn breaks_lock_path(dir: &std::path::Path) -> PathBuf {
+    dir.join("breaks.lock")
+}
+
+/// A breaks lock is stale only when its mtime is provably older than the
+/// bound. Unreadable clocks fail closed (treat as live) — a retry costs a
+/// wait, a wrongful steal costs a sibling writer its update.
+const BREAKS_LOCK_STALE: Duration = Duration::from_secs(30);
+
+struct BreaksGuard {
+    path: PathBuf,
+    nonce: String,
+}
+
+impl Drop for BreaksGuard {
+    fn drop(&mut self) {
+        if std::fs::read_to_string(&self.path)
+            .map(|c| c == self.nonce)
+            .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Claim the breaks lock, waiting briefly for a live holder. On failure
+/// the caller reports applied-live-but-unpersisted (the existing honest
+/// error) instead of risking a torn intent — never spins forever.
+fn acquire_breaks_lock(dir: &std::path::Path) -> anyhow::Result<BreaksGuard> {
+    let path = breaks_lock_path(dir);
+    let nonce = startup_nonce();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                use std::io::Write as _;
+                f.write_all(nonce.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("cannot write breaks lock: {e}"))?;
+                return Ok(BreaksGuard { path, nonce });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => anyhow::bail!("cannot create breaks lock: {e}"),
+        }
+        let stale = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+            .map(|age| age >= BREAKS_LOCK_STALE)
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("breaks lock held by a live writer");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Append confirmed raw specs to stops.json's breaks list. Atomic tmp+rename
 /// in the same dir; every other field (timeout, target, unknown) is preserved
 /// byte-for-byte in value (only the breaks array grows).
@@ -272,6 +353,7 @@ fn append_confirmed_breaks(name: &str, raws: &[String]) -> anyhow::Result<()> {
 }
 
 fn append_confirmed_breaks_in(dir: &std::path::Path, raws: &[String]) -> anyhow::Result<()> {
+    let _guard = acquire_breaks_lock(dir)?;
     let path = dir.join("stops.json");
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("cannot read session intent: {e}"))?;
@@ -281,8 +363,13 @@ fn append_confirmed_breaks_in(dir: &std::path::Path, raws: &[String]) -> anyhow:
         .get_mut("breaks")
         .and_then(|b| b.as_array_mut())
         .ok_or_else(|| anyhow::anyhow!("corrupt session intent: breaks is not a list"))?;
+    // Exact-raw dedup: concurrent identical adds (or a retried forward the
+    // bridge already applied) must not grow the list — the bridge is the
+    // source of truth for what is armed, this file only records it once.
     for r in raws {
-        list.push(Value::String(r.clone()));
+        if !list.iter().any(|v| v.as_str() == Some(r)) {
+            list.push(Value::String(r.clone()));
+        }
     }
     let tmp = dir.join("stops.json.tmp");
     std::fs::write(
@@ -296,14 +383,16 @@ fn append_confirmed_breaks_in(dir: &std::path::Path, raws: &[String]) -> anyhow:
 }
 
 /// Drop confirmed-removed raws from stops.json's breaks list. Exact-string
-/// match against persisted entries, first occurrence per removed raw (the
-/// list holds no duplicates: adds are idempotent). Every other field is
+/// match against persisted entries, ALL occurrences per removed raw (a
+/// legacy file may hold duplicates from before idempotent adds: leaving
+/// one behind would ghost-resurrect the intent). Every other field is
 /// preserved in value; the write is atomic tmp+rename like the append path.
 fn remove_confirmed_breaks(name: &str, raws: &[String]) -> anyhow::Result<()> {
     remove_confirmed_breaks_in(&checked_session_dir(name)?, raws)
 }
 
 fn remove_confirmed_breaks_in(dir: &std::path::Path, raws: &[String]) -> anyhow::Result<()> {
+    let _guard = acquire_breaks_lock(dir)?;
     let path = dir.join("stops.json");
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("cannot read session intent: {e}"))?;
@@ -314,9 +403,7 @@ fn remove_confirmed_breaks_in(dir: &std::path::Path, raws: &[String]) -> anyhow:
         .and_then(|b| b.as_array_mut())
         .ok_or_else(|| anyhow::anyhow!("corrupt session intent: breaks is not a list"))?;
     for r in raws {
-        if let Some(pos) = list.iter().position(|v| v.as_str() == Some(r)) {
-            list.remove(pos);
-        }
+        list.retain(|v| v.as_str() != Some(r.as_str()));
     }
     let tmp = dir.join("stops.json.tmp");
     std::fs::write(
@@ -393,18 +480,26 @@ pub fn forward(name: &str, body: &Value, timeout: Duration) -> anyhow::Result<Va
 /// lang.json) and unrecognized values forward like multi-target langs.
 /// Display callers keep `session_lang_in` (java default); every routing
 /// call site uses this so unknown never misroutes as main-only.
+/// Omitted target stays auto-select (`None`); explicit `main` is pinned as
+/// `Some("main")` on multi-target/unknown langs so bridges serve main
+/// instead of auto-selecting a recently stopped child/worker. Main-only
+/// adapters (java/browser) accept explicit `main` as a no-op (`None`: they
+/// predate the target field and can only ever serve main) and reject
+/// anything else before any forward.
 fn normalize_target_for_lang_opt(
     lang: Option<&str>,
     target: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
     match (lang, target) {
-        (_, None) | (_, Some("main")) => Ok(None),
+        (_, None) => Ok(None),
+        (Some("java") | Some("browser"), Some("main")) => Ok(None),
         (Some("java") | Some("browser"), Some(other)) => {
             anyhow::bail!(
                 "unsupported target '{other}' (session is {}, main-only)",
                 lang.unwrap()
             )
         }
+        (_, Some("main")) => Ok(Some("main".to_string())),
         (_, Some(other)) => Ok(Some(other.to_string())),
     }
 }
@@ -445,6 +540,30 @@ pub fn forward_target(
         Ok(stamp_main(resp))
     } else {
         Err(bridge_failure(&resp))
+    }
+}
+
+/// Reload the page and wait for the next stop. Browser tabs only (CLI
+/// help): gate before any forward so py/node/java fail fast with a stable
+/// browser-only error and never spend bridge traffic. Missing, corrupt, or
+/// unknown langs fail the same way (a reload is never forwarded elsewhere).
+pub fn cmd_reload(name: &str, timeout: u64) -> anyhow::Result<Value> {
+    check_name(name)?;
+    let dir = checked_session_dir(name)?;
+    require_schema_v2(&dir, name)?;
+    reload_gate(session_lang_opt(&dir).as_deref())?;
+    forward(
+        name,
+        &json!({"cmd": "reload", "timeout": timeout}),
+        Duration::from_secs(timeout.saturating_add(5)),
+    )
+}
+
+/// Offline-testable reload routing decision: only browser forwards.
+fn reload_gate(lang: Option<&str>) -> anyhow::Result<()> {
+    match lang {
+        Some("browser") => Ok(()),
+        _ => anyhow::bail!("reload is browser-only (browser attach sessions only)"),
     }
 }
 
@@ -1533,6 +1652,13 @@ fn listener_present(host: &str, port: u16) -> Option<bool> {
 /// (fail closed — a wedged probe must never authorize a second attach
 /// onto a live target). The corroboration window is bounded (2min), so a
 /// truly dead session stops blocking shortly after its last publish.
+///
+/// NOTE: this stays deliberately TCP-based (not protocol-aware): a
+/// stranger reusing the port must still read as live HERE, otherwise a
+/// second attach could land on a live exclusive target the stranger
+/// happens to share the port with. Stranger discrimination lives in
+/// `probe_session_bridge`, used only by `status` (display) and `close`
+/// (cleanup) — never by attach gating or legacy reclaim.
 fn daemon_alive_in(dir: &std::path::Path) -> bool {
     const DAEMON_PROBE: Duration = Duration::from_secs(1);
     const RECENT_PUBLISH: Duration = Duration::from_secs(120);
@@ -1558,15 +1684,122 @@ fn daemon_alive_in(dir: &std::path::Path) -> bool {
     }
     // Probe failed twice: only a very recent bridge publish keeps the
     // session live (transient probe failure, not a dead daemon).
-    let updated_ago = parsed
-        .as_ref()
-        .and_then(|v| v.get("updatedAt").and_then(|u| u.as_u64()))
+    if published_recently(&parsed.unwrap_or(serde_json::json!({})), RECENT_PUBLISH) {
+        return true;
+    }
+    false
+}
+
+/// Bridge publish recency: `updatedAt` (seconds since epoch, written by
+/// the bridge on every publish) is within `bound` of now. Unparseable or
+/// future timestamps read as stale, never live.
+fn published_recently(session: &Value, bound: Duration) -> bool {
+    let age = session
+        .get("updatedAt")
+        .and_then(|u| u.as_u64())
         .and_then(|s| {
             std::time::UNIX_EPOCH
                 .checked_add(Duration::from_secs(s))
                 .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
         });
-    matches!(updated_ago, Some(age) if age < RECENT_PUBLISH)
+    matches!(age, Some(a) if a < bound)
+}
+
+/// Outcome of a protocol-aware liveness probe against a recorded port.
+/// Unlike the bare-TCP checks, this distinguishes our debugger bridge
+/// from a stranger that reused the port after our bridge died.
+#[derive(Debug, PartialEq, Eq)]
+enum Probe {
+    /// A valid debugger envelope answered: our bridge is up.
+    Ours,
+    /// Definitively not our bridge, with a short diagnostic reason
+    /// (refused/dead, EOF, corrupt framing, or valid framing with a
+    /// non-debugger shape). Safe to treat as gone.
+    NotOurs(&'static str),
+    /// Ambiguous (timeouts): never proof either way — callers fail safe
+    /// toward the pre-existing TCP behavior instead of deciding.
+    Unclear,
+}
+
+/// Is the listener on `port` OUR debugger bridge? Sends the lightest
+/// side-effect-free read — bare `breaks` list (in-memory intent state on
+/// every bridge: no resume, no arming, no stop required) — and requires a
+/// valid debugger envelope: a JSON object with boolean `ok`, plus a
+/// `stops` array on success or an `error` string on refusal. A stranger
+/// (HTTP server, DAP adapter, node inspector, bare listener) fails
+/// framing or shape and reads as NotOurs; a blackhole that accepts but
+/// never answers reads as Unclear. Total bound is `timeout` (connect +
+/// write + read); refused connections return fast.
+fn probe_session_bridge(port: u16, timeout: Duration) -> Probe {
+    use std::io::{Read, Write};
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let mut sock = match std::net::TcpStream::connect_timeout(&addr, timeout) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            return Probe::NotOurs("connection refused");
+        }
+        Err(_) => return Probe::Unclear,
+    };
+    if sock.set_read_timeout(Some(timeout)).is_err()
+        || sock.set_write_timeout(Some(timeout)).is_err()
+    {
+        return Probe::Unclear;
+    }
+    if sock
+        .write_all(&dap::encode_message(&json!({"cmd": "breaks"})))
+        .is_err()
+    {
+        // Accepted then died before our write landed: not serving us.
+        return Probe::NotOurs("connection lost");
+    }
+    let mut buf = Vec::with_capacity(65536);
+    let mut tmp = [0u8; 65536];
+    loop {
+        // Probe cap is small on purpose: a legit `breaks` answer is
+        // kilobytes; anything past this is a rogue bridge, not data.
+        // (Headerless junk past the header bound is likewise definitively
+        // not our framing — a real frame always opens with its short
+        // Content-Length header.)
+        if buf.len() > 1024 * 1024 {
+            return Probe::NotOurs("oversize frame");
+        }
+        if dap::validate_frame_size(&buf, 1024 * 1024).is_err() {
+            return Probe::NotOurs("invalid protocol");
+        }
+        match dap::try_decode_message(&buf) {
+            Err(_) => return Probe::NotOurs("invalid protocol"),
+            Ok(Some((v, _))) => {
+                return if valid_breaks_envelope(&v) {
+                    Probe::Ours
+                } else {
+                    Probe::NotOurs("unexpected protocol")
+                };
+            }
+            Ok(None) => {}
+        }
+        match sock.read(&mut tmp) {
+            Ok(0) => return Probe::NotOurs("closed connection"),
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Probe::Unclear
+            }
+            Err(_) => return Probe::NotOurs("connection lost"),
+        }
+    }
+}
+
+/// Debugger-envelope shape for the probe's `breaks` read: success carries
+/// a `stops` array, refusal carries an `error` string (an exited bridge
+/// still answers — its process is up and speaking our protocol).
+fn valid_breaks_envelope(v: &Value) -> bool {
+    match v.get("ok").and_then(|o| o.as_bool()) {
+        Some(true) => v.get("stops").and_then(|s| s.as_array()).is_some(),
+        Some(false) => v.get("error").and_then(|e| e.as_str()).is_some(),
+        None => false,
+    }
 }
 
 /// Attach endpoint from a persisted intent: `requestedTarget` only (exact
@@ -3258,6 +3491,23 @@ pub fn close(name: &str) -> anyhow::Result<Value> {
             // the bridge refused (still alive by definition).
             confirmed = resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
         }
+        if !confirmed {
+            // No valid close ACK: ask the port who it is before wedging.
+            // A stranger (or dead listener) is never our bridge — drop the
+            // dir unconfirmed instead of preserving it for a retry that can
+            // never succeed. Never signal/kill by port; a live bridge that
+            // refused, or an ambiguous (timed-out) probe, keeps the old
+            // death-poll path below so a valid session is never deleted on
+            // uncertainty.
+            match probe_session_bridge(port, Duration::from_secs(2)) {
+                Probe::NotOurs(_) => {
+                    std::fs::remove_dir_all(&dir)
+                        .map_err(|e| anyhow::anyhow!("cannot remove session: {e}"))?;
+                    return Ok(json!({"closed": name, "confirmed": false, "target": "main"}));
+                }
+                Probe::Ours | Probe::Unclear => {}
+            }
+        }
         // Then make sure the daemon actually exited before dropping the dir.
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -3313,12 +3563,16 @@ pub fn status() -> Value {
 /// Exact frozen contract — current rows keep every existing key, drop
 /// `observedTarget`, and add `stale`/`unsupported`/`hint`:
 /// - current: v2 CLI markers plus (when session.json is present) a v2
-///   session marker; `stale:false, unsupported:false, hint:null`.
+///   session marker; `stale:false, unsupported:false`, `hint:null` when the
+///   recorded port serves our debugger, otherwise a bounded non-secret
+///   stranger note (`hint` names the port + reason, never secrets).
+///   `alive` is protocol-aware (valid debugger envelope), never bare TCP.
 /// - old/unsupported: anything else (incl. a present session.json lacking
 ///   `schemaVersion==2`, even when the CLI markers are v2); `stale:true,
 ///   unsupported:true, hint:"close '<name>' and recreate (unsupported
 ///   schema v1)"`, with `lang` from lang.json else `"unknown"`, `port`
-///   numeric-u16 else `0`, `alive` by TCP probe iff port nonzero,
+///   numeric-u16 else `0`, `alive` by the same protocol-aware probe iff
+///   port nonzero, `kind`/`stopped`/`lastStop`/`updatedAt` from parseable
 ///   `kind`/`stopped`/`lastStop`/`updatedAt` from parseable session.json
 ///   else `null`, `armed`/`target`/`requestedTarget` from parseable
 ///   stops.json else nulls, `targetIdentity` when a valid layered object
@@ -3350,12 +3604,31 @@ fn session_entry(dir: &std::path::Path) -> Value {
         .and_then(|p| p.as_u64())
         .and_then(|p| u16::try_from(p).ok())
         .unwrap_or(0);
-    let alive = port != 0
-        && std::net::TcpStream::connect_timeout(
-            &format!("127.0.0.1:{port}").parse().unwrap(),
-            Duration::from_millis(300),
-        )
-        .is_ok();
+    // Protocol-aware liveness (not bare TCP): a stranger reusing the port
+    // after our bridge died must never read as live. Bound matches the old
+    // TCP probe (≤300ms per row) so status latency is unchanged. Ambiguous
+    // (timeout) fails closed toward live only with a recent bridge publish
+    // — the same corroboration daemon_alive_in uses.
+    let (alive, alive_hint) = if port == 0 {
+        (false, None)
+    } else {
+        match probe_session_bridge(port, Duration::from_millis(300)) {
+            Probe::Ours => (true, None),
+            Probe::NotOurs(reason) => (
+                false,
+                Some(format!(
+                    "port {port} is not this session's debugger ({reason}); close to clear"
+                )),
+            ),
+            Probe::Unclear => {
+                if published_recently(&live, Duration::from_secs(120)) {
+                    (true, None)
+                } else {
+                    (false, None)
+                }
+            }
+        }
+    };
     // Resume intent: armed counts + target, derived at spawn. Unparseable
     // intent reads as nulls — honest ("unknown"), never fabricated zeros.
     let stops_parsed: Option<Value> = std::fs::read_to_string(dir.join("stops.json"))
@@ -3393,7 +3666,7 @@ fn session_entry(dir: &std::path::Path) -> Value {
             "targetIdentity": identity,
             "stale": false,
             "unsupported": false,
-            "hint": Value::Null,
+            "hint": alive_hint.map(Value::String).unwrap_or(Value::Null),
         })
     } else {
         json!({
@@ -3419,6 +3692,225 @@ fn session_entry(dir: &std::path::Path) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One-purpose in-test listener: every connection is read-drained, then
+    /// answered once with `reply` (empty reply = close with nothing said).
+    /// Returned port is held open by the detached thread for the test.
+    fn spawn_stranger(reply: Vec<u8>) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for mut conn in listener.incoming().flatten() {
+                let _ = conn.set_read_timeout(Some(Duration::from_millis(500)));
+                let mut buf = [0u8; 4096];
+                let _ = conn.read(&mut buf);
+                let _ = conn.write_all(&reply);
+            }
+        });
+        port
+    }
+
+    /// A listener that accepts and never answers (blackhole stranger).
+    fn spawn_blackhole() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut conn in listener.incoming().flatten() {
+                std::thread::sleep(Duration::from_secs(30));
+                let _ = conn.shutdown(std::net::Shutdown::Both);
+            }
+        });
+        port
+    }
+
+    fn framed(body: &Value) -> Vec<u8> {
+        dap::encode_message(body)
+    }
+
+    #[test]
+    fn probe_session_bridge_classifies_ports() {
+        let t = Duration::from_millis(500);
+        // HTTP-shaped garbage: framing validation fails outright —
+        // definitive non-debugger (the later EOF would say the same).
+        assert_eq!(
+            probe_session_bridge(spawn_stranger(b"HTTP/1.0 200 OK\r\n\r\nnope".to_vec()), t),
+            Probe::NotOurs("invalid protocol")
+        );
+        // Immediate EOF with nothing said: nothing serving here.
+        assert_eq!(
+            probe_session_bridge(spawn_stranger(Vec::new()), t),
+            Probe::NotOurs("closed connection")
+        );
+        // Complete but corrupt frame: definitive non-debugger.
+        assert_eq!(
+            probe_session_bridge(
+                spawn_stranger(b"Content-Length: 5\r\n\r\n{oops".to_vec()),
+                t
+            ),
+            Probe::NotOurs("invalid protocol")
+        );
+        // Valid framing, wrong shape (no `ok` envelope).
+        assert_eq!(
+            probe_session_bridge(spawn_stranger(framed(&json!({"hello": 1}))), t),
+            Probe::NotOurs("unexpected protocol")
+        );
+        // Valid debugger envelopes count, success or refusal alike.
+        assert_eq!(
+            probe_session_bridge(spawn_stranger(framed(&json!({"ok": true, "stops": []}))), t),
+            Probe::Ours
+        );
+        assert_eq!(
+            probe_session_bridge(
+                spawn_stranger(framed(
+                    &json!({"ok": false, "error": "target VM has exited"})
+                )),
+                t
+            ),
+            Probe::Ours
+        );
+        // Nothing listens: definitively gone.
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        assert_eq!(
+            probe_session_bridge(dead, t),
+            Probe::NotOurs("connection refused")
+        );
+        // Blackhole (accepts, never answers): ambiguous, never a verdict.
+        assert_eq!(
+            probe_session_bridge(spawn_blackhole(), Duration::from_millis(200)),
+            Probe::Unclear
+        );
+    }
+
+    /// A current-schema dir whose port serves garbage: alive:false with a
+    /// bounded non-secret hint (never true on TCP-only).
+    #[test]
+    fn session_entry_stranger_port_is_not_alive() {
+        let dir = tmpdir("entry-stranger");
+        let port = spawn_stranger(b"nope".to_vec());
+        std::fs::write(
+            dir.join("session.json"),
+            format!(
+                r#"{{"name":"x","kind":"launch","port":{port},"stopped":false,"schemaVersion":2}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("lang.json"), r#"{"lang":"py","schemaVersion":2}"#).unwrap();
+        std::fs::write(
+            dir.join("stops.json"),
+            r#"{"breaks":[],"logpoints":[],"watches":[],"exits":[],
+                "sources":[],"timeout":7,"schemaVersion":2}"#,
+        )
+        .unwrap();
+        let v = session_entry(&dir);
+        assert_eq!(v["unsupported"], json!(false));
+        assert_eq!(v["alive"], json!(false));
+        let hint = v["hint"].as_str().expect("stranger rows carry a hint");
+        assert!(hint.contains(&port.to_string()), "{hint}");
+        assert!(hint.contains("not this session's debugger"), "{hint}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same dir shape against a valid-envelope mimic: alive:true, hint null.
+    #[test]
+    fn session_entry_valid_bridge_is_alive() {
+        let dir = tmpdir("entry-valid");
+        let port = spawn_stranger(framed(&json!({"ok": true, "stops": []})));
+        std::fs::write(
+            dir.join("session.json"),
+            format!(
+                r#"{{"name":"x","kind":"launch","port":{port},"stopped":false,"schemaVersion":2}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("lang.json"), r#"{"lang":"py","schemaVersion":2}"#).unwrap();
+        std::fs::write(
+            dir.join("stops.json"),
+            r#"{"breaks":[],"logpoints":[],"watches":[],"exits":[],
+                "sources":[],"timeout":7,"schemaVersion":2}"#,
+        )
+        .unwrap();
+        let v = session_entry(&dir);
+        assert_eq!(v["alive"], json!(true));
+        assert!(v["hint"].is_null());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_confirmed_breaks_dedups_exact_raws() {
+        let dir = tmpdir("append-dedup");
+        std::fs::write(
+            dir.join("stops.json"),
+            r#"{"breaks":["a.py:1"],"logpoints":[],"watches":[],"exits":[],
+                "sources":[],"timeout":7}"#,
+        )
+        .unwrap();
+        append_confirmed_breaks_in(&dir, &["a.py:1".to_string(), "b.py:2|x>1".to_string()])
+            .unwrap();
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("stops.json")).unwrap())
+                .unwrap();
+        assert_eq!(v["breaks"], json!(["a.py:1", "b.py:2|x>1"]));
+        assert!(!dir.join("breaks.lock").exists(), "lock never lingers");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_confirmed_breaks_drops_legacy_duplicates() {
+        let dir = tmpdir("remove-dups");
+        std::fs::write(
+            dir.join("stops.json"),
+            r#"{"breaks":["a.py:1","a.py:1","b.py:2"],"logpoints":[],"watches":[],
+                "exits":[],"sources":[],"timeout":7}"#,
+        )
+        .unwrap();
+        remove_confirmed_breaks_in(&dir, &["a.py:1".to_string()]).unwrap();
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("stops.json")).unwrap())
+                .unwrap();
+        // All copies go (a leftover would ghost-resurrect the intent).
+        assert_eq!(v["breaks"], json!(["b.py:2"]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn breaks_lock_serializes_concurrent_appends() {
+        // Eight threads racing the same identical add: the file holds
+        // exactly one copy (lock serializes the read-modify-write so no
+        // stale read can duplicate).
+        let dir = tmpdir("append-race");
+        std::fs::write(
+            dir.join("stops.json"),
+            r#"{"breaks":[],"logpoints":[],"watches":[],"exits":[],
+                "sources":[],"timeout":7}"#,
+        )
+        .unwrap();
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    append_confirmed_breaks_in(&dir, &["a.py:1".to_string()]).unwrap();
+                });
+            }
+        });
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("stops.json")).unwrap())
+                .unwrap();
+        assert_eq!(v["breaks"], json!(["a.py:1"]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ephemeral_target_is_non_main_only() {
+        // Omitted and explicit main are the global path (persisted);
+        // only child/worker targets skip stops.json persistence.
+        assert!(!is_ephemeral_target(None));
+        assert!(!is_ephemeral_target(Some("main")));
+        assert!(is_ephemeral_target(Some("child:1")));
+        assert!(is_ephemeral_target(Some("worker:abc")));
+    }
 
     #[test]
     fn logpoints_only_intent_gates_the_collect_logs_fallback() {
@@ -3649,18 +4141,42 @@ mod tests {
 
     #[test]
     fn target_normalize_keeps_main_and_rejects_on_single_target_langs() {
-        // Omitted and explicit main are identical (legacy wire behavior).
+        // Omitted target is auto-select on every lang.
         assert_eq!(
             normalize_target_for_lang_opt(Some("java"), None).unwrap(),
             None
         );
         assert_eq!(
+            normalize_target_for_lang_opt(Some("py"), None).unwrap(),
+            None
+        );
+        assert_eq!(normalize_target_for_lang_opt(None, None).unwrap(), None);
+        // Explicit main is accepted everywhere but only pinned on
+        // multi-target/unknown langs; main-only adapters keep the legacy
+        // no-op (they can only ever serve main).
+        assert_eq!(
             normalize_target_for_lang_opt(Some("browser"), Some("main")).unwrap(),
             None
         );
         assert_eq!(
-            normalize_target_for_lang_opt(Some("py"), Some("main")).unwrap(),
+            normalize_target_for_lang_opt(Some("java"), Some("main")).unwrap(),
             None
+        );
+        assert_eq!(
+            normalize_target_for_lang_opt(Some("py"), Some("main")).unwrap(),
+            Some("main".to_string())
+        );
+        assert_eq!(
+            normalize_target_for_lang_opt(Some("node"), Some("main")).unwrap(),
+            Some("main".to_string())
+        );
+        assert_eq!(
+            normalize_target_for_lang_opt(None, Some("main")).unwrap(),
+            Some("main".to_string())
+        );
+        assert_eq!(
+            normalize_target_for_lang_opt(Some("go"), Some("main")).unwrap(),
+            Some("main".to_string())
         );
         // Multi-target langs pass selectors through for bridge validation.
         assert_eq!(
@@ -3683,6 +4199,51 @@ mod tests {
             normalize_target_for_lang_opt(Some("go"), Some("child:7")).unwrap(),
             Some("child:7".to_string())
         );
+    }
+
+    #[test]
+    fn target_normalize_explicit_main_differs_from_omitted() {
+        // The A1 contract: explicit `--target main` must not collapse into
+        // auto-select on multi-target langs (a recently stopped child would
+        // otherwise serve vars/context/continue instead of main).
+        for lang in [Some("py"), Some("node"), None, Some("mystery")] {
+            assert_eq!(
+                normalize_target_for_lang_opt(lang, Some("main")).unwrap(),
+                Some("main".to_string()),
+                "explicit main pins main on {lang:?}"
+            );
+            assert_eq!(
+                normalize_target_for_lang_opt(lang, None).unwrap(),
+                None,
+                "omitted still auto-selects on {lang:?}"
+            );
+        }
+        // Main-only langs: explicit main stays accepted and cheap.
+        for lang in [Some("java"), Some("browser")] {
+            assert_eq!(
+                normalize_target_for_lang_opt(lang, Some("main")).unwrap(),
+                None,
+                "explicit main is a no-op on {lang:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reload_gate_is_browser_only() {
+        assert!(reload_gate(Some("browser")).is_ok());
+        for lang in [
+            Some("py"),
+            Some("node"),
+            Some("java"),
+            None,
+            Some("mystery"),
+        ] {
+            let err = reload_gate(lang).expect_err("non-browser reload must fail");
+            assert!(
+                format!("{err:#}").contains("browser-only"),
+                "gate names the browser-only contract on {lang:?}: {err:#}"
+            );
+        }
     }
 
     #[test]

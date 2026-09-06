@@ -1361,8 +1361,7 @@ class BridgeSession {
                 if (st.activeHandlers >= MAX_ACTIVE_HANDLERS) {
                     try {
                         sock.setSoTimeout(5000);
-                        BridgeProto.writeFrame(sock.getOutputStream(),
-                                "{\"ok\":false,\"error\":\"overloaded: too many active handlers\"}");
+                        BridgeProto.writeFrame(sock.getOutputStream(), overloadedJson());
                     } catch (Exception ignored) {}
                     try { sock.close(); } catch (Exception ignored) {}
                     continue;
@@ -1380,6 +1379,9 @@ class BridgeSession {
      *  Socket IO never holds sessionLock; dispatch/cases take it for
      *  bounded sections only. A client disconnect drops only its own
      *  response — target-side work still publishes. */
+    static String overloadedJson() {
+        return "{\"ok\":false,\"error\":\"overloaded: too many active handlers\",\"target\":\"main\"}";
+    }
     static void handleOne(SessionState st, Socket sock) {
         try {
             sock.setSoTimeout(5000);
@@ -1389,7 +1391,7 @@ class BridgeSession {
             } catch (Exception e) {
                 try {
                     BridgeProto.writeFrame(sock.getOutputStream(),
-                            "{\"ok\":false,\"error\":" + JdiBridge.quote(JdiBridge.shortMsg(e)) + "}");
+                            "{\"ok\":false,\"error\":" + JdiBridge.quote(JdiBridge.shortMsg(e)) + ",\"target\":\"main\"}");
                 } catch (Exception ignored) {}
                 return;
             }
@@ -1406,20 +1408,25 @@ class BridgeSession {
                 // now (launch kills its VM, attach detaches). In-flight
                 // resume handlers abort on the torn-down transport.
                 try {
-                    BridgeProto.writeFrame(sock.getOutputStream(), "{\"ok\":true,\"closed\":true}");
+                    BridgeProto.writeFrame(sock.getOutputStream(), "{\"ok\":true,\"closed\":true,\"target\":\"main\"}");
                 } catch (Exception ignored) {}
                 synchronized (st.sessionLock) {
                     st.closing = true;
                 }
                 cleanup(st);
             } catch (Exception e) {
+                // Central ok:false envelope: every dispatch failure (busy,
+                // closing, stopped/exited, frame validation, unknown cmd,
+                // capture stages) names target main here, so no per-case
+                // append can be missed or doubled (this string is built
+                // fresh and never carries a target yet).
                 String errBody = "{\"ok\":false,\"error\":"
                         + JdiBridge.quote(JdiBridge.shortMsg(e));
                 if (e instanceof BridgeException
                         && ((BridgeException) e).waitContextJson != null) {
                     errBody += ",\"waitContext\":" + ((BridgeException) e).waitContextJson;
                 }
-                errBody += "}";
+                errBody += ",\"target\":\"main\"}";
                 try {
                     BridgeProto.writeFrame(sock.getOutputStream(), errBody);
                 } catch (Exception ignored) {}
@@ -1678,7 +1685,7 @@ class BridgeSession {
                     // stale-shaped, never blocking delivery.
                     String cached = st.cachedThreads;
                     return "{\"ok\":true,\"running\":true,\"threads\":"
-                            + (cached == null ? "[]" : cached) + "}";
+                            + (cached == null ? "[]" : cached) + ",\"target\":\"main\"}";
                 }
                 boolean wasSuspended = st.suspended;
                 if (!wasSuspended) {
@@ -1699,7 +1706,7 @@ class BridgeSession {
                     }
                 }
                 st.cachedThreads = dump;
-                return "{\"ok\":true,\"running\":" + (!wasSuspended) + ",\"threads\":" + dump + "}";
+                return "{\"ok\":true,\"running\":" + (!wasSuspended) + ",\"threads\":" + dump + ",\"target\":\"main\"}";
                 }
             }
             case "breaks": {
@@ -1728,7 +1735,7 @@ class BridgeSession {
                 // lines evicted by the ring; truncated = the tail was cut OR
                 // any line was ever evicted (historical drops, not just cut).
                 return "{\"ok\":true,\"total\":" + total + ",\"truncated\":" + (total > lines.size() || st.logDropped > 0)
-                        + ",\"dropped\":" + st.logDropped + ",\"lines\":" + toJsonArray(lines) + "}";
+                        + ",\"dropped\":" + st.logDropped + ",\"lines\":" + toJsonArray(lines) + ",\"target\":\"main\"}";
                 }
             }
             case "context": {
@@ -1746,18 +1753,15 @@ class BridgeSession {
             case "stack": {
                 synchronized (st.sessionLock) {
                 requireStopped(st);
-                return "{\"ok\":true,\"frames\":" + BridgeSnapshot.framesJson(st.thread, false) + "}";
+                return "{\"ok\":true,\"frames\":" + BridgeSnapshot.framesJson(st.thread, false) + ",\"target\":\"main\"}";
                 }
             }
             case "vars": {
                 synchronized (st.sessionLock) {
                 requireStopped(st);
-                int frame = req.containsKey("frame") ? Integer.parseInt(req.get("frame")) : 0;
                 List<StackFrame> frames = BridgeSnapshot.safeFrames(st.thread);
-                if (frame < 0 || frame >= frames.size()) {
-                    throw new BridgeException("no frame " + frame + " (have " + frames.size() + ")");
-                }
-                return "{\"ok\":true,\"frame\":" + frame + ",\"locals\":" + BridgeSnapshot.localsJson(frames.get(frame)) + "}";
+                int frame = parseFrameIndex(req, frames, "vars");
+                return "{\"ok\":true,\"frame\":" + frame + ",\"locals\":" + BridgeSnapshot.localsJson(frames.get(frame)) + ",\"target\":\"main\"}";
                 }
             }
             case "eval": {
@@ -1765,13 +1769,10 @@ class BridgeSession {
                 requireStopped(st);
                 String expr = req.get("expr");
                 if (expr == null) throw new BridgeException("eval needs an expr");
-                int frame = req.containsKey("frame") ? Integer.parseInt(req.get("frame")) : 0;
                 List<StackFrame> frames = BridgeSnapshot.safeFrames(st.thread);
-                if (frame < 0 || frame >= frames.size()) {
-                    throw new BridgeException("no frame " + frame + " (have " + frames.size() + ")");
-                }
+                int frame = parseFrameIndex(req, frames, "eval");
                 String value = BridgeEval.evalExpr(st.thread, frames.get(frame), expr);
-                return "{\"ok\":true,\"expr\":" + JdiBridge.quote(expr) + ",\"value\":" + JdiBridge.quote(value) + "}";
+                return "{\"ok\":true,\"expr\":" + JdiBridge.quote(expr) + ",\"value\":" + JdiBridge.quote(value) + ",\"target\":\"main\"}";
                 }
             }
             case "continue": {
@@ -2418,6 +2419,31 @@ class BridgeSession {
         if (st.exited) throw new BridgeException("target VM has exited — close this session");
     }
 
+    /** Uniform frame validation shared by vars/eval (same contract on all
+     *  four bridges, with one intentional representation gap: the flat
+     *  request parser stores every value as a String, so a JSON numeric
+     *  {@code 1.0} arrives as {@code "1.0"} — indistinguishable from the
+     *  quoted string {@code "1.0"}, which must stay invalid. Java therefore
+     *  rejects {@code "1.0"} while the other bridges accept numeric
+     *  {@code 1.0}; canonical integer JSON ({@code 1}/{@code "1"}) agrees
+     *  everywhere. Absent or JSON null reads as 0; otherwise 1–15 ASCII
+     *  digits (longer would lose precision on double-based bridges, so it
+     *  is a typed error everywhere). Malformed, fractional, negative, or
+     *  over-long input is {@code <what> needs integer frame} (never
+     *  coerced, never an internal/parse message); a well-formed index past
+     *  the end is {@code no frame N (have M)}. requireStopped still runs
+     *  first at the call sites. */
+    static int parseFrameIndex(Map<String, String> req, List<StackFrame> frames,
+            String what) throws BridgeException {
+        int total = frames == null ? 0 : frames.size();
+        String raw = req.get("frame");
+        if (raw == null || raw.equals("null")) return 0;
+        if (!raw.matches("[0-9]{1,15}")) throw new BridgeException(what + " needs integer frame");
+        long v = Long.parseLong(raw);
+        if (v >= total) throw new BridgeException("no frame " + v + " (have " + total + ")");
+        return (int) v;
+    }
+
     /** Attribute a reported breakpoint stop to its line/method records.
      *  Step landings never reach here (StepEvent branch doesn't count), so
      *  dead breakpoints honestly read 0. */
@@ -2479,7 +2505,7 @@ class BridgeSession {
      */
 
     static String breaksJson(SessionState st) throws Exception {
-        return "{\"ok\":true,\"stops\":" + stopsArrayJson(st) + "}";
+        return "{\"ok\":true,\"stops\":" + stopsArrayJson(st) + ",\"target\":\"main\"}";
     }
 
     /**
@@ -2572,7 +2598,7 @@ class BridgeSession {
             added.append('}');
         }
         added.append(']');
-        return "{\"ok\":true,\"added\":" + added + ",\"stops\":" + stopsArrayJson(st) + "}";
+        return "{\"ok\":true,\"added\":" + added + ",\"stops\":" + stopsArrayJson(st) + ",\"target\":\"main\"}";
     }
 
     /** Line-break-only parse (mirrors BridgeCli.parseBreakpoint normalization). */
@@ -2627,7 +2653,7 @@ class BridgeSession {
         }
         if (matched.isEmpty()) {
             return "{\"ok\":true,\"removed\":[],\"missing\":" + toJsonArray(missing)
-                    + ",\"stops\":" + stopsArrayJson(st) + "}";
+                    + ",\"stops\":" + stopsArrayJson(st) + ",\"target\":\"main\"}";
         }
         return dropBreakKeys(st, matched, missing);
     }
@@ -2678,7 +2704,7 @@ class BridgeSession {
             }
         }
         if (ordered.isEmpty()) {
-            return "{\"ok\":true,\"removed\":[],\"stops\":" + stopsArrayJson(st) + "}";
+            return "{\"ok\":true,\"removed\":[],\"stops\":" + stopsArrayJson(st) + ",\"target\":\"main\"}";
         }
         return dropBreakKeys(st, ordered, new ArrayList<>());
     }
@@ -2745,7 +2771,7 @@ class BridgeSession {
                 throw new BridgeException("breaks remove failed: " + failed + "]");
             }
             return "{\"ok\":true,\"removed\":[],\"missing\":" + toJsonArray(missing)
-                    + ",\"stops\":" + stopsArrayJson(st) + "}";
+                    + ",\"stops\":" + stopsArrayJson(st) + ",\"target\":\"main\"}";
         }
         StringBuilder resp = new StringBuilder("{\"ok\":true,\"removed\":");
         resp.append(removed).append(']');
@@ -2760,7 +2786,8 @@ class BridgeSession {
         if (warning != null) {
             resp.append(",\"warning\":").append(JdiBridge.quote(warning));
         }
-        return resp.append('}').toString();
+        resp.append(",\"target\":\"main\"}");
+        return resp.toString();
     }
 
     /** Single combined remove/clear warning (null when nothing to report).

@@ -917,3 +917,25 @@ for (const [name, mod, mkSession] of [['node', node, nodeSession], ['browser', b
     assert.equal(varsTruncated, true);
   });
 }
+
+test('node capture: one pump, one park — no second wait after the first stop', async () => {
+  // A single fresh park must be collected, unplanted, and resumed; a
+  // second pump would discard it and demand another stop (old code
+  // pumped twice: the first park leaked, still suspended).
+  const dir = tmpdir('wc-node-');
+  const file = writeJs(dir);
+  const st = nodeSession(dir);
+  st.cdp = { request: async () => ({}) };
+  let pumps = 0;
+  st.pump = async () => {
+    pumps += 1;
+    parkMain(st, file, 5);
+    return 'stopped';
+  };
+  const resp = await st.cmdCapture({}, 5);
+  assert.equal(pumps, 1, 'exactly one pump call per capture');
+  assert.equal(resp.target, 'main');
+  assert.equal(resp.resumed, true);
+  assert.equal(resp.targetWasPaused, false);
+  assert.ok(!st.paused, 'the served park was resumed, not leaked');
+});

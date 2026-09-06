@@ -857,6 +857,22 @@ class ChildTarget:
         self._suspect_warned = False
 
 
+def _serialized_gate(fn):
+    """Serialize one breaks-mutation entry on Session._gate (reentrant, so
+    dispatch acceptance, _TargetScope, and nested mutation calls stay
+    safe). Serve runs one thread per connection: without this, concurrent
+    identical adds both pass the have-check, then plant and record twice.
+    With it, check+plant+state mutation is atomic — the second add sees
+    the first's state and reports empty-added. DAP under _gate follows the
+    existing _TargetScope precedent (bounded 5s per file, order _gate ->
+    mu, never reverse)."""
+    def wrap(self, *args, **kwargs):
+        with self._gate:
+            return fn(self, *args, **kwargs)
+    wrap.__name__ = fn.__name__
+    return wrap
+
+
 class Session:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -2780,9 +2796,29 @@ class Session:
             if t is not None and t._awaiting_continued and not t.suspended:
                 t._awaiting_continued = False
 
-    def pump(self, timeout):
-        """Wait for the next stopped/exited on ANY target; returns the
-        parking target id (the parked target is also recorded in
+    def _pump_hit_ok(self, want):
+        """Whether the just-consumed park satisfies this waiter: omitted
+        waits take any park; explicit waits (want pins one target id) take
+        only want's own park. Other targets' parks stay parked (visible
+        via context/roster) — just never returned here."""
+        if want is None:
+            return True
+        return getattr(self._park_local, "parked", None) == want
+
+    def _pump_for(self, timeout, want):
+        """Target-scoped pump entry: single-arg call for any-target waits
+        (legacy fake_pump(timeout) doubles stay compatible), two-arg only
+        when pinned to one target."""
+        if want is None:
+            return self.pump(timeout)
+        return self.pump(timeout, want)
+
+    def pump(self, timeout, want=None):
+        """Wait for the next stopped/exited on ANY target (omitted), or only
+        on want (explicit --target): stops on other targets are still
+        consumed and parked (visible via context/roster, never discarded)
+        but never returned — the waiter keeps waiting for want until the
+        deadline. Returns the parking target id (also recorded in
         _last_park_target) or raises. Concurrent pumps (M5: independent
         resumes on different targets) share every connection: stash pops
         and wire reads are mu-protected, dispatch is gate-protected, and
@@ -2798,7 +2834,7 @@ class Session:
                 if msg is None:
                     break
                 r = self._dispatch_pumped(msg, tid)
-                if r:
+                if r and self._pump_hit_ok(want):
                     return r
         while True:
             if not am_owner(self.cfg.dir, self._nonce):
@@ -2815,9 +2851,11 @@ class Session:
                 # The resume produced only held suspects: park the first
                 # still-live one on any target instead of timing out, then
                 # close every episode either way so later genuine stops park
-                # at once.
+                # at once. An explicit waiter only accepts its own target
+                # here — another target's probe park stays parked while we
+                # report the honest timeout.
                 r = self._probe_all_suspects()
-                if r:
+                if r and self._pump_hit_ok(want):
                     return r
                 self._close_suspect_episodes()
                 raise StopTimeout(self.timeout_text(timeout))
@@ -2828,7 +2866,7 @@ class Session:
                     if msg is None:
                         break
                     r = self._dispatch_pumped(msg, tid)
-                    if r:
+                    if r and self._pump_hit_ok(want):
                         return r
             # Buffered/coalesced data before selecting: DapConn keeps an
             # internal buffer, so a select-first loop would stall on an
@@ -2850,7 +2888,7 @@ class Session:
                         break
                     progressed = True
                     r = self._dispatch_pumped(msg, tid)
-                    if r:
+                    if r and self._pump_hit_ok(want):
                         return r
             if progressed:
                 continue  # re-check deadline/owner before selecting
@@ -2869,9 +2907,11 @@ class Session:
                 if remaining > 2:
                     # No `continued` yet (older adapters may never send one):
                     # bounded probe of the held stops on any target (main or
-                    # a resumed child), then keep waiting.
+                    # a resumed child), then keep waiting. An explicit
+                    # waiter skips another target's probe park (it stays
+                    # parked) and keeps waiting for its own.
                     r = self._probe_all_suspects()
-                    if r:
+                    if r and self._pump_hit_ok(want):
                         return r
                 continue  # idle second; re-check deadline
             for tid, conn, sock in entries:
@@ -2896,7 +2936,7 @@ class Session:
                         continue
                     raise
                 r = self._dispatch_pumped(msg, tid)
-                if r:
+                if r and self._pump_hit_ok(want):
                     return r
 
     @staticmethod
@@ -3239,9 +3279,38 @@ class Session:
         self.require_stopped()
         return {"ok": True, "frames": self.frames_json(False)}
 
+    def _frame_index(self, req, what):
+        """Uniform frame validation shared by vars/eval (same contract on
+        all four bridges): absent/None reads as 0; an int (never bool) ≥ 0,
+        an integer-valued finite float ≥ 0, or 1–15 ASCII digits read as the
+        index. Malformed, fractional, negative, over-long, or mistyped
+        input is `<what> needs integer frame` (a typed BridgeErr — never
+        coerced to 0, never an internal ValueError). Range stays with
+        frame_entry (`no frame N (have M)`); require_stopped still runs
+        first at the call sites."""
+        raw = req.get("frame", 0) if isinstance(req, dict) else 0
+        if raw is None:
+            return 0
+        if isinstance(raw, bool):
+            raise BridgeErr(f"{what} needs integer frame")
+        if isinstance(raw, int):
+            if raw < 0:
+                raise BridgeErr(f"{what} needs integer frame")
+            return raw
+        if isinstance(raw, float):
+            if not math.isfinite(raw) or not raw.is_integer() or raw < 0:
+                raise BridgeErr(f"{what} needs integer frame")
+            return int(raw)
+        if isinstance(raw, str):
+            if not raw or len(raw) > 15 or not raw.isascii() \
+                    or not raw.isdigit():
+                raise BridgeErr(f"{what} needs integer frame")
+            return int(raw)
+        raise BridgeErr(f"{what} needs integer frame")
+
     def cmd_vars(self, req):
         self.require_stopped()
-        frame = int(req.get("frame", 0))
+        frame = self._frame_index(req, "vars")
         self.frame_entry(frame)  # bounds-check (widens fetch if needed)
         return {"ok": True, "frame": frame, "locals": self.frame_locals(frame)}
     def cmd_eval(self, req):
@@ -3249,7 +3318,7 @@ class Session:
         expr = req.get("expr")
         if expr is None:
             raise BridgeErr("eval needs an expr")
-        frame = int(req.get("frame", 0))
+        frame = self._frame_index(req, "eval")
         fid = self.frame_entry(frame)["id"]
         if expr.strip().startswith("refs(") and expr.strip().endswith(")"):
             return {"ok": True, "expr": expr,
@@ -3330,10 +3399,13 @@ class Session:
             out["trackingWarning"] = warn
         return out
 
-    def _resume_and_wait(self, timeout, tid="main"):
-        """Resume one target after step/continue and wait for the next stop
-        on ANY target. The response names the target that actually parked
-        (which may differ from the resumed one)."""
+    def _resume_and_wait(self, timeout, tid="main", explicit=False):
+        """Resume one target after step/continue and wait for a selectable
+        stop: only the resumed target's own fresh park when explicit, any
+        fresh park when omitted (stale pre-existing parks never satisfy —
+        the resume unparked our target first). The response names the
+        target that actually parked (which may differ from the resumed one
+        only for omitted waits)."""
         self._pending_target = tid
         try:
             with self._TargetScope(self, tid):
@@ -3360,7 +3432,7 @@ class Session:
                 self.frames = []
                 self.publish_state(False)
             self._park_local.parked = None
-            self.pump(timeout)
+            self._pump_for(timeout, tid if explicit else None)
             # Attribute our own stop: the pump records the parking target
             # thread-locally (concurrent pumps must not share
             # _last_park_target). Legacy/unknown values fall back to the
@@ -3399,7 +3471,8 @@ class Session:
             self.dap_request(cmd, {"threadId": self.thread_id,
                                    "singleThread": True,
                                    "granularity": "statement"})
-        return self._resume_and_wait(timeout, tid)
+        explicit = isinstance(req, dict) and req.get("target") is not None
+        return self._resume_and_wait(timeout, tid, explicit)
 
     def cmd_continue(self, req, timeout):
         tid = self.resolve_target(req)
@@ -3407,7 +3480,8 @@ class Session:
             self.require_live()
             if self.suspended:
                 self.dap_request("continue", {"threadId": self.thread_id})
-        return self._resume_and_wait(timeout, tid)
+        explicit = isinstance(req, dict) and req.get("target") is not None
+        return self._resume_and_wait(timeout, tid, explicit)
 
     # -- event-driven wait + bounded auto-resuming capture (UX batch)
 
@@ -3481,8 +3555,10 @@ class Session:
         """Pure long-poll: NEVER resumes. Immediate success when the
         selected target is already parked; otherwise pump for the next
         fresh stop (any target when omitted — the response stamps the
-        actual one). Timeout preserves session/intents (typed message)."""
+        actual one; only the requested target when explicit). Timeout
+        preserves session/intents (typed message)."""
         tid = self.resolve_target(req)
+        explicit = isinstance(req, dict) and req.get("target") is not None
         with self._TargetScope(self, tid):
             self.require_live()
             if self._parked_now():
@@ -3494,7 +3570,7 @@ class Session:
         self._park_local.parked = None
         started = time.time()
         try:
-            self.pump(timeout)
+            self._pump_for(timeout, tid if explicit else None)
         except StopTimeout as e:
             if e.wait_context is None:
                 e.wait_context = self._wait_context(timeout, started)
@@ -3752,7 +3828,8 @@ class Session:
         started = time.time()
         try:
             self._park_local.parked = None
-            self.pump(timeout)
+            want = tid if isinstance(req, dict) and req.get("target") is not None else None
+            self._pump_for(timeout, want)
         except Exception as orig:
             # Timeout/exit: nothing parked by us — no resume — but the
             # ephemeral must not leak: remove best-effort, then re-raise
@@ -3967,25 +4044,71 @@ class Session:
                 except BridgeErr:
                     return
 
-    def cmd_threads(self, req=None):
-        # Bare threads stays main-focused (unchanged single-target shape);
-        # --target X dumps that target's threads instead.
-        req = req or {}
-        tid = self.resolve_target(req)
+    def _threads_for(self, tid):
+        """One target's live thread dump: (running, threads). Busy targets
+        (a resume outstanding) serve the published running truth with zero
+        DAP traffic — never waits, never opens a second DAP reader."""
         with self._gate:
             busy = tid in self._outstanding
         if busy:
             # M5 live read: never waits behind the outstanding resume and
             # never opens a second DAP reader — serve the published running
             # truth with zero DAP traffic (no stale frames as current).
-            return self.stamp({"ok": True, "running": True,
-                               "threads": []}, tid)
+            return True, []
         with self._TargetScope(self, tid):
             if self.exited:
                 raise BridgeErr("target VM has exited — close this session")
-            resp = {"ok": True, "running": not self.suspended,
-                    "threads": self.threads_dump()}
-        return self.stamp(resp, tid)
+            return (not self.suspended), self.threads_dump()
+
+    def cmd_threads(self, req=None):
+        # Explicit --target X (including main) dumps that target only
+        # (unchanged single-target shape). Bare threads aggregates main plus
+        # every live non-ignored non-exited child in targets/breaks order
+        # (main first, then creation order); exited history is excluded.
+        # Top-level running/threads stay the auto-selected target's dump and
+        # the per-target entries ride additively under `targets` with a
+        # `selected` stamp, so single-target sessions read byte-identical.
+        req = req or {}
+        if isinstance(req, dict) and req.get("target") is not None:
+            tid = self.resolve_target(req)
+            running, threads = self._threads_for(tid)
+            return self.stamp({"ok": True, "running": running,
+                               "threads": threads}, tid)
+        with self._gate:
+            selected = self._resolve_target_inner(req)
+            if self.exited:
+                raise BridgeErr("target VM has exited — close this session")
+            roster = ["main"] + [t.id for t in self.active_nonmain()]
+        if len(roster) == 1:
+            running, threads = self._threads_for(selected)
+            return self.stamp({"ok": True, "running": running,
+                               "threads": threads}, selected)
+        # A child that exits (or is released) between the roster snapshot
+        # and its dump is skipped — never failing the whole call; the
+        # survivors stay attributable. Anything else (e.g. a DAP read
+        # failure, or main's own exit) still propagates.
+        entries = []
+        for tid in roster:
+            try:
+                running, threads = self._threads_for(tid)
+            except (KeyError, BridgeErr) as e:
+                if tid != "main" and (isinstance(e, KeyError)
+                                      or "has exited" in str(e)
+                                      or "was released" in str(e)):
+                    continue
+                raise
+            entries.append({"target": tid, "running": running,
+                            "threads": threads})
+        if not entries:
+            # Everything churned: serve the selected target honestly
+            # (raises).
+            running, threads = self._threads_for(selected)
+            return self.stamp({"ok": True, "running": running,
+                               "threads": threads}, selected)
+        sel = next((e for e in entries if e["target"] == selected), entries[0])
+        return self.stamp({"ok": True, "running": sel["running"],
+                           "threads": sel["threads"], "targets": entries,
+                           "selected": sel["target"]}, sel["target"])
 
     def cmd_breaks(self, req=None):
         # Bare breaks aggregates every target: main records plus each live
@@ -4005,6 +4128,7 @@ class Session:
                     stops.append(dict(r, target=tid))
             return self.stamp({"ok": True, "stops": stops}, selected)
 
+    @_serialized_gate
     def cmd_breaks_add(self, req):
         """Additive line breaks on a live session (running or parked — never
         suspended/resumed here). The whole batch validates first (parse,
@@ -4264,6 +4388,7 @@ class Session:
                         [b[1] for b in scratch.breaks],
                         [b[2] for b in scratch.breaks]))
 
+    @_serialized_gate
     def _add_ephemeral(self, tid, raws):
         """Ephemeral target-scoped add on one child: same validation as the
         global path, but matches only that child's planted lines and never

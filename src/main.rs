@@ -209,14 +209,7 @@ fn dispatch(session: &str, cmd: cli::Commands) -> (&'static str, anyhow::Result<
                 target.as_deref(),
             ),
         ),
-        cli::Commands::Reload { timeout } => (
-            "reload",
-            session::forward(
-                session,
-                &json!({"cmd": "reload", "timeout": timeout}),
-                Duration::from_secs(timeout.saturating_add(5)),
-            ),
-        ),
+        cli::Commands::Reload { timeout } => ("reload", session::cmd_reload(session, timeout)),
         cli::Commands::Context { target } => (
             "context",
             session::cmd_context_target(session, target.as_deref()),

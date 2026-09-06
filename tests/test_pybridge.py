@@ -1606,6 +1606,289 @@ class BridgeTests(unittest.TestCase):
             resp = st.cmd_breaks({})
             self.assertEqual(resp["target"], "main")
 
+    def test_bare_threads_aggregates_main_plus_live_children(self):
+        # Bare threads lists main + every live child in roster order, each
+        # attributable by target; top-level stays the auto-selected target's
+        # dump. Explicit --target main keeps the single-target shape.
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            st.suspended = True
+            st._main_seq = 1
+            st._stop_seq = 1
+            st.dap_request = Mock(return_value={"threads": []})
+            # Single-target bare: legacy shape, no aggregation keys.
+            resp = st.cmd_threads({})
+            self.assertTrue(resp["ok"])
+            self.assertEqual(resp["target"], "main")
+            self.assertNotIn("targets", resp)
+            self.assertNotIn("selected", resp)
+            # Parked child newer than main: auto-select serves the child.
+            live = self.fake_child(st, 61, suspended=True)
+            ignored = self.fake_child(st, 62)
+            ignored.state = "ignored"
+            resp = st.cmd_threads({})
+            self.assertTrue(resp["ok"])
+            self.assertEqual(resp["selected"], "child:61")
+            self.assertEqual(resp["target"], "child:61")
+            ids = [e["target"] for e in resp["targets"]]
+            self.assertEqual(ids, ["main", "child:61"])
+            main_e, child_e = resp["targets"]
+            self.assertFalse(main_e["running"])
+            self.assertEqual(main_e["threads"], [])
+            self.assertFalse(child_e["running"])
+            self.assertEqual(child_e["threads"], [])
+            # Top-level stays the selected target's dump.
+            self.assertEqual(resp["running"], child_e["running"])
+            self.assertEqual(resp["threads"], child_e["threads"])
+            # Busy child appears truthfully running without blocking.
+            st._outstanding["child:61"] = "continue"
+            st.dap_request = Mock(return_value={"threads": []})
+            busy = st.cmd_threads({})
+            got = {e["target"]: e for e in busy["targets"]}
+            self.assertEqual(got["child:61"]["running"], True)
+            self.assertEqual(got["child:61"]["threads"], [])
+            self.assertIn("main", got)
+            del st._outstanding["child:61"]
+            # Explicit main pins main even though the child stopped later.
+            st.dap_request = Mock(return_value={"threads": []})
+            one = st.cmd_threads({"target": "main"})
+            self.assertEqual(one["target"], "main")
+            self.assertNotIn("targets", one)
+            self.assertNotIn("selected", one)
+            self.assertIn("running", one)
+            self.assertIn("threads", one)
+            # Explicit child still serves only that child.
+            two = st.cmd_threads({"target": "child:61"})
+            self.assertEqual(two["target"], "child:61")
+            self.assertNotIn("targets", two)
+            # Exited history never joins the aggregate.
+            st._note_exit("child:61")
+            bare = st.cmd_threads({})
+            self.assertEqual([e["target"] for e in bare["targets"]]
+                             if "targets" in bare else ["main"], ["main"])
+
+    def test_vars_frame_validation_matrix(self):
+        # Uniform frame contract (same on all four bridges): missing/None
+        # reads as 0; ints ≥ 0, integer floats, and 1–15 digit strings are
+        # the index; malformed/fractional/negative/over-long/mistyped is a
+        # typed `<cmd> needs integer frame` (never coerced, never
+        # internal); well-formed past-the-end is `no frame N (have M)`.
+        # require_stopped still runs first (covered elsewhere).
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            st.thread_id, st.suspended = 7, True
+            st.frames = [{"id": 11}, {"id": 12}]
+            st.dap_request = Mock(return_value={"stackFrames": [{"id": 11},
+                                                                 {"id": 12}]})
+            st.frame_locals = Mock(return_value=[{"name": "x"}])
+            for req, want in [({}, 0), ({"frame": None}, 0),
+                              ({"frame": 0}, 0), ({"frame": 1}, 1),
+                              ({"frame": "1"}, 1), ({"frame": "001"}, 1),
+                              ({"frame": 1.0}, 1)]:
+                resp = st.cmd_vars(req)
+                self.assertEqual(resp["frame"], want, req)
+            for req, msg in [({"frame": 2}, "no frame 2 (have 2)"),
+                             ({"frame": 99}, "no frame 99 (have 2)"),
+                             ({"frame": "99999999999"},
+                              "no frame 99999999999 (have 2)")]:
+                with self.assertRaises(bridge.BridgeErr) as cm:
+                    st.cmd_vars(req)
+                self.assertEqual(str(cm.exception), msg, req)
+            for bad in ["abc", "", "3x", "3.5", "-1", "+1", " 3", "3 ",
+                        "0x3", "9999999999999999", "99999999999999999999",
+                        -1, -2, 3.5, float("inf"), float("nan"),
+                        True, False, ["1"], {"n": 1}]:
+                with self.assertRaises(bridge.BridgeErr) as cm:
+                    st.cmd_vars({"frame": bad})
+                self.assertEqual(str(cm.exception),
+                                 "vars needs integer frame", bad)
+                self.assertNotIn("internal", str(cm.exception), bad)
+            # eval shares the helper with its own command word.
+            with self.assertRaises(bridge.BridgeErr) as cm:
+                st.cmd_eval({"expr": "1", "frame": "1.5"})
+            self.assertEqual(str(cm.exception), "eval needs integer frame")
+            with self.assertRaises(bridge.BridgeErr) as cm:
+                st.cmd_eval({"expr": "1", "frame": 9})
+            self.assertEqual(str(cm.exception), "no frame 9 (have 2)")
+
+    def test_concurrent_identical_adds_converge_to_one_record(self):
+        # Eight handler threads racing the same identical add through
+        # dispatch: exactly one plant, one live record, one intent entry;
+        # the seven rivals report coherent empty-added instead of
+        # duplicating bridge state.
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.realpath(str(Path(tmp) / "w.py"))
+            Path(path).write_text("".join(f"line {n}\n" for n in range(12)))
+            st = self.target_session(tmp)
+            st._nonce = bridge.write_owner(tmp)
+            st.publish_state = Mock()
+            plants = []
+
+            def fake_dap(command, args=None, timeout=30):
+                if command == "setBreakpoints":
+                    plants.append(1)
+                    time.sleep(0.01)  # realistic plant latency: widens the
+                    # check-then-mutate race window between rivals
+                    n = len(args.get("breakpoints", []))
+                    return {"breakpoints": [{"verified": True, "line": 5}] * n}
+                raise AssertionError(f"unexpected DAP: {command}")
+            st.dap_request = fake_dap
+            spec = f"{path}:5"
+            out = [None] * 8
+
+            def run(i):
+                try:
+                    out[i] = st.dispatch({"cmd": "breaksAdd",
+                                          "breaks": [spec]})
+                except Exception as e:  # noqa: BLE001 — collected below
+                    out[i] = e
+            ths = [threading.Thread(target=run, args=(i,)) for i in range(8)]
+            for t in ths:
+                t.start()
+            for t in ths:
+                t.join(15)
+            for r in out:
+                self.assertIsInstance(r, dict, r)
+                self.assertTrue(r["ok"], r)
+            self.assertEqual(len(plants), 1, "a single setBreakpoints plant")
+            self.assertEqual(len(st.stop_states), 1)
+            self.assertEqual(len(st.cfg.breaks), 1)
+            self.assertEqual(len(st._hitkeys), 1)
+            winners = [r for r in out if len(r["added"]) == 1]
+            self.assertEqual(len(winners), 1)
+            self.assertEqual(
+                sum(1 for r in out if r["added"] == []), 7)
+            self.assertEqual(winners[0]["target"], "main")
+
+    def test_bare_threads_skips_child_that_exits_mid_dump(self):
+        # Deterministic churn: the child exits between the roster snapshot
+        # and its own dump. It is skipped (never fails the call), the exit
+        # stays recorded, and the served entry is coherent.
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            st.suspended = True
+            st._main_seq = 1
+            st._stop_seq = 1
+            st.dap_request = Mock(return_value={"threads": []})
+            self.fake_child(st, 61, suspended=True)
+            real = st._threads_for
+            calls = []
+
+            def spy(tid):
+                calls.append(tid)
+                if len(calls) == 1:
+                    st._note_exit("child:61")
+                return real(tid)
+            st._threads_for = spy
+            resp = st.cmd_threads({})
+            self.assertEqual([e["target"] for e in resp["targets"]], ["main"])
+            self.assertEqual(resp["selected"], "main")
+            self.assertEqual(resp["target"], "main")
+            self.assertTrue(any(e["id"] == "child:61"
+                                for e in st.exited_targets),
+                            "exit still recorded")
+
+    def test_explicit_wait_ignores_stale_child_park(self):
+        # Main running, child parked BEFORE the wait (stale): an explicit
+        # main wait/continue times out main-scoped, never serves the
+        # child, and leaves the child parked and untouched. Real pump
+        # over sockless conn doubles (owner written for the owner-guard).
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            st._nonce = bridge.write_owner(tmp)
+            st.publish_state = Mock()
+            st.dap = SimpleNamespace(stash=[], sock=None)
+            child = self.fake_child(st, 61, suspended=True)
+            child.dap = SimpleNamespace(stash=[], sock=None)
+            with self.assertRaises(bridge.StopTimeout) as cm:
+                st.cmd_wait({"target": "main"}, 1)
+            self.assertIn("no stop within", str(cm.exception))
+            self.assertTrue(child.suspended)
+            self.assertEqual(child.state, "stopped")
+            # Same through continue on the running main.
+            st.dap_request = Mock(return_value={})
+            with self.assertRaises(bridge.StopTimeout):
+                st.cmd_continue({"target": "main"}, 1)
+            self.assertTrue(child.suspended)
+            self.assertEqual(child.state, "stopped")
+
+    def test_explicit_pump_skips_other_target_then_serves_own(self):
+        # A fresh child stop consumed during an explicit main pump is
+        # parked (visible, never discarded) but skipped; main's own stop
+        # is served. Omitted pumps keep any-target semantics.
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            st._nonce = bridge.write_owner(tmp)
+            st.publish_state = Mock()
+            st.dap = SimpleNamespace(stash=[], sock=None)
+            child = self.fake_child(st, 61)
+            child.dap = SimpleNamespace(stash=[], sock=None)
+            script = ["child:61", "main"]
+
+            def fake_dispatch(msg, tid):
+                eff = script.pop(0)
+                if eff == "child:61":
+                    child.suspended = True
+                    child.state = "stopped"
+                else:
+                    st.suspended = True
+                st._park_local.parked = eff
+                return "stopped"
+            st._dispatch_pumped = fake_dispatch
+            st.dap.stash.append({"type": "event", "event": "stopped"})
+            st.dap.stash.append({"type": "event", "event": "stopped"})
+            self.assertEqual(st.pump(5, "main"), "stopped")
+            self.assertEqual(st._park_local.parked, "main")
+            self.assertTrue(child.suspended,
+                            "other-target park stays parked, never consumed")
+            # Omitted: the first park serves.
+            st2 = self.target_session(tmp)
+            st2._nonce = bridge.write_owner(tmp)
+            st2.publish_state = Mock()
+            st2.dap = SimpleNamespace(stash=[], sock=None)
+            c2 = self.fake_child(st2, 62)
+            c2.dap = SimpleNamespace(stash=[], sock=None)
+            script2 = ["child:62"]
+
+            def fake_dispatch2(msg, tid):
+                c2.suspended = True
+                c2.state = "stopped"
+                st2._park_local.parked = "child:62"
+                return "stopped"
+            st2._dispatch_pumped = fake_dispatch2
+            st2.dap.stash.append({"type": "event", "event": "stopped"})
+            self.assertEqual(st2.pump(5), "stopped")
+            self.assertEqual(st2._park_local.parked, "child:62")
+
+    def test_explicit_step_scopes_pump_to_its_target(self):
+        # Step on parked main with a stale parked child: the pump is
+        # pinned to main and the response names main; the child is never
+        # resumed or served.
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            st._nonce = bridge.write_owner(tmp)
+            st.publish_state = Mock()
+            child = self.fake_child(st, 61, suspended=True)
+            st.thread_id, st.suspended = 7, True
+            st.frames = [{"id": 1, "name": "m",
+                          "source": {"path": "/tmp/a.py"}, "line": 3}]
+            st.stop_info = None
+            st.dap_request = Mock(return_value={})
+            seen = {}
+
+            def spy_pump(timeout, want=None):
+                seen["want"] = want
+                st._park_local.parked = "main"
+                return "stopped"
+            st.pump = spy_pump
+            resp = st.cmd_step({"target": "main", "mode": "over"}, 5)
+            self.assertEqual(seen["want"], "main")
+            self.assertEqual(resp["target"], "main")
+            self.assertTrue(child.suspended)
+            self.assertEqual(child.state, "stopped")
+
 
 
     def test_child_suspect_fallback_parks_under_target_scope(self):
@@ -1768,7 +2051,7 @@ class BridgeTests(unittest.TestCase):
             parked.dap = SimpleNamespace(stash=[])
             self.hold_resume(st, "child:61")
             seen = []
-            def fake_wait(timeout, tid="main"):
+            def fake_wait(timeout, tid="main", explicit=False):
                 seen.append(tid)
                 return {"ok": True}
             st._resume_and_wait = fake_wait
@@ -1824,7 +2107,7 @@ class BridgeTests(unittest.TestCase):
             st.thread_id, st.suspended = 7, True
             st.frames = [{"id": 1}]
             st.dap_request = Mock(return_value={})
-            def fake_wait(timeout, tid="main"):
+            def fake_wait(timeout, tid="main", explicit=False):
                 self.assertEqual(st._outstanding.get("main"), "step")
                 raise bridge.BridgeErr("timeout: no stop within 1s")
             st._resume_and_wait = fake_wait

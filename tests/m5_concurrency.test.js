@@ -163,7 +163,7 @@ test('m5 node: target-scoped mutation conflicts only with its target', async () 
     st.dispatch({ cmd: 'breaksAdd', target: a.id, breaks: ['x:1'] }),
     /busy: continue outstanding for worker:a/);
   let called = null;
-  st.addWorkerEphemeral = async (tid, raws) => {
+  st._addWorkerEphemeralInner = async (tid, raws) => {
     called = [tid, raws];
     return { ok: true };
   };
@@ -179,7 +179,15 @@ test('m5 node: different-target resume runs independently', async () => {
   const b = addWorker(st, 'b');
   st.outstanding.set(a.id, 'continue');
   st.lastParkTarget = b.id;
-  st.pump = async () => 'stopped';
+  // b starts parked so the dispatch reaches a real resume; the pump
+  // re-parks it fresh after the resume (honest wait semantics). Worker
+  // resume transport is stubbed at the sender boundary.
+  b.paused = { frames: [workerFrame()], stopInfo: null };
+  st.workerSend = async () => ({});
+  st.pump = async () => {
+    b.paused = { frames: [workerFrame()], stopInfo: null };
+    return 'stopped';
+  };
   await assert.rejects(
     st.dispatch({ cmd: 'continue', target: a.id }),
     /busy: continue outstanding for worker:a/);
@@ -226,6 +234,8 @@ test('m5 node: resume registers outstanding during the wait, then clears', async
   let seenDuringWait = null;
   st.pump = async () => {
     seenDuringWait = new Map(st.outstanding);
+    // Honest wait: the resume above unparked main, so re-park it fresh.
+    st.paused = { frames: [], stopInfo: null };
     return 'stopped';
   };
   const resp = await st.dispatch({ cmd: 'continue' });

@@ -1834,6 +1834,25 @@ class LiveTests(unittest.TestCase):
             self.assertEqual(entry["observed"]["source"], "debugpy-subProcessId")
             self.assertEqual(entry["scope"], "inherited")
             self.assertEqual(roster["selected"], child_id)
+            # Explicit main is pinned (Milestone A): bare threads
+            # aggregates main + the live child, --target main serves main
+            # only, and a main-targeted continue never serves the parked
+            # child (main-scoped timeout here — main has no break).
+            threads = self.cli(name, "threads")
+            agg = [e["target"] for e in threads.get("targets", [])]
+            self.assertIn("main", agg)
+            self.assertIn(child_id, agg)
+            self.assertEqual(threads["selected"], child_id)
+            one = self.cli(name, "threads", "--target", "main")
+            self.assertEqual(one["target"], "main")
+            self.assertNotIn("targets", one)
+            cont_main = self.cli(name, "continue", "--target", "main",
+                                 "--timeout", "3", ok=False)
+            self.assertIn("no stop within", cont_main["error"])
+            still = self.cli(name, "targets")
+            self.assertEqual(
+                next(t for t in still["targets"]
+                     if t["id"] == child_id)["state"], "stopped")
             # Targetless commands auto-select the parked child.
             ctx = self.cli(name, "context")
             self.assertEqual(ctx["target"], child_id)
@@ -2026,6 +2045,25 @@ class LiveTests(unittest.TestCase):
             self.assertEqual(entry["scope"], "inherited")
             self.assertTrue((entry["observed"] or {}).get("url", "").endswith("b2_worker.js"))
             self.assertEqual(roster["selected"], wid)
+            # Explicit main is pinned (Milestone A): bare threads
+            # aggregates main + the live worker, --target main serves main
+            # only, and a main-targeted continue never serves the parked
+            # worker (main-scoped timeout here — main has no break).
+            threads = self.cli(name, "threads")
+            agg = [e["target"] for e in threads.get("targets", [])]
+            self.assertIn("main", agg)
+            self.assertIn(wid, agg)
+            self.assertEqual(threads["selected"], wid)
+            one = self.cli(name, "threads", "--target", "main")
+            self.assertEqual(one["target"], "main")
+            self.assertNotIn("targets", one)
+            cont_main = self.cli(name, "continue", "--target", "main",
+                                 "--timeout", "3", ok=False)
+            self.assertIn("no stop within", cont_main["error"])
+            still = self.cli(name, "targets")
+            self.assertEqual(
+                next(t for t in still["targets"]
+                     if t["id"] == wid)["state"], "stopped")
             self.assertEqual(self.cli(name, "eval", "result", "--target", wid)["value"], "42")
             step = self.cli(name, "step", "over", "--target", wid, "--timeout", "15")
             self.assertEqual(step["target"], wid)
