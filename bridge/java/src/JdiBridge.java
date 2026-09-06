@@ -90,11 +90,11 @@ public class JdiBridge {
         }
     }
 
-    static String shortMsg(Exception e) {
-        String m = e.getMessage();
-        if (m == null || m.isEmpty()) return e.getClass().getSimpleName();
+    static String shortMsg(Throwable t) {
+        String m = t.getMessage();
+        if (m == null || m.isEmpty()) return t.getClass().getSimpleName();
         if (m.length() > 160) m = m.substring(0, 160) + "…";
-        return e.getClass().getSimpleName() + ": " + m;
+        return t.getClass().getSimpleName() + ": " + m;
     }
 
     /** Sanitized unexpected-crash text: class + message + a few stack

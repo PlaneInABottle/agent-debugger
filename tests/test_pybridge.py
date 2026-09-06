@@ -2147,9 +2147,17 @@ class TargetIdentityTests(unittest.TestCase):
         self.assertEqual(bridge.phase_of_error(bridge.ConfigErr("x")), "config")
         # ConfigErr is still a BridgeErr: existing catches keep working.
         self.assertIsInstance(bridge.ConfigErr("x"), bridge.BridgeErr)
+        # Explicit runtime marker reads as runtime (truthful internal
+        # error, never endpoint-diagnosed).
+        self.assertEqual(bridge.phase_of_error(bridge.RuntimeErr("bug")), "runtime")
+        # Unexpected exceptions after a successful operation read as
+        # runtime, not transport.
+        for e in [ValueError("bug"), RuntimeError("boom")]:
+            self.assertEqual(bridge.phase_of_error(e), "runtime",
+                             f"{e!r} must read runtime")
         for e in [bridge.BridgeErr("boom"),
                   bridge.StopTimeout("timeout: no stop within 2s"),
-                  ValueError("bug"), None, object(), "config"]:
+                  None, object(), "config"]:
             self.assertEqual(bridge.phase_of_error(e), "transport",
                              f"{e!r} must stay transport")
 
@@ -2232,11 +2240,28 @@ class TargetIdentityTests(unittest.TestCase):
 
     def test_pump_target_exit_stays_transport(self):
         # Initial-pump target exit is a transport loss, never semantic —
-        # even though the connection was established.
+        # even though the connection was established. Runtime must not
+        # mask it: only unexpected exceptions read as runtime.
         exc = bridge.BridgeErr("target exited")
         self.assertEqual(bridge.phase_of_error(exc), "transport")
         self.assertEqual(
             bridge.setup_error_payload(exc, str(exc))["phase"], "transport")
+
+    def test_unexpected_setup_crash_reads_runtime(self):
+        # Synthetic unexpected failure after a successful operation:
+        # sanitized payload, runtime phase (truthful internal error, no
+        # endpoint diagnosis). Target exits stay transport (above). The
+        # body goes through format_unexpected exactly as the production
+        # setup catch does (bridge main, `except Exception` path) — for
+        # RuntimeErr too, which is a plain Exception, not a BridgeErr.
+        for exc in [bridge.RuntimeErr("track boom"), ValueError("bug")]:
+            body = bridge.format_unexpected(exc)
+            self.assertTrue(body.startswith("internal:"),
+                            f"{exc!r} must sanitize, got: {body[:60]}")
+            payload = bridge.setup_error_payload(exc, body)
+            self.assertEqual(payload["phase"], "runtime", f"{exc!r}")
+            self.assertEqual(payload["schemaVersion"], 2)
+            self.assertEqual(payload["error"], body)
 
     def test_dir_from_argv_scans_without_parsing(self):
         self.assertEqual(

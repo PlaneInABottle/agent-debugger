@@ -276,6 +276,10 @@ class WaitCaptureTests(unittest.TestCase):
             msg = str(cm.exception)
             self.assertIn("target exited", msg)  # original never masked
             self.assertIn("remove boom", msg)  # removal failure attached
+            # The exit stage survives the removal failure (dead adapter).
+            self.assertIn("target exited before capture hit", msg)
+            self.assertEqual(
+                cm.exception.wait_context["captureStage"], "armed-wait")
 
     def test_diag_attribution_matches_bound_line(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -290,6 +294,286 @@ class WaitCaptureTests(unittest.TestCase):
             self.assertEqual(diag["requestedBreak"], "a.py:5")
             self.assertEqual(diag["boundLine"], 5)
             self.assertEqual(diag["hitCount"], 4)  # park counted one hit
+
+    # ---- change-tracking resilience (>MAX_VARS sentinel + malformed) ----
+
+    def _many_vars_dap(self, path, n=25, line=5, tid=1, extra=()):
+        """Fake DAP with n locals (over MAX_VARS=20, so frame_locals caps
+        with the value-less {"name": "…", "note": "+N more"} sentinel)
+        plus caller-supplied malformed entries."""
+        many = [{"name": f"v{k}", "type": "int", "value": str(k),
+                 "variablesReference": 0} for k in range(n)]
+        many.extend(extra)
+
+        def fake(command, args=None, timeout=30):
+            if command == "stackTrace":
+                return {"stackFrames": [{"id": 11, "name": "handler",
+                                         "source": {"path": path},
+                                         "line": line}]}
+            if command == "threads":
+                return {"threads": [{"id": tid, "name": "main"}]}
+            if command == "scopes":
+                return {"scopes": [{"name": "Locals",
+                                    "variablesReference": 1}]}
+            if command == "variables":
+                return {"variables": many}
+            if command == "setBreakpoints":
+                return {"breakpoints": [{"verified": True, "line": line}]}
+            if command == "continue":
+                return {}
+            raise AssertionError(f"unexpected DAP: {command}")
+        return fake
+
+    def test_track_changes_skips_sentinel_and_malformed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.realpath(str(Path(tmp) / "a.py"))
+            Path(path).write_text("".join(f"line {n}\n" for n in range(12)))
+            st = _session(tmp)
+            malformed = [
+                {"name": "…", "note": "+5 more"},  # truncation sentinel
+                {"name": "novalue", "type": "int"},  # value-less entry
+                {"name": 42, "value": "x"},  # non-string name
+                {"value": "orphan"},  # nameless entry
+                "not-a-dict",
+                None,
+            ]
+            st.dap_request.side_effect = self._many_vars_dap(
+                path, n=5, extra=malformed)
+            st.thread_id = None
+            st.suspended = False
+            st._park_stop("breakpoint", 1)  # must not raise KeyError
+            self.assertTrue(st.suspended)
+            changed = json.loads(st.last_changed)
+            # The 5 real locals are tracked; the value-less truncation
+            # sentinel never leaks into change tracking.
+            for k in range(5):
+                self.assertIn(f"v{k}", changed)
+            self.assertNotIn("…", changed)
+            # Direct filter: frame_locals-shaped output with a value-less
+            # sentinel and malformed entries degrades safely (stable
+            # formatted strings retained, no variable data in warnings).
+            st2 = _session(tmp)
+            st2.frames = [{"name": "handler"}]
+            st2.frame_locals = Mock(return_value=[
+                {"name": "a", "type": "int", "value": "1"},
+                {"name": "…", "note": "+9 more"},
+                {"name": "novalue", "type": "int"},
+                {"name": 42, "value": "x"},
+                "junk",
+                None,
+            ])
+            st2.track_changes()
+            changed2 = json.loads(st2.last_changed)
+            self.assertIn("a", changed2)
+            self.assertNotIn("…", changed2)
+
+    def test_park_over_max_vars_completes_with_truncation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.realpath(str(Path(tmp) / "a.py"))
+            Path(path).write_text("".join(f"line {n}\n" for n in range(12)))
+            st = _session(tmp)
+            st.dap_request.side_effect = self._many_vars_dap(path, n=25)
+            st.thread_id = None
+            st.suspended = False
+            st._park_stop("breakpoint", 1)  # KeyError:'value' regression
+            self.assertTrue(st.suspended)
+            snap = st.snapshot()
+            locs = snap["frames"][0]["locals"]
+            self.assertEqual(locs[-1]["name"], "…")
+            self.assertIn("note", locs[-1])
+            changed = json.loads(st.last_changed)
+            self.assertEqual(len(changed), 20)  # capped real locals
+            self.assertNotIn("…", changed)
+
+    def test_park_survives_change_tracking_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.realpath(str(Path(tmp) / "a.py"))
+            Path(path).write_text("".join(f"line {n}\n" for n in range(12)))
+            st = _session(tmp)
+            st.dap_request.side_effect = _live_dap(path)
+            st.thread_id = None
+            st.suspended = False
+            st.frame_locals = Mock(side_effect=ValueError("synthetic"))
+            st._park_stop("breakpoint", 1)  # must complete, not crash
+            self.assertTrue(st.suspended)
+            self.assertEqual(st.last_changed, "[]")
+            self.assertEqual(st.last_top, {})
+            # The session is intact: a later good park tracks normally.
+            st.frame_locals = Mock(return_value=[
+                {"name": "x", "type": "int", "value": "1"}])
+            st.suspended = False
+            st.last_func = "other"
+            st.track_changes()
+            self.assertEqual(json.loads(st.last_changed), ["x"])
+            # Backstop: even a total track_changes failure inside
+            # _park_stop degrades (safe baseline) instead of crashing.
+            st.track_changes = Mock(side_effect=RuntimeError("synthetic"))
+            st.suspended = False
+            st._park_stop("breakpoint", 1)
+            self.assertTrue(st.suspended)
+            self.assertEqual(st.last_changed, "[]")
+            self.assertEqual(st.last_top, {})
+
+    # ---- capture short-lived target stages ----
+
+    def test_capture_exit_after_armed_names_hit_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.realpath(str(Path(tmp) / "a.py"))
+            Path(path).write_text("".join(f"line {n}\n" for n in range(12)))
+            st = _session(tmp)
+            st.dap_request.side_effect = _live_dap(path)
+
+            def fake_pump(timeout):
+                raise _bridge.BridgeErr("target exited")
+            st.pump = fake_pump
+            with self.assertRaises(_bridge.BridgeErr) as cm:
+                st.cmd_capture({"break": f"{path}:5"}, 5)
+            msg = str(cm.exception)
+            self.assertIn("target exited before capture hit", msg)
+            self.assertIn(f"{path}:5", msg)
+            self.assertNotIn("endpoint", msg.lower())
+            self.assertNotIn("unreachable", msg.lower())
+            self.assertNotIn("rejected", msg.lower())
+            ctx = cm.exception.wait_context
+            self.assertEqual(ctx["captureStage"], "armed-wait")
+            self.assertTrue(ctx["ephemeralPlanted"])
+            self.assertEqual(ctx["expectedBreak"], f"{path}:5")
+            self.assertEqual(ctx["triggerStatus"], "unknown")
+            # Ephemeral removed, nothing persisted, nothing resumed.
+            calls = [c[0][0] for c in st.dap_request.call_args_list]
+            self.assertEqual(calls.count("setBreakpoints"), 2)
+            self.assertNotIn("continue", calls)
+            self.assertEqual(st.cfg.breaks, [])
+
+    def test_capture_exit_before_armed_at_plant(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.realpath(str(Path(tmp) / "a.py"))
+            Path(path).write_text("".join(f"line {n}\n" for n in range(12)))
+            st = _session(tmp)
+            st.dap_request.side_effect = _live_dap(path)
+            st._capture_plant = Mock(
+                side_effect=_bridge.BridgeErr("target exited"))
+            with self.assertRaises(_bridge.BridgeErr) as cm:
+                st.cmd_capture({"break": f"{path}:5"}, 5)
+            msg = str(cm.exception)
+            self.assertIn(
+                "capture target exited before ephemeral breakpoint was armed",
+                msg)
+            self.assertNotIn("endpoint", msg.lower())
+            self.assertNotIn("rejected", msg.lower())
+            ctx = cm.exception.wait_context
+            self.assertEqual(ctx["captureStage"], "before-armed")
+            self.assertFalse(ctx["ephemeralPlanted"])
+            self.assertIsInstance(ctx["waitStartedAt"], int)
+            self.assertIsInstance(ctx["waitedMs"], int)
+
+    def test_capture_session_gone_before_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = _session(tmp)
+            st.exited = True  # startup target already gone
+            with self.assertRaises(_bridge.BridgeErr) as cm:
+                st.cmd_capture({"break": "a.py:5"}, 5)
+            # Truthful session/target-exited message, never "no session".
+            self.assertIn("exited", str(cm.exception).lower())
+            self.assertNotIn("no session", str(cm.exception).lower())
+            ctx = cm.exception.wait_context
+            self.assertEqual(ctx["captureStage"], "session-gone")
+            self.assertIsInstance(ctx["waitStartedAt"], int)
+            self.assertIsInstance(ctx["waitedMs"], int)
+
+    def test_capture_timeout_carries_armed_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.realpath(str(Path(tmp) / "a.py"))
+            Path(path).write_text("".join(f"line {n}\n" for n in range(12)))
+            st = _session(tmp)
+            st.dap_request.side_effect = _live_dap(path)
+
+            def fake_pump(timeout):
+                raise _bridge.StopTimeout(st.timeout_text(timeout))
+            st.pump = fake_pump
+            with self.assertRaises(_bridge.StopTimeout) as cm:
+                st.cmd_capture({"break": f"{path}:5"}, 5)
+            ctx = cm.exception.wait_context
+            self.assertEqual(ctx["captureStage"], "armed-wait-timeout")
+            self.assertTrue(ctx["ephemeralPlanted"])
+            self.assertEqual(ctx["expectedBreak"], f"{path}:5")
+
+    def test_frame_locals_skips_malformed_scopes_and_nested(self):
+        # Malformed scopes list (non-dict entries) and malformed nested
+        # Globals children (non-dict records, non-string names inside the
+        # function-variables pseudo-container): skipped, never
+        # AttributeError. The direct context/vars path (frames_json /
+        # snapshot) and track_changes survive on the same fixture.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.realpath(str(Path(tmp) / "a.py"))
+            Path(path).write_text("".join(f"line {n}\n" for n in range(12)))
+
+            def fake(command, args=None, timeout=30):
+                if command == "threads":
+                    return {"threads": [{"id": 1, "name": "main"}]}
+                if command == "scopes":
+                    return {"scopes": ["junk", None, 42,
+                                       {"name": "Globals",
+                                        "variablesReference": 7}]}
+                if command == "variables":
+                    ref = (args or {}).get("variablesReference")
+                    if ref == 7:
+                        return {"variables": [
+                            {"name": "function variables",
+                             "variablesReference": 8},
+                            "junk",
+                            None,
+                            {"name": 42, "type": "int", "value": "x",
+                             "variablesReference": 0},
+                            {"name": ["unhashable", "name"], "type": "?",
+                             "value": "?", "variablesReference": 0},
+                            {"name": "ok", "type": "int", "value": "1",
+                             "variablesReference": 0}]}
+                    if ref == 8:
+                        return {"variables": [
+                            {"name": "inner", "type": "int", "value": "2",
+                             "variablesReference": 0},
+                            None,
+                            "junk",
+                            {"name": {"weird": 1}, "type": "?",
+                             "value": "?", "variablesReference": 0}]}
+                    raise AssertionError(f"unexpected ref: {ref}")
+                raise AssertionError(f"unexpected DAP: {command}")
+
+            st = _session(tmp)
+            st.frames = [{"id": 11, "name": "handler",
+                          "source": {"path": path}, "line": 5}]
+            st.dap_request.side_effect = fake
+            locals_ = st.frame_locals(0)
+            names = [v["name"] for v in locals_
+                     if isinstance(v, dict)]
+            self.assertIn("ok", names)
+            self.assertIn("inner", names)
+            # Direct context/vars path serves the same locals, no raise.
+            snap = st.snapshot()
+            snap_names = [v["name"] for v in
+                          snap["frames"][0]["locals"]
+                          if isinstance(v, dict)]
+            self.assertIn("ok", snap_names)
+            self.assertIn("inner", snap_names)
+            # Change tracking degrades gracefully on the same shape.
+            st.track_changes()
+            changed = json.loads(st.last_changed)
+            self.assertIn("ok", changed)
+            self.assertIn("inner", changed)
+
+    def test_frame_locals_malformed_scopes_body_degrades(self):
+        # Non-dict scopes body (or non-list scopes): no locals, no raise;
+        # track_changes falls back to an empty baseline.
+        with tempfile.TemporaryDirectory() as tmp:
+            for body in (["not", "a", "dict"], {"scopes": "junk"}):
+                st = _session(tmp)
+                st.frames = [{"id": 11, "name": "handler"}]
+                st.dap_request.side_effect = (
+                    lambda command, args=None, timeout=30: body)
+                self.assertEqual(st.frame_locals(0), [])
+                st.track_changes()
+                self.assertEqual(st.last_changed, "[]")
 
 
 if __name__ == "__main__":

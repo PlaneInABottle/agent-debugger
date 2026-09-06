@@ -2296,6 +2296,162 @@ class LiveTests(unittest.TestCase):
         self.assertEqual(out["closed"], weird)
         self._assert_absent(weird)
 
+    def test_35_py_many_locals_attach_capture_and_shortlived_stages(self):
+        """User-reported stop/capture regressions, live on debugpy:
+        (a) a frame with >MAX_VARS (20) locals stops, tracks, and
+        captures successfully — no KeyError, no session loss, snapshot
+        carries the truncation sentinel; (b) capture against a
+        short-lived target reports truthful stages (session-gone /
+        armed-wait) with additive waitContext, never endpoint-rejected;
+        (c) closing (detach) while parked resumes the debuggee — the
+        target proceeds on its own afterwards."""
+        self._ensure_idle_fixtures()
+        gate = self.fixture / "manygo"
+        done = self.fixture / "manydone"
+        for p in (gate, done):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        many = self.fixture / "many_locals.py"
+        lines = ["import pathlib", "import time",
+                 f"GATE = pathlib.Path({str(gate)!r})",
+                 f"DONE = pathlib.Path({str(done)!r})",
+                 'print("ready", flush=True)',
+                 "while True:",
+                 "    if GATE.exists():"]
+        for k in range(25):
+            lines.append(f"        v{k:02d} = {k}")
+        lines += ['        print("hit", flush=True)',
+                  "        GATE.unlink()",
+                  "        DONE.touch()",
+                  "    time.sleep(0.05)"]
+        many.write_text("\n".join(lines) + "\n")
+        hit_line = 7 + 25 + 1  # print("hit") line
+        port = free_port()
+        proc = self._launch_target(
+            [str(VENV_PY), "-Xfrozen_modules=off", "-m", "debugpy",
+             "--listen", f"127.0.0.1:{port}", str(many)], "manylocals")
+        self._wait_log("manylocals", "ready")
+        time.sleep(1)
+        name = "many-py"
+        self.sessions.add(name)
+        data = self.cli(name, "py", "attach", "--port", str(port),
+                        "--break", f"{many}:{hit_line}", "--timeout", "3")
+        self.assertTrue(data["running"], "never-hit break stays running")
+        gate.touch()
+        self._wait_stopped(name, True)
+        ctx = self.cli(name, "context")
+        self.assertEqual(ctx["location"]["line"], hit_line)
+        # >20 locals: vars stay bounded with the truncation sentinel, and
+        # change tracking completed (no KeyError/session loss).
+        locals_ = self.cli(name, "vars")["locals"]
+        self.assertEqual(locals_[-1]["name"], "\u2026")
+        self.assertIn("note", locals_[-1])
+        real = [v for v in locals_ if v["name"] != "\u2026"]
+        self.assertEqual(len(real), 20)
+        # Capture on the parked target collects without resuming.
+        cap = self.cli(name, "capture", "--timeout", "10")
+        self.assertTrue(cap["targetWasPaused"])
+        self.assertFalse(cap["resumed"])
+        cap_locs = cap["snapshot"]["frames"][0]["locals"]
+        self.assertEqual(cap_locs[-1]["name"], "\u2026")
+        self.assertTrue(cap["truncated"]["vars"])
+        # (c) close (detach) while parked resumes the debuggee: the
+        # target proceeds past the stop on its own (DONE appears) and
+        # stays alive for a fresh attach.
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not done.exists():
+            time.sleep(0.1)
+        self.assertTrue(done.exists(),
+                        "detach must resume the paused debuggee")
+        self.assertIsNone(proc.poll(), "target survives detach")
+        # (b) short-lived stages. Fresh attach, then kill the target:
+        # a capture afterwards is session-gone or armed-wait — truthful
+        # target-exited wording, additive stage, never endpoint-rejected.
+        name2 = "short-py"
+        self.sessions.add(name2)
+        data = self.cli(name2, "py", "attach", "--port", str(port),
+                        "--timeout", "5")
+        self.assertIn("targetIdentity", data)
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+        # Let the bridge observe the death (idle pump between commands).
+        deadline = time.monotonic() + 15
+        gone = False
+        while time.monotonic() < deadline:
+            try:
+                self.cli(name2, "threads", timeout=5)
+            except AssertionError as e:
+                if "exited" in str(e).lower():
+                    gone = True
+                    break
+            time.sleep(0.2)
+        data = self.cli(name2, "capture", "--timeout", "3", ok=False)
+        self.assertFalse(data["ok"])
+        self.assertIn("exited", data["error"].lower())
+        self.assertNotIn("no session", data["error"].lower())
+        self.assertNotIn("rejected", data["error"].lower())
+        self.assertNotIn("unreachable", data["error"].lower())
+        ctx2 = data.get("waitContext") or {}
+        self.assertIn(ctx2.get("captureStage"),
+                      ("session-gone", "armed-wait"))
+        self.assertEqual(ctx2.get("triggerStatus"), "unknown")
+        # Armed-wait via a raced kill: never-hit break keeps the attach
+        # running, capture waits, the kill lands mid-wait.
+        port2 = free_port()
+        proc2 = self._launch_target(
+            [str(VENV_PY), "-Xfrozen_modules=off", "-m", "debugpy",
+             "--listen", f"127.0.0.1:{port2}", str(self.py_idle)], "shortidle")
+        self._wait_log("shortidle", "ready")
+        time.sleep(1)
+        name3 = "armed-py"
+        self.sessions.add(name3)
+        data = self.cli(name3, "py", "attach", "--port", str(port2),
+                        "--break", f"{self.py_idle}:7", "--timeout", "3")
+        self.assertTrue(data["running"])
+        import concurrent.futures as _fut
+        # A different line than the attach break, so the capture plants
+        # its own ephemeral. Line 8 (print "hit") never executes without
+        # the gate file, so the kill below lands mid-wait, after the
+        # plant confirmed. (Line 6 is the loop condition itself — it
+        # executes every iteration and would park immediately.)
+        cap_spec = f"{self.py_idle}:8"
+        with _fut.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(self.cli, name3, "capture", "--break",
+                              cap_spec, "--timeout", "15", ok=False)
+            time.sleep(3)  # capture is armed and waiting
+            proc2.terminate()
+            try:
+                proc2.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc2.kill()
+                proc2.wait(timeout=10)
+            data = fut.result(timeout=30)
+        self.assertFalse(data["ok"])
+        self.assertIn("target exited before capture hit", data["error"])
+        self.assertNotIn("rejected", data["error"].lower())
+        self.assertNotIn("unreachable", data["error"].lower())
+        ctx3 = data.get("waitContext") or {}
+        self.assertEqual(ctx3.get("captureStage"), "armed-wait")
+        self.assertTrue(ctx3.get("ephemeralPlanted"))
+        self.assertEqual(ctx3.get("expectedBreak"), cap_spec)
+        for n in (name2, name3):
+            try:
+                self.cli(n, "close", timeout=85)
+            except Exception:
+                pass
+            try:
+                self.sessions.remove(n)
+            except KeyError:
+                pass
+
     def _m1_target(self, lang, port):
         if lang == "py":
             return [str(VENV_PY), "-Xfrozen_modules=off", "-m", "debugpy",

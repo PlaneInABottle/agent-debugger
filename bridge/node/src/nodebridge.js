@@ -50,7 +50,7 @@ class Usage extends Error {}
 // provisioned next to this bridge):
 //   ./cdp_conn.js  BridgeErr + CdpConn (id-matched CDP over ws)
 //   ./framing.js   readFrame + writeFrame (Content-Length + JSON)
-const { BridgeErr, ConfigError, CdpConn } = require('./cdp_conn.js');
+const { BridgeErr, ConfigError, RuntimeError, CdpConn } = require('./cdp_conn.js');
 const { readFrame, writeFrame } = require('./framing.js');
 class CloseSession extends Error {}
 // Typed first-stop timeout: attach falls back to a live running session,
@@ -59,9 +59,10 @@ class StopTimeout extends BridgeErr {}
 // Setup-failure phase (error.json `phase`) derives from the exception
 // type — never from message text or a stage timer: Usage (spec validation,
 // conflicts, unknown args) and ConfigError (a valid CDP refusal of a
-// breakpoint install) read as config; every other failure (connect loss,
-// request IO/timeout, target exit, unexpected crashes) stays transport so
-// the CLI keeps evidence-based endpoint diagnosis for it.
+// breakpoint install) read as config; RuntimeError and any other
+// unexpected exception read as runtime (truthful internal error, never
+// endpoint-diagnosed); connect loss, request IO/timeout, and target exit
+// stay transport so the CLI keeps evidence-based endpoint diagnosis.
 
 const MAX_STRING = 200;
 const MAX_FIELDS = 20;
@@ -648,20 +649,35 @@ function sanitizeUnexpected(e) {
 // Setup-failure phase for error.json (additive; `error` text unchanged):
 // derived from the exception type, never from message text or a stage
 // timer. Usage (spec validation, conflicts, unknown args) and ConfigError
-// (a valid CDP refusal of a breakpoint install) read as config; every
-// other failure — connect loss, request IO/timeout, target exit,
-// unexpected crashes — stays transport so the CLI keeps evidence-based
-// endpoint diagnosis. Default is transport: a successful connection never
-// globally flips later failures to config.
+// (a valid CDP refusal of a breakpoint install) read as config;
+// RuntimeError and any other unexpected exception read as runtime
+// (truthful internal error, never endpoint-diagnosed); connect loss,
+// request IO/timeout, and target exit stay transport so the CLI keeps
+// evidence-based endpoint diagnosis for them. Default is transport: a
+// successful connection never globally flips later failures to config.
 function phaseOfError(e) {
   try {
     if (e instanceof Usage || e instanceof ConfigError) return 'config';
+    if (typeof RuntimeError !== 'undefined' && e instanceof RuntimeError) return 'runtime';
+    if (e instanceof BridgeErr) return 'transport';
+    if (e instanceof Error) return 'runtime';
   } catch (_) { /* no verdict: fall through */ }
   return 'transport';
 }
 
 function setupErrorPayload(exc, message) {
   return { schemaVersion: 2, error: message, phase: phaseOfError(exc) };
+}
+
+// Map a setup catch to the error.json payload to persist (the exact
+// mapping the setup catch uses, so tests drive this helper): Usage and
+// BridgeErr keep their message (config vs transport derives from the
+// type); anything unexpected is sanitized to an internal error and reads
+// as runtime (truthful internal error, never endpoint-diagnosed). Phase
+// always derives from the ORIGINAL exception, never message text.
+function setupFailurePayload(e) {
+  if (e instanceof Usage || e instanceof BridgeErr) return setupErrorPayload(e, e.message);
+  return setupErrorPayload(e, sanitizeUnexpected(e));
 }
 
 /** One-line redacted hint derived from the layered CLI seed (debuggee
@@ -2134,12 +2150,21 @@ class Session {
   }
 
   async trackChanges(frames) {
+    // Resilient change tracking: only real local entries (object, string
+    // name, non-sentinel, with a value) are tracked — the truncation
+    // sentinel {name:'…',note} carries no value, and malformed entries
+    // are safely skipped (never a park crash). Stable formatted strings
+    // are retained. Callers (onPaused) additionally degrade to an empty
+    // baseline when the locals fetch itself throws.
     const locals = await this.frameLocalsIn(frames, 0);
     this.cachedLocals = locals;
     const cur = {};
-    for (const l of locals) {
-      if (l.name === '…') continue;
-      cur[l.name] = l.value;
+    for (const l of locals || []) {
+      if (!l || typeof l !== 'object') continue;
+      const name = l.name;
+      if (typeof name !== 'string' || name === '…' || !('value' in l)) continue;
+      const v = l.value;
+      cur[name] = typeof v === 'string' ? v : String(v);
     }
     const func = frames.length > 0 ? (frames[0].functionName || '(anonymous)') : '?';
     let changed;
@@ -2679,7 +2704,10 @@ class Session {
   }
 
   /** Capture snapshot: frames 1..10, frame-0 vars 1..20. Returns
-   *  {snapshot, framesTruncated, varsTruncated}. */
+   *  {snapshot, framesTruncated, varsTruncated}. The frameLocalsIn
+   *  truncation sentinel ({name:'…',note}) is preserved as the last entry
+   *  within the vars cap (varsN-1 real + sentinel) so the bounded
+   *  snapshot still reports how many locals were cut. */
   async boundedSnapshot(framesN, varsN) {
     const paused = this.paused;
     const frames = ((paused && paused.frames) || []).slice(0, framesN);
@@ -2693,8 +2721,13 @@ class Session {
     if (out.length > 0) {
       try {
         const full = await this.frameLocalsIn(frames, 0);
-        varsTruncated = full.length > varsN;
-        out[0].locals = full.slice(0, varsN);
+        const last = full.length > 0 ? full[full.length - 1] : null;
+        const sentinel = (last && last.name === '…') ? last : null;
+        const real = sentinel ? full.slice(0, -1) : full;
+        varsTruncated = full.length > varsN || !!sentinel;
+        out[0].locals = sentinel && real.length >= varsN
+          ? real.slice(0, Math.max(0, varsN - 1)).concat([sentinel])
+          : (sentinel ? real.concat([sentinel]) : real.slice(0, varsN));
       } catch (_) { out[0].locals = []; }
     }
     return {
@@ -2788,11 +2821,59 @@ class Session {
    *  (nothing parked). No eval, no persisted vars. */
   async cmdCapture(req, timeout) {
     const { frames, vars, budget, spec } = this.captureBounds(req);
-    const tid = this.resolveTarget(req);
-    const prepark = await this.withTarget(tid, async () => {
-      this.requireLive();
-      return !!this.paused;
-    });
+    // Entry time for the early-stage contexts below (session-gone /
+    // before-armed): same seconds+ms units as every wait context; the
+    // wait never happened, so waitedMs is ~0 — never faked.
+    const entryStarted = Date.now();
+    let tid;
+    try {
+      tid = this.resolveTarget(req);
+    } catch (e) {
+      // No live target at all (short-lived session already gone): keep
+      // the truthful exited message verbatim, attach the additive stage
+      // so the CLI never reports "no session".
+      if (e instanceof BridgeErr && /exited/i.test(String((e && e.message) || e)) && !e.waitContext) {
+        try {
+          e.waitContext = {
+            waitStartedAt: Math.floor(entryStarted / 1000),
+            waitedMs: Math.max(0, Date.now() - entryStarted),
+            triggerStatus: 'unknown',
+            captureStage: 'session-gone',
+            ephemeralPlanted: false,
+            targetIdentity: (this.targetIdentity && typeof this.targetIdentity === 'object') ? this.targetIdentity : null,
+            note: WAIT_NOTE,
+          };
+          if (spec !== null) e.waitContext.expectedBreak = spec;
+        } catch (_) { /* best effort */ }
+      }
+      throw e;
+    }
+    let prepark = false;
+    try {
+      prepark = await this.withTarget(tid, async () => {
+        this.requireLive();
+        return !!this.paused;
+      });
+    } catch (e) {
+      // Session already gone before the capture arrived (short-lived
+      // target): keep the truthful exited message verbatim, attach the
+      // additive stage so the CLI never reports "no session".
+      if (e instanceof BridgeErr && /exited/i.test(String((e && e.message) || e)) && !e.waitContext) {
+        try {
+          e.waitContext = {
+            waitStartedAt: Math.floor(entryStarted / 1000),
+            waitedMs: Math.max(0, Date.now() - entryStarted),
+            triggerStatus: 'unknown',
+            captureStage: 'session-gone',
+            ephemeralPlanted: false,
+            targetIdentity: (this.targetIdentity && typeof this.targetIdentity === 'object') ? this.targetIdentity : null,
+            note: WAIT_NOTE,
+          };
+          if (spec !== null) e.waitContext.expectedBreak = spec;
+        } catch (_) { /* best effort */ }
+      }
+      throw e;
+    }
     if (prepark) {
       return this.withTarget(tid, async () => {
         const { snapshot, framesTruncated, varsTruncated } =
@@ -2807,20 +2888,84 @@ class Session {
         }, tid);
       });
     }
+    // Fresh path: plant the ephemeral first (failure parks nothing, so no
+    // resume is owed). A plant failure from a dying session means the
+    // target exited BEFORE the ephemeral was armed — wrapped truthfully;
+    // invalid specs stay verbatim (the target did not exit).
     let token = null;
-    if (spec !== null) token = await this.capturePlant(tid, spec);
+    if (spec !== null) {
+      try {
+        token = await this.capturePlant(tid, spec);
+      } catch (e) {
+        if (e instanceof BridgeErr && /exited|closed/i.test(String((e && e.message) || e)) && !e.waitContext) {
+          const wrapped = new BridgeErr(`capture target exited before ephemeral breakpoint was armed: ${(e && e.message) || e}`);
+          try {
+            wrapped.waitContext = {
+              waitStartedAt: Math.floor(entryStarted / 1000),
+              waitedMs: Math.max(0, Date.now() - entryStarted),
+              triggerStatus: 'unknown',
+              captureStage: 'before-armed',
+              ephemeralPlanted: false,
+              expectedBreak: spec,
+              targetIdentity: (this.targetIdentity && typeof this.targetIdentity === 'object') ? this.targetIdentity : null,
+              note: WAIT_NOTE,
+            };
+          } catch (_) { /* best effort */ }
+          throw wrapped;
+        }
+        throw e;
+      }
+    }
+    // Stage a short-lived-target exit as the truthful armed-wait error
+    // (null when e is not an exit/close): reaching the pump means the
+    // ephemeral WAS armed. Never endpoint-rejected/unreachable, never
+    // "unreachable code". waitStartedAt/waitedMs match the timeout
+    // context units (seconds since epoch / ms waited).
+    const started = Date.now();
+    const stageExit = (err) => {
+      if (!(err instanceof BridgeErr) || !/exited|closed/i.test(String((err && err.message) || err))) return null;
+      const wasPlanted = !!(token && token.kind !== 'main-dup' && token.kind !== 'child-dup');
+      const wrapped = new BridgeErr(
+        `target exited before capture hit${spec !== null ? ` (${spec})` : ''}: ${(err && err.message) || err}`);
+      try {
+        wrapped.waitContext = {
+          waitStartedAt: Math.floor(started / 1000),
+          waitedMs: Math.max(0, Date.now() - started),
+          triggerStatus: 'unknown',
+          captureStage: 'armed-wait',
+          ephemeralPlanted: wasPlanted,
+          targetIdentity: (this.targetIdentity && typeof this.targetIdentity === 'object') ? this.targetIdentity : null,
+          note: WAIT_NOTE,
+        };
+        if (spec !== null) wrapped.waitContext.expectedBreak = spec;
+      } catch (_) { /* best effort */ }
+      return wrapped;
+    };
     try {
       await this.pump(timeout, true);
     } catch (e) {
       // Timeout/exit: nothing parked by us — no resume — but the ephemeral
-      // must not leak.
+      // must not leak. A removal failure on a dead target must not mask
+      // the exit stage either: the staged error carries the removal note
+      // with its waitContext.
       try {
         await this.captureUnplant(token);
       } catch (ue) {
-        throw new BridgeErr(`${(e && e.message) || e}; capture ephemeral may still be planted (breaks remove --target ${tid} to clear)`);
+        const staged = stageExit(e);
+        if (staged) {
+          const err = new BridgeErr(`${staged.message}; capture ephemeral remove failed: ${(ue && ue.message) || ue} (breaks remove --target ${tid} to clear)`);
+          if (staged.waitContext && typeof staged.waitContext === 'object') err.waitContext = staged.waitContext;
+          throw err;
+        }
+        throw new BridgeErr(`${(e && e.message) || e}; capture ephemeral remove failed: ${(ue && ue.message) || ue} (breaks remove --target ${tid} to clear)`);
       }
       // The planted spec rides the honest timeout context (in canonical
-      // field order); other errors pass through untouched.
+      // field order); reaching the pump means the ephemeral WAS armed, so
+      // a target exit here is always armed-wait (the stop never arrived).
+      // Exits before arming wrap at the plant site above. No endpoint
+      // verdict, never "unreachable code"; other errors pass through
+      // untouched.
+      const _planted = !!(token && token.kind !== 'main-dup' && token.kind !== 'child-dup');
       if (e instanceof StopTimeout && spec !== null && e.waitContext && typeof e.waitContext === 'object') {
         const old = e.waitContext;
         e.waitContext = {
@@ -2832,6 +2977,12 @@ class Session {
           note: old.note || WAIT_NOTE,
         };
       }
+      if (e instanceof StopTimeout && e.waitContext && typeof e.waitContext === 'object') {
+        e.waitContext.captureStage = 'armed-wait-timeout';
+        e.waitContext.ephemeralPlanted = _planted;
+      }
+      const staged = stageExit(e);
+      if (staged) throw staged;
       throw e;
     }
     let stopped = this.lastParkTarget || 'main';
@@ -4034,26 +4185,16 @@ async function main(argv) {
     }
     process.exit(0);
   } catch (e) {
-    if (e instanceof Usage || e instanceof BridgeErr) {
-      writeFile(path.join(cfg.dir, 'error.json'), JSON.stringify(setupErrorPayload(e, e.message)));
-      await st.cleanup().catch(() => {});
-      try {
-        server.close();
-      } catch (_) { /* best effort */ }
-      // Mirror pybridge: exit nonzero; session.rs surfaces error.json.
-      process.exit(e instanceof Usage ? 2 : 1);
-    }
-    // Unexpected setup crash (never a silent exit-1): same cleanup, then a
-    // sanitized error.json the CLI surfaces. The name stays reusable — the
-    // CLI removes failed-setup dirs wholesale. Unexpected failures always
-    // report transport (the CLI keeps evidence-based endpoint diagnosis).
-    const detail = sanitizeUnexpected(e);
-    writeFile(path.join(cfg.dir, 'error.json'), JSON.stringify(setupErrorPayload(e, detail)));
+    // One mapping for every setup failure (see setupFailurePayload):
+    // typed failures keep their message, unexpected crashes sanitize to
+    // an internal error with the runtime phase. Mirror pybridge: exit
+    // nonzero; session.rs surfaces error.json.
+    writeFile(path.join(cfg.dir, 'error.json'), JSON.stringify(setupFailurePayload(e)));
     await st.cleanup().catch(() => {});
     try {
       server.close();
     } catch (_) { /* best effort */ }
-    process.exit(1);
+    process.exit(e instanceof Usage ? 2 : 1);
   }
 }
 

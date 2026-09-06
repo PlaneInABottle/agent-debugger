@@ -2449,12 +2449,40 @@ fn attach_config_failure(message: String, identity: &Value, requested: &Value) -
     .into()
 }
 
+/// Unexpected internal attach-setup failure (bridge-reported `phase:
+/// "runtime"`): the bridge operated successfully and then failed
+/// internally (post-handshake crash, degraded state). The sanitized
+/// message stays the top-level error verbatim — no endpoint diagnosis,
+/// no cause duplication, never endpoint-rejected. The redacted attempted
+/// identity and requested endpoint still ride along; they are spawn-time
+/// OS observations, never a diagnosis claim.
+fn attach_runtime_failure(message: String, identity: &Value, requested: &Value) -> anyhow::Error {
+    BridgeFailure {
+        message,
+        cause: None,
+        wait_context: None,
+        diagnosis: None,
+        target_identity: Some(identity.clone()),
+        requested_target: Some(requested.clone()),
+    }
+    .into()
+}
+
 /// True only for the bridge-reported config phase: the connection was
 /// established, so the message is semantic, not a transport symptom.
 /// Anything else takes the conservative transport path with endpoint
 /// diagnosis (corrupt files never reach here — they bail earlier).
 fn is_config_phase(phase: Option<&str>) -> bool {
     matches!(phase, Some("config"))
+}
+
+/// True only for the bridge-reported runtime phase: an unexpected
+/// internal failure after a successful bridge operation. Like config,
+/// the message stays top-level verbatim with no endpoint diagnosis and
+/// no cause duplication — it is never called endpoint-rejected. The
+/// redacted attempted identity and requested endpoint still ride along.
+fn is_runtime_phase(phase: Option<&str>) -> bool {
+    matches!(phase, Some("runtime"))
 }
 
 /// Preflight rejection when a live session already owns the endpoint.
@@ -2703,12 +2731,23 @@ fn spawn_in(
             }
             // Attach setup failure: config phase (connection was
             // established) keeps the semantic message top-level with no
-            // endpoint diagnosis; transport takes the OS-observed listener
-            // state (pre-attach vs now) with the raw text as sanitized
-            // cause. Every v2 bridge writes schemaVersion + phase.
+            // endpoint diagnosis; runtime phase (unexpected internal
+            // failure after a successful operation) keeps the truthful
+            // internal message top-level with no endpoint diagnosis and
+            // is never called endpoint-rejected; transport takes the
+            // OS-observed listener state (pre-attach vs now) with the raw
+            // text as sanitized cause. Every v2 bridge writes
+            // schemaVersion + phase.
             if let Some((host, port)) = &endpoint {
                 if is_config_phase(failure.phase.as_deref()) {
                     return Err(attach_config_failure(
+                        failure.message,
+                        &spec.target_identity,
+                        &spec.requested,
+                    ));
+                }
+                if is_runtime_phase(failure.phase.as_deref()) {
+                    return Err(attach_runtime_failure(
                         failure.message,
                         &spec.target_identity,
                         &spec.requested,
@@ -2765,10 +2804,19 @@ fn spawn_in(
                         }
                         // Late-settling attach failure: same phase routing
                         // as the fast path (config keeps the semantic
-                        // message; transport takes a fresh probe).
+                        // message; runtime keeps the truthful internal
+                        // message, never endpoint-rejected; transport
+                        // takes a fresh probe).
                         if let Some((host, port)) = &endpoint {
                             if is_config_phase(failure.phase.as_deref()) {
                                 return Err(attach_config_failure(
+                                    failure.message,
+                                    &spec.target_identity,
+                                    &spec.requested,
+                                ));
+                            }
+                            if is_runtime_phase(failure.phase.as_deref()) {
+                                return Err(attach_runtime_failure(
                                     failure.message,
                                     &spec.target_identity,
                                     &spec.requested,
@@ -3108,13 +3156,14 @@ fn read_logs_file(dir: &std::path::Path, tail: usize) -> Option<Value> {
 }
 
 /// Bridge setup-failure file (v2): `{"schemaVersion":2,"error":"…",
-/// "phase":"transport"|"config"}`. Every v2 bridge writes all three keys on
-/// every early path. Strict action: a present parseable `error.json` that
-/// carries an `error` string but the wrong `schemaVersion` or a
-/// missing/invalid `phase` reads as corrupt (`corrupt: true` with the exact
-/// actionable message — internal, never transport-diagnosed). Absent,
-/// unparseable, or error-less files keep the transport fallback
-/// (`corrupt: false`, default message, `phase: None`).
+/// "phase":"transport"|"config"|"runtime"}`. Every v2 bridge writes all
+/// three keys on every early path. Strict action: a present parseable
+/// `error.json` that carries an `error` string but the wrong
+/// `schemaVersion` or a missing/invalid `phase` reads as corrupt
+/// (`corrupt: true` with the exact actionable message — internal, never
+/// transport-diagnosed). Absent, unparseable, or error-less files keep
+/// the transport fallback (`corrupt: false`, default message, `phase:
+/// None`).
 #[derive(Debug)]
 struct BridgeSetupError {
     message: String,
@@ -3153,7 +3202,10 @@ fn read_bridge_error(dir: &std::path::Path) -> BridgeSetupError {
         .and_then(|v| v.get("phase"))
         .and_then(|p| p.as_str())
         .map(|s| s.to_string());
-    let phase_ok = matches!(phase.as_deref(), Some("transport") | Some("config"));
+    let phase_ok = matches!(
+        phase.as_deref(),
+        Some("transport") | Some("config") | Some("runtime")
+    );
     if !version_ok || !phase_ok {
         return BridgeSetupError {
             message: format!(
@@ -5178,8 +5230,21 @@ mod tests {
         let e = read_bridge_error(&dir);
         assert!(!e.corrupt);
         assert!(!is_config_phase(e.phase.as_deref()));
+        assert!(!is_runtime_phase(e.phase.as_deref()));
+        // Runtime phase with schemaVersion 2: truthful internal error,
+        // never endpoint-diagnosed, never endpoint-rejected.
+        std::fs::write(
+            dir.join("error.json"),
+            r#"{"schemaVersion":2,"error":"internal: KeyError('value')","phase":"runtime"}"#,
+        )
+        .unwrap();
+        let e = read_bridge_error(&dir);
+        assert!(!e.corrupt);
+        assert!(is_runtime_phase(e.phase.as_deref()));
+        assert!(!is_config_phase(e.phase.as_deref()));
         // Present + parseable but missing/bad version/phase: exact corrupt
-        // message (internal, never transport-diagnosed).
+        // message (internal, never transport-diagnosed). Unknown phases
+        // stay corrupt — only transport/config/runtime are valid.
         for (tag, body) in [
             (
                 "missing-phase",
@@ -5195,7 +5260,7 @@ mod tests {
             ),
             (
                 "bad-phase",
-                r#"{"schemaVersion":2,"error":"x","phase":"runtime"}"#,
+                r#"{"schemaVersion":2,"error":"x","phase":"internal"}"#,
             ),
             (
                 "nonstring-phase",
@@ -5264,6 +5329,30 @@ mod tests {
         assert_eq!(e.message, "no method x() in Y");
         assert!(is_config_phase(e.phase.as_deref()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attach_runtime_phase_stays_truthful_internal_error() {
+        // Runtime phase: the bridge operated successfully then failed
+        // internally. The message stays top-level verbatim (never
+        // rewritten to `attach failed:`, never endpoint-rejected), with
+        // no diagnosis and no cause duplication — but the redacted
+        // identities still ride along for the envelope.
+        let seed = attach_seed("127.0.0.1", 9);
+        let requested = json!({"host": "127.0.0.1", "port": 9, "pid": Value::Null});
+        let msg = "internal: KeyError('value')";
+        let err = attach_runtime_failure(msg.to_string(), &seed, &requested);
+        let text = format!("{err:#}");
+        assert_eq!(text, msg);
+        assert!(
+            !text.contains("attach failed") && !text.contains("rejected"),
+            "runtime errors are never endpoint-diagnosed: {text}"
+        );
+        let bf = err.downcast_ref::<BridgeFailure>().expect("typed failure");
+        assert!(bf.diagnosis.is_none(), "no misleading endpoint diagnosis");
+        assert!(bf.cause.is_none(), "no cause duplication");
+        assert!(bf.target_identity.is_some());
+        assert_eq!(bf.requested_target.as_ref().unwrap()["port"], json!(9));
     }
 
     #[test]

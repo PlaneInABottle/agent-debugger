@@ -24,7 +24,8 @@ function loadBridge(rel, exports) {
   return m.exports;
 }
 
-const node = loadBridge('bridge/node/src/nodebridge.js', 'Session');
+const node = loadBridge('bridge/node/src/nodebridge.js',
+  'Session, StopTimeout, Usage, BridgeErr, ConfigError, RuntimeError, setupFailurePayload');
 
 function tmpdir(prefix) {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
@@ -183,6 +184,56 @@ test('node capture: timeout removes ephemeral without resume', async () => {
   assert.equal(st.cfg.breaks.length, 0);
 });
 
+test('node capture: exit after armed names hit stage, never endpoint verdict', async () => {
+  const dir = tmpdir('wc-node-');
+  const file = writeJs(dir);
+  const st = nodeSession(dir);
+  const order = [];
+  st.cdp = {
+    request: async (m) => {
+      order.push(m);
+      if (m === 'Debugger.setBreakpointByUrl') {
+        return { breakpointId: 'bp-1', locations: [{ lineNumber: 4 }] };
+      }
+      return {};
+    },
+  };
+  st.pump = async () => { throw new node.BridgeErr('target exited'); };
+  await assert.rejects(
+    st.cmdCapture({ break: `${file}:5` }, 5),
+    (e) => {
+      assert.match(e.message, /target exited before capture hit/);
+      assert.ok(e.message.includes(`${file}:5`));
+      assert.ok(!/endpoint|unreachable|rejected/i.test(e.message));
+      assert.equal(e.waitContext.captureStage, 'armed-wait');
+      assert.equal(e.waitContext.ephemeralPlanted, true);
+      assert.equal(e.waitContext.expectedBreak, `${file}:5`);
+      return true;
+    });
+  assert.ok(order.includes('Debugger.removeBreakpoint'), 'ephemeral removed');
+  assert.ok(!order.includes('Debugger.resume'), 'exit never resumes');
+  assert.equal(st.cfg.breaks.length, 0, 'no intent left behind');
+});
+
+test('node capture: exit before armed at plant', async () => {
+  const dir = tmpdir('wc-node-');
+  const file = writeJs(dir);
+  const st = nodeSession(dir);
+  st.cdp = { request: async () => { throw new node.BridgeErr('target exited'); } };
+  await assert.rejects(
+    st.cmdCapture({ break: `${file}:5` }, 5),
+    (e) => {
+      assert.match(e.message,
+        /capture target exited before ephemeral breakpoint was armed/);
+      assert.ok(!/endpoint|rejected/i.test(e.message));
+      assert.equal(e.waitContext.captureStage, 'before-armed');
+      assert.equal(e.waitContext.ephemeralPlanted, false);
+      assert.ok(typeof e.waitContext.waitStartedAt === 'number');
+      assert.ok(typeof e.waitContext.waitedMs === 'number');
+      return true;
+    });
+});
+
 test('node capture: collection failure still resumes', async () => {
   const dir = tmpdir('wc-node-');
   const file = writeJs(dir);
@@ -195,6 +246,129 @@ test('node capture: collection failure still resumes', async () => {
   assert.equal(resp.resumed, true);
   assert.ok(resp.snapshotError);
   assert.ok(order.includes('Debugger.resume'));
+});
+
+test('node trackChanges skips sentinel and malformed, keeps stable strings', async () => {
+  const st = nodeSession(tmpdir('wc-node-'));
+  st.frameLocalsIn = async () => ([
+    { name: 'a', type: 'int', value: '1' },
+    { name: '…', note: '+9 more' },
+    { name: 'novalue', type: 'int' },
+    { name: 42, value: 'x' },
+    null,
+    'junk',
+    { name: 'n', type: 'null', value: null },
+  ]);
+  await st.trackChanges([{ functionName: 'handler' }]);
+  assert.deepEqual(JSON.parse(st.lastChanged).sort(), ['a', 'n']);
+  assert.ok(!('…' in st.lastTop));
+});
+
+test('node onPaused degrades when change tracking throws, park stands', async () => {
+  const dir = tmpdir('wc-node-');
+  const file = writeJs(dir);
+  const st = nodeSession(dir);
+  const url = `file://${file}`;
+  st.scripts = new Map([['s1', url]]);
+  st.frameLocalsIn = async () => { throw new Error('synthetic locals boom'); };
+  await st.onPaused({
+    reason: 'breakpoint', hitBreakpoints: ['bp-1'],
+    callFrames: [{
+      functionName: 'handler', url,
+      location: { scriptId: 's1', lineNumber: 4 }, scopeChain: [],
+    }],
+  });
+  assert.ok(st.paused, 'park stands');
+  assert.deepEqual(st.lastChanged, '[]');
+  assert.deepEqual(st.cachedLocals, []);
+  const sess = JSON.parse(fs.readFileSync(path.join(dir, 'session.json'), 'utf-8'));
+  assert.equal(sess.stopped, true);
+  assert.equal(sess.schemaVersion, 2);
+});
+
+test('node capture session-gone entry keeps exited message with stage', async () => {
+  const st = nodeSession(tmpdir('wc-node-'));
+  st.exited = true;
+  await assert.rejects(st.cmdCapture({ break: 'x.js:1' }, 5), (e) => {
+    assert.match(e.message, /exited/);
+    assert.ok(!/no session/i.test(e.message));
+    assert.equal(e.waitContext.captureStage, 'session-gone');
+    assert.equal(e.waitContext.expectedBreak, 'x.js:1');
+    assert.equal(e.waitContext.ephemeralPlanted, false);
+    assert.equal(e.waitContext.triggerStatus, 'unknown');
+    assert.ok(typeof e.waitContext.waitStartedAt === 'number');
+    assert.ok(typeof e.waitContext.waitedMs === 'number');
+    return true;
+  });
+});
+
+test('node capture timeout carries armed-wait-timeout stage', async () => {
+  const dir = tmpdir('wc-node-');
+  const file = writeJs(dir);
+  const st = nodeSession(dir);
+  st.cdp = {
+    request: async (m) => {
+      if (m === 'Debugger.setBreakpointByUrl') {
+        return { breakpointId: 'bp-9', locations: [{ lineNumber: 4 }] };
+      }
+      return {};
+    },
+  };
+  st.pump = async () => {
+    const e = new node.StopTimeout('timeout: no stop within 5s');
+    e.waitContext = {
+      waitStartedAt: 1, waitedMs: 2, triggerStatus: 'unknown',
+      targetIdentity: null, note: 'n',
+    };
+    throw e;
+  };
+  await assert.rejects(st.cmdCapture({ break: `${file}:5` }, 5), (e) => {
+    assert.equal(e.waitContext.captureStage, 'armed-wait-timeout');
+    assert.equal(e.waitContext.ephemeralPlanted, true);
+    assert.equal(e.waitContext.expectedBreak, `${file}:5`);
+    return true;
+  });
+});
+
+test('node capture removal failure on dead target keeps exit stage', async () => {
+  const dir = tmpdir('wc-node-');
+  const file = writeJs(dir);
+  const st = nodeSession(dir);
+  st.cdp = {
+    request: async (m) => {
+      if (m === 'Debugger.setBreakpointByUrl') {
+        return { breakpointId: 'bp-7', locations: [{ lineNumber: 4 }] };
+      }
+      return {};
+    },
+  };
+  st.pump = async () => { throw new node.BridgeErr('target exited'); };
+  st.captureUnplant = async () => { throw new Error('remove boom'); };
+  await assert.rejects(st.cmdCapture({ break: `${file}:5` }, 5), (e) => {
+    assert.match(e.message, /target exited before capture hit/);
+    assert.match(e.message, /remove boom/);
+    assert.equal(e.waitContext.captureStage, 'armed-wait');
+    assert.ok(typeof e.waitContext.waitStartedAt === 'number');
+    assert.ok(typeof e.waitContext.waitedMs === 'number');
+    return true;
+  });
+});
+
+test('node setupFailurePayload maps the real setup catch', () => {
+  // Typed failures keep their message; unexpected crashes sanitize to an
+  // internal error with the runtime phase. Phase derives from the
+  // original exception, never message text.
+  assert.deepEqual(node.setupFailurePayload(new node.BridgeErr('target exited')),
+    { schemaVersion: 2, error: 'target exited', phase: 'transport' });
+  assert.deepEqual(node.setupFailurePayload(new node.Usage('bad --break')),
+    { schemaVersion: 2, error: 'bad --break', phase: 'config' });
+  assert.deepEqual(
+    node.setupFailurePayload(new node.ConfigError('CDP refused: bad cond')),
+    { schemaVersion: 2, error: 'CDP refused: bad cond', phase: 'config' });
+  const p = node.setupFailurePayload(new Error('bug'));
+  assert.equal(p.phase, 'runtime');
+  assert.equal(p.schemaVersion, 2);
+  assert.match(p.error, /^internal: Error: bug/);
 });
 
 test('node dispatch: wait occupies slot, rival resume busy', async () => {
@@ -218,7 +392,8 @@ test('node notePark: same-line second park diagnoses, slide does not', () => {
 
 // ---- browser ----
 
-const browser = loadBridge('bridge/browser/src/browserbridge.js', 'Session');
+const browser = loadBridge('bridge/browser/src/browserbridge.js',
+  'Session, StopTimeout, Usage, BridgeErr, ConfigError, RuntimeError, setupFailurePayload');
 
 function browserSession(dir, over = {}) {
   const st = new browser.Session({
@@ -356,3 +531,230 @@ test('browser captureBounds enforced', () => {
     assert.throws(() => st.captureBounds(req), /capture/);
   }
 });
+
+test('browser capture session-gone entry on closed tab keeps message with stage', async () => {
+  const st = browserSession(tmpdir('wc-br-'));
+  st.verifyTab = async () => { throw new browser.BridgeErr('tab closed (or navigated beyond reach) — close this session'); };
+  await assert.rejects(st.cmdCapture({ break: 'app.js:5' }, 5), (e) => {
+    assert.match(e.message, /tab closed/);
+    assert.ok(!/no session/i.test(e.message));
+    assert.equal(e.waitContext.captureStage, 'session-gone');
+    assert.equal(e.waitContext.expectedBreak, 'app.js:5');
+    assert.equal(e.waitContext.ephemeralPlanted, false);
+    assert.equal(e.waitContext.triggerStatus, 'unknown');
+    assert.ok(typeof e.waitContext.waitStartedAt === 'number');
+    assert.ok(typeof e.waitContext.waitedMs === 'number');
+    return true;
+  });
+});
+
+test('browser capture session-gone entry on exited flag keeps message with stage', async () => {
+  const st = browserSession(tmpdir('wc-br-'));
+  st.exited = true;
+  await assert.rejects(st.cmdCapture({ break: 'app.js:5' }, 5), (e) => {
+    assert.match(e.message, /closed/);
+    assert.equal(e.waitContext.captureStage, 'session-gone');
+    assert.equal(e.waitContext.ephemeralPlanted, false);
+    assert.ok(typeof e.waitContext.waitStartedAt === 'number');
+    assert.ok(typeof e.waitContext.waitedMs === 'number');
+    return true;
+  });
+});
+
+test('browser capture: exit before armed at plant', async () => {
+  const st = browserSession(tmpdir('wc-br-'));
+  st.cdp = { request: async () => { throw new browser.BridgeErr('tab closed'); } };
+  await assert.rejects(st.cmdCapture({ break: 'app.js:5' }, 5), (e) => {
+    assert.match(e.message, /capture target exited before ephemeral breakpoint was armed/);
+    assert.ok(!/endpoint|rejected/i.test(e.message));
+    assert.equal(e.waitContext.captureStage, 'before-armed');
+    assert.equal(e.waitContext.ephemeralPlanted, false);
+    assert.equal(e.waitContext.expectedBreak, 'app.js:5');
+    assert.ok(typeof e.waitContext.waitStartedAt === 'number');
+    assert.ok(typeof e.waitContext.waitedMs === 'number');
+    return true;
+  });
+});
+
+test('browser capture: reload before armed never claims exit', async () => {
+  const st = browserSession(tmpdir('wc-br-'));
+  st.cdp = { request: async () => { throw new browser.BridgeErr('reload dropped execution contexts'); } };
+  await assert.rejects(st.cmdCapture({ break: 'app.js:5' }, 5), (e) => {
+    assert.match(e.message, /reloaded before ephemeral breakpoint was armed/);
+    assert.ok(!/exited/i.test(e.message));
+    assert.equal(e.waitContext.captureStage, 'before-armed');
+    assert.equal(e.waitContext.ephemeralPlanted, false);
+    return true;
+  });
+});
+
+test('browser capture: exit after armed names hit stage, never endpoint verdict', async () => {
+  const st = browserSession(tmpdir('wc-br-'));
+  const order = [];
+  st.cdp = {
+    request: async (m) => {
+      order.push(m);
+      if (m === 'Debugger.setBreakpointByUrl') {
+        return { breakpointId: 'bp-1', locations: [{ lineNumber: 4 }] };
+      }
+      return {};
+    },
+  };
+  st.pump = async () => { throw new browser.BridgeErr('tab closed'); };
+  await assert.rejects(st.cmdCapture({ break: 'app.js:5' }, 5), (e) => {
+    assert.match(e.message, /target exited before capture hit/);
+    assert.ok(e.message.includes('app.js:5'));
+    assert.ok(!/endpoint|unreachable|rejected/i.test(e.message));
+    assert.equal(e.waitContext.captureStage, 'armed-wait');
+    assert.equal(e.waitContext.ephemeralPlanted, true);
+    assert.equal(e.waitContext.expectedBreak, 'app.js:5');
+    assert.ok(typeof e.waitContext.waitStartedAt === 'number');
+    assert.ok(typeof e.waitContext.waitedMs === 'number');
+    return true;
+  });
+  assert.ok(order.includes('Debugger.removeBreakpoint'), 'ephemeral removed');
+  assert.ok(!order.includes('Debugger.resume'), 'exit never resumes');
+  assert.equal(st.cfg.breaks.length, 0, 'no intent left behind');
+});
+
+test('browser capture: reload mid-wait never claims exit', async () => {
+  const st = browserSession(tmpdir('wc-br-'));
+  st.cdp = {
+    request: async (m) => {
+      if (m === 'Debugger.setBreakpointByUrl') {
+        return { breakpointId: 'bp-9', locations: [{ lineNumber: 4 }] };
+      }
+      return {};
+    },
+  };
+  st.pump = async () => { throw new browser.BridgeErr('reload navigated away'); };
+  await assert.rejects(st.cmdCapture({ break: 'app.js:5' }, 5), (e) => {
+    assert.match(e.message, /target reloaded before capture hit/);
+    assert.ok(!/exited/i.test(e.message));
+    assert.equal(e.waitContext.captureStage, 'armed-wait');
+    assert.equal(e.waitContext.ephemeralPlanted, true);
+    return true;
+  });
+});
+
+test('browser capture timeout carries armed-wait-timeout stage', async () => {
+  const st = browserSession(tmpdir('wc-br-'));
+  st.cdp = {
+    request: async (m) => {
+      if (m === 'Debugger.setBreakpointByUrl') {
+        return { breakpointId: 'bp-9', locations: [{ lineNumber: 4 }] };
+      }
+      return {};
+    },
+  };
+  st.pump = async () => {
+    const e = new browser.StopTimeout('timeout: no stop within 5s');
+    e.waitContext = {
+      waitStartedAt: 1, waitedMs: 2, triggerStatus: 'unknown',
+      targetIdentity: null, note: 'n',
+    };
+    throw e;
+  };
+  await assert.rejects(st.cmdCapture({ break: 'app.js:5' }, 5), (e) => {
+    assert.equal(e.waitContext.captureStage, 'armed-wait-timeout');
+    assert.equal(e.waitContext.ephemeralPlanted, true);
+    assert.equal(e.waitContext.expectedBreak, 'app.js:5');
+    return true;
+  });
+});
+
+test('browser capture removal failure on dead tab keeps exit stage', async () => {
+  const st = browserSession(tmpdir('wc-br-'));
+  st.cdp = {
+    request: async (m) => {
+      if (m === 'Debugger.setBreakpointByUrl') {
+        return { breakpointId: 'bp-7', locations: [{ lineNumber: 4 }] };
+      }
+      return {};
+    },
+  };
+  st.pump = async () => { throw new browser.BridgeErr('tab closed'); };
+  st.captureUnplant = async () => { throw new Error('remove boom'); };
+  await assert.rejects(st.cmdCapture({ break: 'app.js:5' }, 5), (e) => {
+    assert.match(e.message, /target exited before capture hit/);
+    assert.match(e.message, /remove boom/);
+    assert.equal(e.waitContext.captureStage, 'armed-wait');
+    assert.ok(typeof e.waitContext.waitStartedAt === 'number');
+    assert.ok(typeof e.waitContext.waitedMs === 'number');
+    return true;
+  });
+});
+
+test('browser setupFailurePayload maps the real setup catch', () => {
+  assert.deepEqual(browser.setupFailurePayload(new browser.BridgeErr('tab closed')),
+    { schemaVersion: 2, error: 'tab closed', phase: 'transport' });
+  assert.deepEqual(browser.setupFailurePayload(new browser.Usage('bad --break')),
+    { schemaVersion: 2, error: 'bad --break', phase: 'config' });
+  assert.deepEqual(
+    browser.setupFailurePayload(new browser.ConfigError('CDP refused: bad cond')),
+    { schemaVersion: 2, error: 'CDP refused: bad cond', phase: 'config' });
+  const p = browser.setupFailurePayload(new Error('bug'));
+  assert.equal(p.phase, 'runtime');
+  assert.equal(p.schemaVersion, 2);
+  assert.match(p.error, /^internal: Error: bug/);
+});
+
+test('browser trackChanges skips sentinel and malformed, keeps stable strings', async () => {
+  const st = browserSession(tmpdir('wc-br-'));
+  st.frameLocalsIn = async () => ([
+    { name: 'a', type: 'string', value: '1' },
+    { name: '…', note: '+9 more' },
+    { name: 'novalue', type: 'int' },
+    { name: 42, value: 'x' },
+    null,
+    'junk',
+    { name: 'n', type: 'null', value: null },
+  ]);
+  await st.trackChanges([{ functionName: 'handler' }]);
+  assert.deepEqual(JSON.parse(st.lastChanged).sort(), ['a', 'n']);
+  assert.ok(!('…' in st.lastTop));
+});
+
+test('browser onPaused degrades when change tracking throws, park stands', async () => {
+  const st = browserSession(tmpdir('wc-br-'));
+  st.frameLocalsIn = async () => { throw new Error('synthetic locals boom'); };
+  st.cdp = { request: async () => ({}) };
+  await st.onPaused({
+    reason: 'breakpoint', hitBreakpoints: ['bp-1'],
+    callFrames: [{
+      functionName: 'handler',
+      url: 'http://localhost:3000/app.js',
+      location: { scriptId: 's1', lineNumber: 4 }, scopeChain: [],
+    }],
+  });
+  assert.ok(st.paused, 'park stands');
+  assert.deepEqual(st.lastChanged, '[]');
+  assert.deepEqual(st.cachedLocals, []);
+});
+
+// Capture snapshots preserve the locals truncation sentinel within the
+// vars cap (varsN-1 real + sentinel): the bounded frame still reports
+// how many locals were cut instead of silently dropping the note.
+for (const [name, mod, mkSession] of [['node', node, nodeSession], ['browser', browser, browserSession]]) {
+  test(`${name} boundedSnapshot preserves truncation sentinel within vars cap`, async () => {
+    const st = mkSession(tmpdir('wc-sentinel-'));
+    const real = Array.from({ length: 20 }, (_, i) => ({ name: `v${i}`, type: 'int', value: `${i}` }));
+    st.frameLocalsIn = async () => [...real, { name: '…', note: '+5 more' }];
+    st.paused = {
+      frames: [{
+        functionName: 'handler', url: 'u',
+        location: { scriptId: 's1', lineNumber: 4 }, scopeChain: [],
+      }],
+      stopInfo: null,
+    };
+    // Browser locationJson needs no traffic for file URLs; node needs a
+    // script map entry.
+    if (name === 'node') st.scripts = new Map([['s1', 'file:///wc.js']]);
+    else st.scriptLines = async () => [];
+    const { snapshot, varsTruncated } = await st.boundedSnapshot(10, 20);
+    const locals = snapshot.frames[0].locals;
+    assert.ok(locals.length <= 20, `within cap: ${locals.length}`);
+    assert.equal(locals[locals.length - 1].name, '…');
+    assert.equal(varsTruncated, true);
+  });
+}

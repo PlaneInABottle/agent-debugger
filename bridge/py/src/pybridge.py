@@ -61,6 +61,15 @@ class ConfigErr(BridgeErr):
     BridgeErr so the CLI keeps endpoint diagnosis for them."""
 
 
+class RuntimeErr(Exception):
+    """Unexpected internal failure after a successful bridge operation
+    (post-handshake crash, degraded change tracking, etc.). Distinct from
+    BridgeErr (transport) and Usage/ConfigErr (config) so error.json
+    `phase` reads `runtime` — truthful internal error, never endpoint
+    diagnosis. Never carries variable data/secrets (class + short
+    message only)."""
+
+
 class StopTimeout(BridgeErr):
     """First-stop wait timed out. Typed so attach can fall back to a live
     running session while launch still fails — never match by message.
@@ -1098,7 +1107,10 @@ class Session:
 
     def fetch_variables(self, ref):
         body = self.dap_request("variables", {"variablesReference": ref})
-        return body.get("variables", [])
+        if not isinstance(body, dict):
+            return []
+        vars_ = body.get("variables", [])
+        return vars_ if isinstance(vars_, list) else []
 
     def fmt_dap_value(self, vartype, value, ref, depth=1):
         """Java-parity formatting with the same caps. Complete literals
@@ -1114,7 +1126,9 @@ class Session:
         except BridgeErr:
             return v
         named = [c for c in children
-                 if c.get("name") not in Session.PSEUDO_SCOPES
+                 if isinstance(c, dict)
+                 and isinstance(c.get("name"), str)
+                 and c.get("name") not in Session.PSEUDO_SCOPES
                  and not c.get("name", "").isdigit()][:MAX_FIELDS]
         if not named:
             return v
@@ -1143,7 +1157,13 @@ class Session:
     def frame_locals(self, index=0, limit=MAX_VARS):
         fid = self.top_frame_id(index)
         body = self.dap_request("scopes", {"frameId": fid})
-        scopes = {s.get("name"): s for s in body.get("scopes", [])}
+        # Malformed scopes (non-dict body, non-list, non-dict entries)
+        # degrade to no locals — never AttributeError on the park path.
+        raw_scopes = body.get("scopes", []) if isinstance(body, dict) else []
+        if not isinstance(raw_scopes, list):
+            raw_scopes = []
+        scopes = {s.get("name"): s for s in raw_scopes
+                  if isinstance(s, dict)}
         # Module frames keep names under Globals; functions under Locals.
         # Fall back only when Locals yields nothing real (never mask a
         # legitimately empty function frame with module noise... except that
@@ -1151,26 +1171,44 @@ class Session:
         children = []
         if "Locals" in scopes:
             children = [v for v in self.fetch_variables(scopes["Locals"]["variablesReference"])
-                        if v.get("name") not in self.PSEUDO_SCOPES]
+                        if isinstance(v, dict)
+                        and (not isinstance(v.get("name"), str)
+                             or v.get("name") not in self.PSEUDO_SCOPES)]
         if not children and "Globals" in scopes:
             # Names hide one level deeper: function/class pseudo containers.
             merged = []
             for v in self.fetch_variables(scopes["Globals"]["variablesReference"]):
+                if not isinstance(v, dict):
+                    continue
                 name = v.get("name", "")
                 if name == "special variables":
                     continue
-                if name in self.PSEUDO_SCOPES and v.get("variablesReference"):
+                # Set membership needs a hashable name: only real strings
+                # can be pseudo-scopes; anything else flows through (the
+                # dunder filter and track_changes skip non-strings
+                # downstream) instead of raising TypeError here.
+                is_pseudo = isinstance(name, str) and name in self.PSEUDO_SCOPES
+                if is_pseudo and v.get("variablesReference"):
                     try:
                         merged.extend(
                             c for c in self.fetch_variables(v["variablesReference"])
-                            if c.get("name") not in self.PSEUDO_SCOPES)
+                            if isinstance(c, dict)
+                            and (not isinstance(c.get("name"), str)
+                                 or c.get("name") not in self.PSEUDO_SCOPES))
                     except BridgeErr:
                         pass
-                elif name not in self.PSEUDO_SCOPES:
+                elif not is_pseudo:
                     merged.append(v)
-            children = [v for v in merged if not v.get("name", "").startswith("__")]
+            # Malformed nested records (non-string names) are kept, never
+            # crashed on: the dunder filter only applies to real strings,
+            # and track_changes skips non-string names downstream.
+            children = [v for v in merged
+                        if not (isinstance(v.get("name"), str)
+                                and v.get("name", "").startswith("__"))]
         out = []
         for var in children:
+            if not isinstance(var, dict):
+                continue
             if len(out) >= limit:
                 out.append({"name": "…",
                             "note": f"+{len(children) - limit} more"})
@@ -1283,18 +1321,77 @@ class Session:
                 "output": self.output_tail[-MAX_OUTPUT:]}
 
     def track_changes(self):
+        # Resilient change tracking: frame_locals() appends a truncation
+        # sentinel {"name": "…", "note": "+N more"} once locals exceed
+        # MAX_VARS — the sentinel carries no "value" key, and malformed
+        # entries must never crash the park (KeyError:'value' regression).
+        # Only real local entries (dict, string name, non-sentinel, with a
+        # value) are tracked; everything else is safely skipped. The
+        # stable formatted value string from frame_locals is retained.
+        # This method never raises: any failure degrades to an empty
+        # baseline with a sanitized class-only warning (no variable
+        # data/secrets), so _park_stop always completes.
         try:
-            cur = {v["name"]: v["value"] for v in self.frame_locals(0)}
-            func = self.frames[0].get("name", "?") if self.frames else "?"
+            entries = self.frame_locals(0)
         except BridgeErr:
-            cur, func = {}, "?"
-        if self.last_top is None or getattr(self, "last_func", None) != func:
-            changed = sorted(cur)
-        else:
-            changed = sorted(n for n, v in cur.items() if self.last_top.get(n) != v)
+            entries = []
+        except Exception as e:
+            try:
+                sys.stderr.write(
+                    f"warn: change tracking degraded "
+                    f"({type(e).__name__})\n")
+            except Exception:
+                pass
+            entries = []
+        cur = {}
+        try:
+            for v in entries or []:
+                try:
+                    if not isinstance(v, dict):
+                        continue
+                    name = v.get("name")
+                    if (not isinstance(name, str) or name == "…"
+                            or "value" not in v):
+                        continue
+                    val = v.get("value")
+                    cur[name] = val if isinstance(val, str) else str(val)
+                except Exception:
+                    continue
+        except Exception as e:
+            try:
+                sys.stderr.write(
+                    f"warn: change tracking degraded "
+                    f"({type(e).__name__})\n")
+            except Exception:
+                pass
+            cur = {}
+        try:
+            func = self.frames[0].get("name", "?") if self.frames else "?"
+        except Exception:
+            func = "?"
+        try:
+            last = self.last_top if isinstance(self.last_top, dict) else None
+            if last is None or getattr(self, "last_func", None) != func:
+                changed = sorted(cur)
+            else:
+                changed = sorted(n for n, v in cur.items()
+                                 if last.get(n) != v)
+        except Exception as e:
+            try:
+                sys.stderr.write(
+                    f"warn: change tracking degraded "
+                    f"({type(e).__name__})\n")
+            except Exception:
+                pass
+            changed = []
+            cur = {}
+        # Coherent baseline so the next change is not a false explosion.
         self.last_top = cur
         self.last_func = func
-        self.last_changed = json.dumps(changed)
+        try:
+            self.last_changed = json.dumps(changed)
+        except Exception:
+            self.last_changed = "[]"
 
     def count_hits(self, reason, frame=None):
         """Attribute a stop to the records it fired (served as `hits` by
@@ -2635,7 +2732,27 @@ class Session:
             self.stop_info = self.exception_info()
         else:
             self.stop_info = None
-        self.track_changes()
+        # Change tracking must never crash the park (degraded track bug:
+        # track_changes is total, but this guard is the backstop for any
+        # future regression). Safe baseline + sanitized class-only
+        # warning, then count_hits/publish/diag continue normally.
+        try:
+            self.track_changes()
+        except Exception as e:
+            try:
+                func = (self.frames[0].get("name", "?")
+                        if self.frames else "?")
+            except Exception:
+                func = "?"
+            self.last_top = {}
+            self.last_func = func
+            self.last_changed = "[]"
+            try:
+                sys.stderr.write(
+                    f"warn: change tracking degraded "
+                    f"({type(e).__name__})\n")
+            except Exception:
+                pass
         self.count_hits(reason)
         self.publish_state(True)
         self._stop_seq += 1
@@ -3269,10 +3386,39 @@ class Session:
         reports). Any collection/removal failure still resumes; timeout
         never resumes (nothing parked). No eval, no persisted vars."""
         frames_n, vars_n, budget, spec = self._capture_bounds(req)
-        tid = self.resolve_target(req)
-        with self._TargetScope(self, tid):
-            self.require_live()
-            prepark = self._parked_now()
+        # Entry time for the early-stage contexts below (session-gone /
+        # before-armed): same seconds+ms units as every wait context; the
+        # wait never happened, so waitedMs is ~0 — never faked.
+        entry = time.time()
+        try:
+            tid = self.resolve_target(req)
+            with self._TargetScope(self, tid):
+                self.require_live()
+                prepark = self._parked_now()
+        except BridgeErr as e:
+            # Session already gone before the capture command arrived
+            # (short-lived startup target): keep the truthful
+            # session/target-exited message verbatim, but attach the
+            # additive stage so the CLI never reports "no session".
+            if "exited" in str(e).lower() and getattr(
+                    e, "wait_context", None) is None:
+                try:
+                    e.wait_context = {
+                        "waitStartedAt": int(entry),
+                        "waitedMs": max(0, int((time.time() - entry) * 1000)),
+                        "triggerStatus": "unknown",
+                        "captureStage": "session-gone",
+                        "ephemeralPlanted": False,
+                        "targetIdentity": (
+                            self._target_identity
+                            if isinstance(self._target_identity, dict)
+                            else None),
+                        "note": WAIT_NOTE}
+                    if spec is not None:
+                        e.wait_context["expectedBreak"] = spec
+                except Exception:
+                    pass
+            raise
         if prepark:
             with self._TargetScope(self, tid):
                 snap = self._bounded_snapshot(frames_n, vars_n)
@@ -3287,10 +3433,38 @@ class Session:
                         "warning": PARK_WARNING}
                 return self.stamp(resp, tid)
         # Fresh path: plant the ephemeral first (failure here parks
-        # nothing, so no resume is owed).
+        # nothing, so no resume is owed). A plant failure from a dying
+        # session (exit/close mid-plant) means the target exited BEFORE
+        # the ephemeral was armed — wrapped truthfully below. Invalid
+        # specs and conflicting conditions raise verbatim (no stage
+        # rewrite: the target did not exit).
         token = None
         if spec is not None:
-            token = self._capture_plant(tid, spec)
+            try:
+                token = self._capture_plant(tid, spec)
+            except BridgeErr as e:
+                if ("exited" in str(e).lower() or "closed" in str(e).lower()) \
+                        and getattr(e, "wait_context", None) is None:
+                    wrapped = BridgeErr(
+                        f"capture target exited before ephemeral "
+                        f"breakpoint was armed: {e}")
+                    try:
+                        wrapped.wait_context = {
+                            "waitStartedAt": int(entry),
+                            "waitedMs": max(0, int((time.time() - entry) * 1000)),
+                            "triggerStatus": "unknown",
+                            "captureStage": "before-armed",
+                            "ephemeralPlanted": False,
+                            "expectedBreak": spec,
+                            "targetIdentity": (
+                                self._target_identity
+                                if isinstance(self._target_identity, dict)
+                                else None),
+                            "note": WAIT_NOTE}
+                    except Exception:
+                        pass
+                    raise wrapped from e
+                raise
         started = time.time()
         try:
             self._park_local.parked = None
@@ -3299,13 +3473,27 @@ class Session:
             # Timeout/exit: nothing parked by us — no resume — but the
             # ephemeral must not leak: remove best-effort, then re-raise
             # the ORIGINAL error with the removal failure attached (never
-            # masked by it).
+            # masked by it). No intent persistence: the ephemeral never
+            # touched stops.json / the global intent. A removal failure
+            # on a dead adapter must not mask the exit stage either: the
+            # staged error carries the removal note with its wait_context.
             try:
                 self._capture_unplant(token)
             except Exception as e:
+                staged = self._stage_capture_exit(orig, token, spec, started)
+                if staged is not None:
+                    note = (f"{staged}; capture ephemeral remove failed: "
+                            f"{e} (breaks remove --target {tid} to clear)")
+                    err = BridgeErr(note)
+                    ctx = getattr(staged, "wait_context", None)
+                    if isinstance(ctx, dict):
+                        err.wait_context = ctx
+                    raise err from e
                 raise BridgeErr(
                     f"{orig}; capture ephemeral remove failed: {e} "
                     f"(breaks remove --target {tid} to clear)") from e
+            planted = (token is not None
+                       and token[0] not in ("main-dup", "child-dup"))
             if isinstance(orig, StopTimeout):
                 # Honest timeout context (canonical field order, planted
                 # spec only): enrich a bare pump timeout, or rebuild an
@@ -3323,6 +3511,18 @@ class Session:
                         "expectedBreak": spec,
                         "targetIdentity": old.get("targetIdentity"),
                         "note": old.get("note", WAIT_NOTE)}
+                if isinstance(getattr(orig, "wait_context", None), dict):
+                    # Additive stage: reaching the pump means the ephemeral
+                    # WAS armed (plant confirmed, or the idempotent dup
+                    # where the line was already armed) and the stop
+                    # simply never arrived — never an endpoint verdict,
+                    # never "unreachable code".
+                    orig.wait_context["captureStage"] = "armed-wait-timeout"
+                    orig.wait_context["ephemeralPlanted"] = planted
+            else:
+                staged = self._stage_capture_exit(orig, token, spec, started)
+                if staged is not None:
+                    raise staged from orig
             raise
         parked = getattr(self._park_local, "parked", None)
         if not (isinstance(parked, str)
@@ -3381,6 +3581,43 @@ class Session:
             if resume_err is not None:
                 resp["resumeError"] = resume_err
             return self.stamp(resp, parked)
+
+    def _stage_capture_exit(self, orig, token, spec, started):
+        """Stage a short-lived-target exit during a capture wait as the
+        truthful armed-wait error (or None when orig is not an exit).
+        Reaching the pump means the ephemeral WAS armed (plant confirmed,
+        or the idempotent dup where the line was already armed): the stop
+        never arrived in time. The message names the stage — never
+        endpoint-rejected/unreachable, never "unreachable code" (an
+        unobserved trigger proves nothing about reachability). Exits
+        BEFORE arming wrap at the plant site (before-armed) or report
+        session-gone at entry."""
+        msg_lower = str(orig).lower() if isinstance(orig, BridgeErr) else ""
+        if not ("exited" in msg_lower or "closed" in msg_lower):
+            return None
+        planted = (token is not None
+                   and token[0] not in ("main-dup", "child-dup"))
+        msg = (f"target exited before capture hit"
+               + (f" ({spec})" if spec is not None else "")
+               + f": {orig}")
+        wrapped = BridgeErr(msg)
+        try:
+            wrapped.wait_context = {
+                "waitStartedAt": int(started),
+                "waitedMs": max(0, int((time.time() - started) * 1000)),
+                "triggerStatus": "unknown",
+                "captureStage": "armed-wait",
+                "ephemeralPlanted": planted,
+                "targetIdentity": (
+                    self._target_identity
+                    if isinstance(self._target_identity, dict)
+                    else None),
+                "note": WAIT_NOTE}
+            if spec is not None:
+                wrapped.wait_context["expectedBreak"] = spec
+        except Exception:
+            pass
+        return wrapped
 
     def drain_pending(self, budget=1.0):
         """Consume already-arrived messages (output events etc.) without
@@ -4484,24 +4721,36 @@ def format_unexpected(e):
 
 
 # Setup-failure phases for error.json (additive; `error` text unchanged).
-# "transport" = the failure is a connection/protocol loss or anything not
-# proven semantic (socket/connect/initialize/handshake loss, timeouts,
-# target exit, unexpected crashes); "config" = a genuine semantic
+# "transport" = a connection/protocol loss (socket/connect/initialize/
+# handshake loss, timeouts, target exit); "config" = a genuine semantic
 # validation error (Usage/ConfigErr: bad method/class/line/source/
-# condition, unknown args, or a valid protocol error response). The CLI
-# routes on this type signal instead of matching message text. Default is
-# transport: a successful connection never globally flips later failures
+# condition, unknown args, or a valid protocol error response);
+# "runtime" = an unexpected internal failure after a successful bridge
+# operation (explicit RuntimeErr, or any other unexpected exception —
+# never message-matched). The CLI routes on this type signal instead of
+# matching message text: config keeps the semantic message with no
+# endpoint diagnosis, runtime surfaces a truthful internal error with no
+# endpoint diagnosis, transport keeps evidence-based endpoint diagnosis.
+# Default is transport (unbound sessions, unexpected non-exception
+# values); a successful connection never globally flips later failures
 # to config.
 
 
 def phase_of_error(e):
     """Validated setup phase for error.json `phase` — derived from the
-    exception type, never from message text or a stage timer. Only Usage
-    and ConfigErr read as config; everything else (unbound sessions,
-    unexpected values, transport losses) reads as transport."""
+    exception type, never from message text or a stage timer. Usage and
+    ConfigErr read as config; RuntimeErr and any other unexpected
+    exception read as runtime; BridgeErr transport losses (socket,
+    timeout, target exit) read as transport."""
     try:
         if isinstance(e, (Usage, ConfigErr)):
             return "config"
+        if isinstance(e, RuntimeErr):
+            return "runtime"
+        if isinstance(e, BridgeErr):
+            return "transport"
+        if isinstance(e, Exception):
+            return "runtime"
     except Exception:
         pass
     return "transport"
@@ -4848,8 +5097,9 @@ def main(argv):
             # Failed setup must not leak the spawned adapter/target:
             # clean up first, then report (the CLI removes the dir). The
             # phase derives from the exception type (Usage/ConfigErr read
-            # as config; transport losses stay transport) — never from
-            # message text or a stage timer.
+            # as config; transport losses stay transport; unexpected
+            # failures read as runtime) — never from message text or a
+            # stage timer.
             try:
                 st.cleanup()
             except Exception:
@@ -4861,8 +5111,9 @@ def main(argv):
             # Unexpected setup crash (never a silent exit-1): same cleanup,
             # then a sanitized error.json the CLI surfaces. The name stays
             # reusable — the CLI removes failed-setup dirs wholesale.
-            # Unexpected failures always report transport (the CLI keeps
-            # evidence-based endpoint diagnosis for them).
+            # Unexpected failures report runtime (truthful internal
+            # error, no endpoint diagnosis); transport losses stay
+            # transport via the BridgeErr path above.
             try:
                 st.cleanup()
             except Exception:

@@ -53,10 +53,11 @@ class BridgeSession {
                 "{\"pid\":" + ProcessHandle.current().pid()
                 + ",\"nonce\":" + JdiBridge.quote(st.ownerNonce) + "}");
         // Setup-failure phase for error.json derives from the exception
-        // type (UsageException/ConfigBridgeException read as config; JDI
-        // transport losses and unexpected crashes stay transport) — never
-        // from message text or a stage timer. A successful connection never
-        // globally flips later failures to config.
+        // type (UsageException/ConfigBridgeException read as config; a
+        // vanished target stays transport; unexpected crashes report
+        // runtime) — never from message text or a stage timer (see
+        // mapSetupFailure). A successful connection never globally flips
+        // later failures to config.
         try {
             if (cfg.sessionKind.equals("attach")) {
                 st.vm = BridgeConn.attachVm(cfg);
@@ -98,25 +99,17 @@ class BridgeSession {
             cleanupVm(st);
             BridgeProto.writeFile(dir.resolve("error.json"), setupErrorJson(e, setupErrorText(e, st)));
             throw e;
-        } catch (RuntimeException e) {
-            // JDI failures surface as unchecked VMDisconnectedException etc.
-            // Map them to the same error file (never a bare "internal:"
-            // crash), e.g. a target that vanishes mid-handshake or
-            // post-connect. Unexpected failures always report transport.
-            BridgeException be = new BridgeException(JdiBridge.shortMsg(e));
-            cleanupVm(st);
-            BridgeProto.writeFile(dir.resolve("error.json"), setupErrorJson(be, setupErrorText(be, st)));
-            throw be;
         } catch (Throwable t) {
-            // Any other setup crash (checked IO, linkage errors): same
-            // cleanup, then a sanitized error.json the CLI surfaces instead
-            // of a bare stdout "internal:" with no file. The name stays
+            // Any other setup failure: the same cleanup, then a sanitized
+            // error.json the CLI surfaces instead of a bare stdout
+            // "internal:" with no file. The typed mapping below decides
+            // the phase (a vanished target stays transport; unexpected
+            // crashes report runtime) — never message text. The name stays
             // reusable — the CLI removes failed-setup dirs wholesale.
-            // (M2 setup cleanup above is reused, never duplicated.)
-            BridgeException be = new BridgeException(JdiBridge.sanitizeUnexpected(t));
+            Exception mapped = mapSetupFailure(t);
             cleanupVm(st);
-            BridgeProto.writeFile(dir.resolve("error.json"), setupErrorJson(be, setupErrorText(be, st)));
-            throw be;
+            BridgeProto.writeFile(dir.resolve("error.json"), setupErrorJson(mapped, setupErrorText(mapped, st)));
+            throw mapped;
         } finally {
             try { server.close(); } catch (Exception ignored) {}
         }
@@ -313,7 +306,7 @@ class BridgeSession {
             }
             st.lastChanged = sb.append(']').toString();
             st.lastTop = cur;
-        } catch (Exception e) {
+        } catch (Throwable e) {
             st.lastChanged = "[]";
         }
     }
@@ -463,8 +456,7 @@ class BridgeSession {
                     st.location = bp.location();
                     st.stopInfo = null; // plain stop supersedes any previous reason
                     trackChanges(st);
-                    st.suspended = true;
-                    stop = BridgeSnapshot.snapshot(vm, st.cfg, st.thread, st.location, st.out, st.err);
+                    stop = parkSnapshot(st, vm);
                 } else if (event instanceof com.sun.jdi.event.StepEvent) {
                     com.sun.jdi.event.StepEvent se = (com.sun.jdi.event.StepEvent) event;
                     if (stop != null) continue;
@@ -473,8 +465,7 @@ class BridgeSession {
                     st.location = se.location();
                     st.stopInfo = null;
                     trackChanges(st);
-                    st.suspended = true;
-                    stop = BridgeSnapshot.snapshot(vm, st.cfg, st.thread, st.location, st.out, st.err);
+                    stop = parkSnapshot(st, vm);
                 } else if (event instanceof com.sun.jdi.event.ExceptionEvent) {
                     com.sun.jdi.event.ExceptionEvent ee = (com.sun.jdi.event.ExceptionEvent) event;
                     if (!pe.wanted) continue;
@@ -487,8 +478,7 @@ class BridgeSession {
                     st.location = ee.location();
                     st.stopInfo = BridgeEval.exceptionInfo(ee);
                     trackChanges(st);
-                    st.suspended = true;
-                    stop = BridgeSnapshot.snapshot(vm, st.cfg, st.thread, st.location, st.out, st.err);
+                    stop = parkSnapshot(st, vm);
                 } else if (event instanceof com.sun.jdi.event.ModificationWatchpointEvent) {
                     com.sun.jdi.event.ModificationWatchpointEvent we =
                             (com.sun.jdi.event.ModificationWatchpointEvent) event;
@@ -499,8 +489,7 @@ class BridgeSession {
                     parkReason = "watch";
                     st.stopInfo = BridgeEval.watchInfo(we.field(), "write", we.valueToBe());
                     trackChanges(st);
-                    st.suspended = true;
-                    stop = BridgeSnapshot.snapshot(vm, st.cfg, st.thread, st.location, st.out, st.err);
+                    stop = parkSnapshot(st, vm);
                 } else if (event instanceof com.sun.jdi.event.AccessWatchpointEvent) {
                     com.sun.jdi.event.AccessWatchpointEvent we =
                             (com.sun.jdi.event.AccessWatchpointEvent) event;
@@ -511,8 +500,7 @@ class BridgeSession {
                     parkReason = "watch";
                     st.stopInfo = BridgeEval.watchInfo(we.field(), "read", we.valueCurrent());
                     trackChanges(st);
-                    st.suspended = true;
-                    stop = BridgeSnapshot.snapshot(vm, st.cfg, st.thread, st.location, st.out, st.err);
+                    stop = parkSnapshot(st, vm);
                 } else if (event instanceof com.sun.jdi.event.MethodExitEvent) {
                     com.sun.jdi.event.MethodExitEvent me = (com.sun.jdi.event.MethodExitEvent) event;
                     if (!BridgeEval.wantedExit(st.cfg, me)) continue;
@@ -523,8 +511,7 @@ class BridgeSession {
                     st.location = me.location();
                     st.stopInfo = BridgeEval.exitInfo(me);
                     trackChanges(st);
-                    st.suspended = true;
-                    stop = BridgeSnapshot.snapshot(vm, st.cfg, st.thread, st.location, st.out, st.err);
+                    stop = parkSnapshot(st, vm);
                 } else if (event instanceof ClassPrepareEvent) {
                     ClassPrepareEvent cp = (ClassPrepareEvent) event;
                     try { cp.request().disable(); } catch (Exception ignored) {}
@@ -698,6 +685,63 @@ class BridgeSession {
             msg += "; " + hint;
         }
         return msg;
+    }
+
+    /** Additive capture stage on a pre-rendered wait-context JSON: inserts
+     *  `"captureStage":"<stage>","ephemeralPlanted":<bool>` before the
+     *  final `}`. Best-effort (returns the input when it is not an
+     *  object); never endpoint diagnosis, never "unreachable code". */
+    static String withCaptureStage(String ctxJson, String stage, boolean planted) {
+        if (ctxJson == null || !ctxJson.endsWith("}")) return ctxJson;
+        return ctxJson.substring(0, ctxJson.length() - 1)
+                + ",\"captureStage\":" + JdiBridge.quote(stage)
+                + ",\"ephemeralPlanted\":" + planted + "}";
+    }
+
+    /** Stage a short-lived-target exit during a capture wait as the
+     *  truthful armed-wait error (null when e is not an exit).
+     *  Reaching the pump means the ephemeral WAS armed (plant confirmed,
+     *  or the idempotent already-armed case): the stop never arrived in
+     *  time. Exits BEFORE arming wrap at the plant site (before-armed).
+     *  Never endpoint-rejected or unreachable. */
+    static BridgeException stageCaptureExit(Exception e, boolean planted,
+            String spec, SessionState st, long waitStartMs) {
+        if (!(e instanceof BridgeException) || e.getMessage() == null) return null;
+        String lower = e.getMessage().toLowerCase();
+        if (!lower.contains("exit") && !lower.contains("closed")) return null;
+        boolean wasPlanted = planted;
+        String msg = "target exited before capture hit"
+                + (spec != null ? " (" + spec + ")" : "")
+                + ": " + e.getMessage();
+        return new BridgeException(msg, captureExitContextJson(
+                st, "armed-wait", wasPlanted, spec, waitStartMs));
+    }
+
+    /** Pre-rendered capture exit/stale-session context: wait timers
+     *  (seconds since epoch / ms waited, same units as the timeout
+     *  context), trigger unknown, the truthful stage, and the layered
+     *  identity. waitStartMs is the pump/entry start; session-gone and
+     *  before-armed pass the entry time (waitedMs ~0 — no wait occurred). */
+    static String captureExitContextJson(SessionState st, String stage,
+            boolean planted, String expectedBreak, long waitStartMs) {
+        long nowMs = System.currentTimeMillis();
+        StringBuilder sb = new StringBuilder("{\"waitStartedAt\":");
+        sb.append(waitStartMs / 1000)
+                .append(",\"waitedMs\":").append(Math.max(0, nowMs - waitStartMs));
+        sb.append(",\"triggerStatus\":\"unknown\"");
+        sb.append(",\"captureStage\":").append(JdiBridge.quote(stage));
+        sb.append(",\"ephemeralPlanted\":").append(planted);
+        if (expectedBreak != null) {
+            sb.append(",\"expectedBreak\":").append(JdiBridge.quote(expectedBreak));
+        }
+        String ident = (st != null && st.cfg != null && st.cfg.targetIdentityJson != null)
+                ? st.cfg.targetIdentityJson : "null";
+        sb.append(",\"targetIdentity\":").append(ident);
+        sb.append(",\"note\":").append(JdiBridge.quote(
+                "external trigger execution is not observed by the debugger; "
+                + "this timeout means no stop was observed, "
+                + "not that the code is unreachable"));
+        return sb.append('}').toString();
     }
 
     /** Honest timeout context (pre-rendered JSON): the debugger never
@@ -1173,23 +1217,108 @@ class BridgeSession {
         return base + suffix;
     }
 
-    /** Validated setup-failure phase for error.json: only an exact "config"
-     *  stage passes — unknown, null, or missing stages read as transport
-     *  (conservative: the CLI keeps endpoint diagnosis instead of guessing).
+    /** Validated setup-failure phase for error.json: only exact "config"
+     *  or "runtime" stages pass — unknown, null, or missing stages read
+     *  as transport (conservative: the CLI keeps endpoint diagnosis
+     *  instead of guessing).
      */
     static String setupPhaseOf(String stage) {
-        return "config".equals(stage) ? "config" : "transport";
+        if ("config".equals(stage)) return "config";
+        if ("runtime".equals(stage)) return "runtime";
+        return "transport";
+    }
+
+    /** Park the session on a genuine stop and render its snapshot. The
+     *  caller sets thread/location/stopInfo first; this helper marks
+     *  suspended and renders. A snapshot throw degrades to a bounded
+     *  location-only snapshot with an additive warning instead of
+     *  escaping: the park stands (suspended stays true, the EventSet
+     *  stays un-resumed, notePark + the stopped publish below still run),
+     *  so session.json never claims running for a suspended VM and the
+     *  caller can context/continue while cleanup still detaches. The
+     *  degradation matches Python/Node (bounded snapshot + warning, the
+     *  normal stop continues). Class + short message only in the
+     *  warning — never target data. Catches Throwable (not just
+     *  Exception): an Error during render must degrade the same way,
+     *  never crash the daemon while the VM sits parked. */
+    static String parkSnapshot(SessionState st, VirtualMachine vm) {
+        st.suspended = true;
+        try {
+            return BridgeSnapshot.snapshot(vm, st.cfg, st.thread, st.location, st.out, st.err);
+        } catch (Throwable e) {
+            String loc;
+            try {
+                loc = BridgeSnapshot.locationJson(st.location, st.cfg);
+            } catch (Throwable ignored) {
+                loc = "{\"class\":\"?\",\"method\":\"?\",\"line\":-1,\"file\":\"?\",\"snippet\":[]}";
+            }
+            return "{\"mode\":" + JdiBridge.quote(st.cfg.mode)
+                    + ",\"location\":" + loc
+                    + ",\"threads\":[],\"frames\":[]"
+                    + ",\"snapshotWarning\":" + JdiBridge.quote(
+                            "snapshot degraded (" + JdiBridge.shortMsg(e) + "); park stands — context/continue still available")
+                    + "}";
+        }
+    }
+
+    /** True only when a bounded snapshot capped frame-0 vars: locals
+     *  rendering marks the cap with a trailing {"name":"…","note":"+N
+     *  more"} sentinel (never a real variable name) — same contract as
+     *  the Python bridge's frame_locals sentinel. The no-debug-info and
+     *  render-error sentinels share the "…" name with a different note,
+     *  so they read false (nothing was capped). Matched by regex over
+     *  the adjacent name+note pair, never a broad substring. */
+    static final java.util.regex.Pattern VARS_CAP_SENTINEL =
+            java.util.regex.Pattern.compile("\"name\":\"…\",\"note\":\"\\+\\d+ more\"");
+
+    static boolean snapshotVarsTruncated(String boundedJson) {
+        return boundedJson != null && VARS_CAP_SENTINEL.matcher(boundedJson).find();
+    }
+
+    /** True when a setup failure is really a vanished target: a JDI
+     *  VMDisconnectedException anywhere in the cause chain. Type-based,
+     *  never message-matched — those stay transport, every other
+     *  failure (checked or unchecked, Exception or Error) reads as
+     *  runtime. */
+    static boolean isVmDisconnect(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c instanceof com.sun.jdi.VMDisconnectedException) return true;
+        }
+        return false;
+    }
+
+    /** Map a setup catch to the typed failure to persist and throw (the
+     *  catch-equivalent path: the setup catch above delegates here, so
+     *  tests drive this helper instead of asserting phaseOfError alone).
+     *  Usage/Bridge failures pass through untouched; a vanished target
+     *  (VMDisconnectedException anywhere in the chain, any throwable
+     *  shape) stays a transport BridgeException; anything else becomes a
+     *  sanitized RuntimeBridgeException (runtime phase: truthful internal
+     *  error, never endpoint-diagnosed). error.json is written from the
+     *  mapped value, so the phase derives from its type, never message
+     *  text. */
+    static Exception mapSetupFailure(Throwable t) {
+        if (t instanceof UsageException || t instanceof BridgeException) return (Exception) t;
+        if (isVmDisconnect(t)) {
+            return new BridgeException(JdiBridge.shortMsg(t));
+        }
+        return new RuntimeBridgeException(JdiBridge.sanitizeUnexpected(t));
     }
 
     /** Phase from the failure type: UsageException (CLI-arg/spec validation)
      *  and ConfigBridgeException (arm-time semantic validation) read as
-     *  config; JDI transport losses, VM disconnects, target exits, and
-     *  unexpected crashes stay transport. Never message text, never a
-     *  stage timer.
+     *  config; RuntimeBridgeException and any other unexpected failure
+     *  (checked or unchecked, Exception or Error) read as runtime
+     *  (truthful internal error, never endpoint diagnosis); JDI transport
+     *  losses, VM disconnects, and target exits stay transport. Never
+     *  message text, never a stage timer.
      */
     static String phaseOfError(Throwable t) {
+        if (t == null) return "transport";
         if (t instanceof UsageException || t instanceof ConfigBridgeException) return "config";
-        return "transport";
+        if (t instanceof RuntimeBridgeException) return "runtime";
+        if (t instanceof BridgeException) return "transport";
+        return "runtime";
     }
 
     /** error.json body: schemaVersion 2, the message verbatim, plus the
@@ -1503,9 +1632,25 @@ class BridgeSession {
                     }
                 }
                 boolean prepark;
-                synchronized (st.sessionLock) {
-                    requireLive(st);
-                    prepark = st.suspended;
+                try {
+                    synchronized (st.sessionLock) {
+                        requireLive(st);
+                        prepark = st.suspended;
+                    }
+                } catch (BridgeException e) {
+                    // Session already gone before the capture arrived
+                    // (short-lived target): keep the truthful exited
+                    // message verbatim, attach the additive stage.
+                    if (e.getMessage() != null
+                            && e.getMessage().toLowerCase().contains("exit")
+                            && e.waitContextJson == null) {
+                        synchronized (st.sessionLock) {
+                            e.waitContextJson = captureExitContextJson(
+                                    st, "session-gone", false, specOut[0],
+                                    System.currentTimeMillis());
+                        }
+                    }
+                    throw e;
                 }
                 if (prepark) {
                     synchronized (st.sessionLock) {
@@ -1518,7 +1663,7 @@ class BridgeSession {
                                 + "\"pauseDurationMs\":0,\"pauseBudgetMs\":" + budgetMs + ","
                                 + "\"ephemeralPlanted\":false,"
                                 + "\"truncated\":{\"frames\":" + (total > framesN)
-                                + ",\"vars\":false},"
+                                + ",\"vars\":" + snapshotVarsTruncated(snap) + "},"
                                 + "\"snapshot\":" + snap
                                 + ",\"diag\":" + stopDiagJson(st)
                                 + ",\"warning\":" + JdiBridge.quote(PARK_WARNING)
@@ -1543,24 +1688,54 @@ class BridgeSession {
                                 + "\"pauseDurationMs\":0,\"pauseBudgetMs\":" + budgetMs + ","
                                 + "\"ephemeralPlanted\":false,"
                                 + "\"truncated\":{\"frames\":" + (total > framesN)
-                                + ",\"vars\":false},"
+                                + ",\"vars\":" + snapshotVarsTruncated(snap) + "},"
                                 + "\"snapshot\":" + snap
                                 + ",\"diag\":" + stopDiagJson(st)
                                 + ",\"warning\":" + JdiBridge.quote(PARK_WARNING)
                                 + ",\"target\":\"main\"}";
                     }
-                    planted = plantCaptureBreak(st, cap);
+                    try {
+                        planted = plantCaptureBreak(st, cap);
+                    } catch (BridgeException e) {
+                        // Plant failure from a dying VM: the target exited
+                        // BEFORE the ephemeral was armed — wrapped
+                        // truthfully (spec/condition errors stay verbatim:
+                        // the target did not exit).
+                        if (e.getMessage() != null
+                                && e.getMessage().toLowerCase().contains("exit")
+                                && e.waitContextJson == null) {
+                            throw new BridgeException(
+                                    "capture target exited before ephemeral "
+                                    + "breakpoint was armed: " + e.getMessage(),
+                                    captureExitContextJson(st, "before-armed",
+                                            false, specOut[0],
+                                            System.currentTimeMillis()));
+                        }
+                        throw e;
+                    }
                 }
                 String snap;
+                long waitStartMs = System.currentTimeMillis();
                 try {
                     snap = awaitStop(st, timeout, specOut[0], true);
                 } catch (Exception e) {
                     // Timeout/exit: nothing parked by us — no resume — but
-                    // the ephemeral must not leak.
+                    // the ephemeral must not leak. A removal failure on a
+                    // dead VM must not mask the exit stage either: the
+                    // staged error carries the removal note with its
+                    // waitContext.
                     synchronized (st.sessionLock) {
                         try {
                             unplantCaptureBreak(st);
                         } catch (Exception ue) {
+                            BridgeException staged = stageCaptureExit(
+                                    e, planted, specOut[0], st, waitStartMs);
+                            if (staged != null) {
+                                throw new BridgeException(staged.getMessage()
+                                        + "; capture ephemeral may still be planted"
+                                        + " (breaks remove to clear)",
+                                        staged.waitContextJson);
+                            }
                             String ctx = (e instanceof BridgeException)
                                     ? ((BridgeException) e).waitContextJson : null;
                             throw new BridgeException(e.getMessage()
@@ -1568,6 +1743,21 @@ class BridgeSession {
                                     + " (breaks remove to clear)", ctx);
                         }
                     }
+                    boolean wasPlanted = planted && cap != null;
+                    if (e instanceof StopTimeout
+                            && ((BridgeException) e).waitContextJson != null) {
+                        // Reaching the pump means the ephemeral WAS armed
+                        // (plant confirmed, or the idempotent already-armed
+                        // case) and the stop simply never arrived — never
+                        // an endpoint verdict, never "unreachable".
+                        ((BridgeException) e).waitContextJson = withCaptureStage(
+                                ((BridgeException) e).waitContextJson,
+                                "armed-wait-timeout", wasPlanted);
+                        throw e;
+                    }
+                    BridgeException staged = stageCaptureExit(
+                            e, planted, specOut[0], st, waitStartMs);
+                    if (staged != null) throw staged;
                     throw e;
                 }
                 synchronized (st.sessionLock) {
@@ -1615,7 +1805,7 @@ class BridgeSession {
                     resp.append(",\"budgetExceeded\":").append(pauseMs > budgetMs);
                     resp.append(",\"ephemeralPlanted\":").append(planted);
                     resp.append(",\"truncated\":{\"frames\":").append(total > framesN);
-                    resp.append(",\"vars\":false},");
+                    resp.append(",\"vars\":").append(snapshotVarsTruncated(bounded)).append("},");
                     resp.append("\"snapshot\":").append(bounded);
                     resp.append(",\"diag\":").append(stopDiagJson(st));
                     resp.append(",\"warning\":").append(JdiBridge.quote(PARK_WARNING));

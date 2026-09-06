@@ -5,7 +5,11 @@
  *  waitContext JSON shape (frozen prefix intact, triggerStatus unknown,
  *  expectedBreak only when planted, note honesty), the StopTimeout context
  *  carrier, and the attach-role truth (no pid claimed, adapter
- *  in-process).
+ *  in-process). Also covers the setup-catch equivalent (mapSetupFailure
+ *  over the original throwable), the snapshot-failure park truth
+ *  (parkSnapshot degrades, suspended stays true), the bounded-locals
+ *  truncation sentinel, and the capture exit/stage context fields
+ *  (waitStartedAt/waitedMs).
  *
  *  Compile: javac -d <out> bridge/java/src/*.java tests/M7JavaCheck.java
  *  Run:     java -cp <out> M7JavaCheck
@@ -135,15 +139,18 @@ public class M7JavaCheck {
                 "config phase shape, got: " + ej);
         check(BridgeSession.setupErrorJson("attach failed: refused", "transport")
                 .contains("\"phase\":\"transport\""), "transport phase shape");
-        check(BridgeSession.setupErrorJson("x", "runtime").contains("\"phase\":\"transport\""),
+        check(BridgeSession.setupErrorJson("x", "runtime").contains("\"phase\":\"runtime\""),
+                "runtime stage reads runtime");
+        check(BridgeSession.setupErrorJson("x", "internal").contains("\"phase\":\"transport\""),
                 "unknown stage reads transport");
         check(BridgeSession.setupErrorJson("x", null).contains("\"phase\":\"transport\""),
                 "null stage reads transport");
 
         // -- phase derives from the exception type, never message text or
         // a stage timer: UsageException and ConfigBridgeException read as
-        // config; transport losses, disconnects, and unexpected crashes
-        // stay transport.
+        // config; RuntimeBridgeException and unexpected failures read as
+        // runtime (truthful internal error, never endpoint-diagnosed);
+        // transport losses, disconnects, and target exits stay transport.
         check(BridgeSession.phaseOfError(new UsageException("bad line")).equals("config"),
                 "usage reads config");
         check(BridgeSession.phaseOfError(
@@ -160,8 +167,15 @@ public class M7JavaCheck {
         check(BridgeSession.phaseOfError(
                 new BridgeException("target VM exited before any breakpoint hit")).equals("transport"),
                 "pump target-exit stays transport");
-        check(BridgeSession.phaseOfError(new RuntimeException("boom")).equals("transport"),
-                "unexpected reads transport");
+        check(BridgeSession.phaseOfError(
+                new RuntimeBridgeException("track boom")).equals("runtime"),
+                "explicit runtime marker reads runtime");
+        check(BridgeSession.phaseOfError(new RuntimeException("boom")).equals("runtime"),
+                "unexpected reads runtime");
+        check(BridgeSession.withCaptureStage(
+                "{\"triggerStatus\":\"unknown\"}", "armed-wait", true).contains(
+                "\"captureStage\":\"armed-wait\""),
+                "capture stage rides additively");
         check(BridgeSession.phaseOfError(null).equals("transport"),
                 "null reads transport");
         String cej = BridgeSession.setupErrorJson(
@@ -172,6 +186,130 @@ public class M7JavaCheck {
                 new BridgeException("target exited"), "target exited");
         check(tej.contains("\"phase\":\"transport\"") && tej.contains("\"schemaVersion\":2"),
                 "transport payload shape");
+        String rej = BridgeSession.setupErrorJson(
+                new RuntimeBridgeException("track boom"), "internal: track boom");
+        check(rej.contains("\"phase\":\"runtime\"") && rej.contains("internal: track boom"),
+                "runtime payload shape, got: " + rej);
+
+        // -- mapSetupFailure: the exact setup-catch equivalent (error.json
+        // is written from the mapped value, so the phase derives from its
+        // type). Typed failures pass through untouched.
+        Exception cfgPass = new ConfigBridgeException("no method x() in Y");
+        check(BridgeSession.mapSetupFailure(cfgPass) == cfgPass, "config passes through");
+        BridgeException traPass = new BridgeException("attach failed: refused");
+        check(BridgeSession.mapSetupFailure(traPass) == traPass, "transport passes through");
+        UsageException usePass = new UsageException("bad line");
+        check(BridgeSession.mapSetupFailure(usePass) == usePass, "usage passes through");
+        // A vanished target (VMDisconnectedException anywhere in the
+        // chain, any throwable shape) stays transport — never runtime.
+        Throwable discChain = new RuntimeException("wrapper",
+                new com.sun.jdi.VMDisconnectedException("gone"));
+        Exception mappedDisc = BridgeSession.mapSetupFailure(discChain);
+        check(mappedDisc instanceof BridgeException
+                && !(mappedDisc instanceof ConfigBridgeException)
+                && !(mappedDisc instanceof RuntimeBridgeException),
+                "disconnect chain stays transport, got: "
+                + mappedDisc.getClass().getSimpleName());
+        check(BridgeSession.phaseOfError(mappedDisc).equals("transport"),
+                "mapped disconnect reads transport");
+        check(mappedDisc.getMessage() != null && mappedDisc.getMessage().contains("wrapper"),
+                "mapped disconnect keeps outer short text, got: " + mappedDisc.getMessage());
+        Exception mappedBare = BridgeSession.mapSetupFailure(
+                new com.sun.jdi.VMDisconnectedException("gone"));
+        check(mappedBare instanceof BridgeException
+                && !(mappedBare instanceof RuntimeBridgeException)
+                && mappedBare.getMessage() != null && mappedBare.getMessage().contains("gone"),
+                "bare disconnect keeps its text, got: " + mappedBare.getMessage());
+        Error errWrapped = new LinkageError("boom");
+        errWrapped.initCause(new com.sun.jdi.VMDisconnectedException("gone"));
+        Exception mappedErrDisc = BridgeSession.mapSetupFailure(errWrapped);
+        check(mappedErrDisc instanceof BridgeException
+                && !(mappedErrDisc instanceof RuntimeBridgeException)
+                && BridgeSession.phaseOfError(mappedErrDisc).equals("transport"),
+                "disconnect under Error stays transport");
+        // Unexpected shapes (unchecked, checked, Error) sanitize to the
+        // runtime marker with an internal: payload.
+        Exception mappedRt = BridgeSession.mapSetupFailure(new RuntimeException("boom"));
+        check(mappedRt instanceof RuntimeBridgeException, "unexpected unchecked reads runtime marker");
+        check(BridgeSession.phaseOfError(mappedRt).equals("runtime"),
+                "mapped unexpected reads runtime");
+        check(mappedRt.getMessage() != null && mappedRt.getMessage().startsWith("internal:"),
+                "mapped unexpected sanitized, got: " + mappedRt.getMessage());
+        Exception mappedChecked =
+                BridgeSession.mapSetupFailure(new java.io.IOException("disk gone"));
+        check(mappedChecked instanceof RuntimeBridgeException
+                && BridgeSession.phaseOfError(mappedChecked).equals("runtime"),
+                "unexpected checked reads runtime");
+        Exception mappedErr = BridgeSession.mapSetupFailure(new AssertionError("bad invariant"));
+        check(mappedErr instanceof RuntimeBridgeException
+                && BridgeSession.phaseOfError(mappedErr).equals("runtime"),
+                "unexpected Error reads runtime");
+
+        // -- parkSnapshot degrade: a snapshot throw keeps the park
+        // truthful (suspended stays true, bounded location-only snapshot
+        // with a warning) instead of crashing the daemon while the VM
+        // sits parked. No live VM needed: a null handle throws inside
+        // render and exercises the degrade path.
+        SessionState pst = state("attach");
+        pst.cfg.mode = "attach";
+        pst.thread = null;
+        pst.location = null;
+        String degraded = BridgeSession.parkSnapshot(pst, null);
+        check(pst.suspended, "snapshot failure keeps suspended=true");
+        check(degraded != null && degraded.contains("\"snapshotWarning\""),
+                "degraded snapshot warns, got: " + degraded);
+        check(degraded.contains("\"frames\":[]") && degraded.contains("\"location\":"),
+                "degraded snapshot bounded with location");
+
+        // -- snapshotVarsTruncated: only the cap sentinel ("+N more")
+        // reads truncated — the no-debug-info and render-error sentinels
+        // share the "…" name with a different note, so they read false
+        // (nothing was capped). Same contract as the Python bridge's
+        // frame_locals sentinel.
+        check(BridgeSession.snapshotVarsTruncated(
+                "{\"locals\":[{\"name\":\"a\"},{\"name\":\"…\",\"note\":\"+9 more\"}]}"),
+                "cap sentinel reads truncated");
+        check(!BridgeSession.snapshotVarsTruncated(
+                "{\"locals\":[{\"name\":\"…\",\"note\":\"no debug info (-g)\"}]}"),
+                "no-debug-info sentinel reads full");
+        check(!BridgeSession.snapshotVarsTruncated(
+                "{\"locals\":[{\"name\":\"…\",\"note\":\"NullPointerException: boom\"}]}"),
+                "render-error sentinel reads full");
+        check(!BridgeSession.snapshotVarsTruncated("{\"locals\":[{\"name\":\"a\"}]}"),
+                "no sentinel reads full");
+        check(!BridgeSession.snapshotVarsTruncated(null), "null reads full");
+        // The capture response flag derives from the same helper over a
+        // full bounded snapshot: capped frame-0 locals flag vars:true.
+        String cappedSnap = "{\"frames\":[{\"index\":0,\"locals\":["
+                + "{\"name\":\"a\"},{\"name\":\"…\",\"note\":\"+9 more\"}]}]}";
+        String cappedFlag = "\"truncated\":{\"frames\":false,\"vars\":"
+                + BridgeSession.snapshotVarsTruncated(cappedSnap) + "}";
+        check(cappedFlag.contains("\"vars\":true"),
+                "capture flag vars:true on cap, got: " + cappedFlag);
+        String infoSnap = "{\"frames\":[{\"index\":0,\"locals\":["
+                + "{\"name\":\"…\",\"note\":\"no debug info (-g)\"}]}]}";
+        check(!BridgeSession.snapshotVarsTruncated(infoSnap),
+                "capture flag input reads full on no-debug-info");
+
+        // -- captureExitContextJson: armed-wait/session-gone stages carry
+        // waitStartedAt/waitedMs (timeout-context units), the truthful
+        // stage, the planted flag, and the honest trigger-unknown note.
+        long entryMs = 1735689600000L;
+        String exitCtx = BridgeSession.captureExitContextJson(
+                st, "armed-wait", true, "com.Foo:54", entryMs);
+        check(exitCtx.contains("\"captureStage\":\"armed-wait\""), "exit stage armed-wait");
+        check(exitCtx.contains("\"ephemeralPlanted\":true"), "exit planted rides");
+        check(exitCtx.contains("\"expectedBreak\":\"com.Foo:54\""), "exit spec rides");
+        check(exitCtx.contains("\"waitStartedAt\":1735689600"), "exit wait start stamped");
+        check(exitCtx.contains("\"waitedMs\":"), "exit waited ms stamped");
+        check(exitCtx.contains("\"triggerStatus\":\"unknown\""), "exit trigger unknown");
+        check(exitCtx.contains("not observed"), "exit honest note");
+        String goneCtx = BridgeSession.captureExitContextJson(
+                st, "session-gone", false, null, entryMs);
+        check(goneCtx.contains("\"captureStage\":\"session-gone\"")
+                && goneCtx.contains("\"ephemeralPlanted\":false")
+                && !goneCtx.contains("expectedBreak"),
+                "session-gone shape, got: " + goneCtx);
 
         // -- parse-error scan finds --dir without parsing; the file is config.
         check("/s".equals(BridgeCli.dirFromArgv(

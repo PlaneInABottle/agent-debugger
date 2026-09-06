@@ -19,7 +19,12 @@ same dir). CLI-owned: `lang.json`, `stops.json`. Bridge-owned:
   + `"schemaVersion":2` + `"targetIdentity":{debuggee,endpoint,adapter}`.
   No `observedTarget` key (absent, not null).
 - `error.json` (bridge, CLI-read): `{"schemaVersion":2,"error":"…",
-  "phase":"transport|config"}` on every early path. Absent/unparseable
+  "phase":"transport|config|runtime"}` on every early path.
+  `transport` = connection/protocol loss (endpoint diagnosis applies);
+  `config` = semantic spec error (message stays top-level, no endpoint
+  diagnosis); `runtime` = unexpected internal failure after a successful
+  bridge operation (truthful internal message top-level, no endpoint
+  diagnosis, never called endpoint-rejected). Absent/unparseable
   (or error-less) files keep the transport fallback. A present parseable
   file with a bad version/phase is corrupt:
   `corrupt setup error file in '<name>' (schemaVersion/phase); close and

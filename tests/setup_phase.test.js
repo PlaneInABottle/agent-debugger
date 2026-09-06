@@ -1,8 +1,9 @@
 // Setup-failure phase (error.json `phase`): typed, never message-matched.
 // Usage (spec validation, conflicts, unknown args) and ConfigError (a
-// valid CDP refusal of a breakpoint install) read as config; every other
-// failure (connect loss, request IO/timeout, target exit, unexpected
-// crashes) stays transport. Real Session objects, stubbed transports —
+// valid CDP refusal of a breakpoint install) read as config; RuntimeError
+// and any other unexpected exception read as runtime (truthful internal
+// error, never endpoint-diagnosed); connect loss, request IO/timeout, and
+// target exit stay transport. Real Session objects, stubbed transports —
 // no timers in assertions.
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -30,10 +31,10 @@ function loadBridge(rel, exports) {
 
 const node = loadBridge(
   'bridge/node/src/nodebridge.js',
-  'Session, StopTimeout, Usage, BridgeErr, ConfigError, phaseOfError, setupErrorPayload, dirFromArgv, writeParseError');
+  'Session, StopTimeout, Usage, BridgeErr, ConfigError, RuntimeError, phaseOfError, setupErrorPayload, dirFromArgv, writeParseError');
 const browser = loadBridge(
   'bridge/browser/src/browserbridge.js',
-  'Session, StopTimeout, Usage, BridgeErr, ConfigError, phaseOfError, setupErrorPayload, dirFromArgv, writeParseError');
+  'Session, StopTimeout, Usage, BridgeErr, ConfigError, RuntimeError, phaseOfError, setupErrorPayload, dirFromArgv, writeParseError');
 
 function tmpdir(prefix) {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
@@ -72,8 +73,18 @@ for (const [name, mod] of [['node', node], ['browser', browser]]) {
       { schemaVersion: 2, error: 'CDP setBreakpoint failed: bad cond', phase: 'config' });
     // ConfigError is still a BridgeErr: existing catches keep working.
     assert.ok(new mod.ConfigError('x') instanceof mod.BridgeErr);
-    // Transport losses, timeouts, exits, unexpected values: transport.
-    for (const e of [new mod.BridgeErr('target exited'), new Error('bug'),
+    // Explicit runtime marker + unexpected exceptions: runtime (truthful
+    // internal error, never endpoint-diagnosed). Target exits stay
+    // transport (never masked by runtime).
+    assert.equal(mod.phaseOfError(new mod.RuntimeError('track boom')), 'runtime');
+    assert.equal(mod.phaseOfError(new Error('bug')), 'runtime');
+    assert.deepEqual(
+      mod.setupErrorPayload(new mod.RuntimeError('track boom'), 'internal: track boom'),
+      { schemaVersion: 2, error: 'internal: track boom', phase: 'runtime' });
+    assert.deepEqual(
+      mod.setupErrorPayload(new Error('bug'), 'internal: Error: bug'),
+      { schemaVersion: 2, error: 'internal: Error: bug', phase: 'runtime' });
+    for (const e of [new mod.BridgeErr('target exited'),
       null, undefined, 'config', 7, {}]) {
       assert.equal(mod.phaseOfError(e), 'transport', `${name}: ${String(e && e.message || e)}`);
     }

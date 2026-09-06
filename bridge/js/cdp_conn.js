@@ -12,6 +12,12 @@ class BridgeErr extends Error {}
 // connection drops always stay plain BridgeErr (transport).
 class ConfigError extends BridgeErr {}
 
+// Unexpected internal failure after a successful bridge operation
+// (post-handshake crash, degraded internal state). Deliberately NOT a
+// BridgeErr: error.json `phase` reads `runtime` (truthful internal
+// error, never endpoint diagnosis). Never carries target data.
+class RuntimeError extends Error {}
+
 class CdpConn {
   constructor(ws, onClose) {
     this.ws = ws;
@@ -93,4 +99,4 @@ class CdpConn {
   }
 }
 
-module.exports = { BridgeErr, ConfigError, CdpConn };
+module.exports = { BridgeErr, ConfigError, RuntimeError, CdpConn };

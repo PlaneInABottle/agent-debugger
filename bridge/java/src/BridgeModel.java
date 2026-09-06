@@ -33,6 +33,14 @@ class BridgeException extends Exception {
 class ConfigBridgeException extends BridgeException {
         ConfigBridgeException(String m) { super(m); }
     }
+// Unexpected internal failure after a successful bridge operation
+// (post-handshake crash, degraded internal state). Deliberately NOT a
+// plain BridgeException path: setup error.json `phase` reads `runtime`
+// (truthful internal error, never endpoint diagnosis). Never carries
+// target data (class + short message only).
+class RuntimeBridgeException extends BridgeException {
+        RuntimeBridgeException(String m) { super(m); }
+    }
 class Config {
         String mode; // "attach" | "launch"
         String host = "localhost";

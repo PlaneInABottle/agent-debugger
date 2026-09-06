@@ -298,6 +298,18 @@ bridges long-poll for you:
   never resumes). Capture carries no eval expression and captured
   locals live only in the response. Browser capture does not survive a
   reload (navigation drops it into a timeout, never a stale resume).
+  One-shot capture cannot observe code that ran before it armed: for a
+  short-lived target, pre-arm at startup (`start --break SPEC`, then
+  `capture` without `--break` on the parked target) or start `capture`
+  before the external trigger fires. If the target exits first, the
+  error names the stage truthfully — `capture target exited before
+  ephemeral breakpoint was armed` (plant never confirmed), `target
+  exited before capture hit` (armed, stop never arrived), or the
+  session-gone variant when the session already exited — with additive
+  `waitContext.captureStage` (`before-armed`/`armed-wait`/`session-gone`
+  plus timeout variants) and `ephemeralPlanted`. A capture timeout or
+  exit never means "unreachable code" and is never endpoint-rejected:
+  verify the trigger path separately instead of re-arming blindly.
 - A logpoint (`--logpoint`) is the true no-park alternative (fires and
   auto-resumes, never parks) but costs expression evaluation per hit;
   use it for tracing, `wait`/`capture` for inspecting.
@@ -397,9 +409,11 @@ bridges long-poll for you:
   then the diagnosis recommendation and identities. Semantic setup errors
   (invalid breakpoint/method/line/condition/source — bridge-typed
   `phase: config`, never inferred from message text) stay top-level
-  verbatim with no endpoint diagnosis; connection loss and target exit
-  stay `transport` and keep endpoint diagnosis. Undiagnosed errors
-  are unchanged.
+  verbatim with no endpoint diagnosis; unexpected internal bridge
+  failures (`phase: runtime`) stay top-level verbatim with no endpoint
+  diagnosis and are never called endpoint-rejected; connection loss and
+  target exit stay `transport` and keep endpoint diagnosis. Undiagnosed
+  errors are unchanged.
 
 ## Python Notes (debugpy)
 
