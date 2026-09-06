@@ -27,6 +27,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 // Persistent session server: arming, event loop, dispatch, breaks, logs. Moved verbatim from JdiBridge.java.
 class BridgeSession {
@@ -327,32 +329,45 @@ class BridgeSession {
             }
             long remaining = (deadline - System.nanoTime()) / 1_000_000;
             if (remaining <= 0) {
-                throw new StopTimeout("timeout: no stop within " + (timeoutMs / 1000) + "s");
+                throw new StopTimeout(timeoutText(st, timeoutMs));
             }
             EventSet set;
             try {
+                // M5: the single pump consumer owns eventQueue.remove; the
+                // blocking wait itself never holds sessionLock (live reads
+                // stay prompt). Per-set processing below takes the lock.
                 set = vm.eventQueue().remove(Math.min(remaining, 1000));
             } catch (InterruptedException ie) {
+                // Pool shutdown (close): never spin — a closing session
+                // aborts the wait instead of looping forever.
+                if (st.closing) throw new BridgeException("session closing");
                 continue;
             } catch (Exception e) {
-                st.exited = true;
-                publishState(st, false);
+                synchronized (st.sessionLock) {
+                    st.exited = true;
+                    publishState(st, false);
+                }
                 throw new BridgeException("lost connection to target VM: " + JdiBridge.shortMsg(e));
             }
             if (set == null) continue;
+            synchronized (st.sessionLock) {
             String stop = null;
+            String parkReason = null;
             for (Event event : set) {
                 if (event instanceof BreakpointEvent) {
                     BreakpointEvent bp = (BreakpointEvent) event;
                     fireLogpoints(st, null, st.dir, st.cfg, bp.thread(), bp.location());
-                    if (!hasStoppingBreak(st.cfg, bp.location())) continue;
+                    if (!hasStoppingBreak(st.cfg, bp.location())
+                            && !isCaptureBreak(st, bp.location())) continue;
                     String cond = BridgeEval.lookupCond(st.cfg, bp.location());
+                    if (cond == null) cond = captureCond(st, bp.location());
                     if (cond != null && !BridgeEval.checkCond(bp.thread(), bp.location(), cond)) continue;
                     countBreakHit(st, bp.location());
                     // First stopping event in the set wins the exposed
                     // stop (deterministic); every matching event still
                     // counts its hits and fires its logpoints above.
                     if (stop != null) continue;
+                    parkReason = "breakpoint";
                     st.thread = bp.thread();
                     st.location = bp.location();
                     st.stopInfo = null; // plain stop supersedes any previous reason
@@ -362,6 +377,7 @@ class BridgeSession {
                 } else if (event instanceof com.sun.jdi.event.StepEvent) {
                     com.sun.jdi.event.StepEvent se = (com.sun.jdi.event.StepEvent) event;
                     if (stop != null) continue;
+                    parkReason = "step";
                     st.thread = se.thread();
                     st.location = se.location();
                     st.stopInfo = null;
@@ -376,6 +392,7 @@ class BridgeSession {
                     if (cond != null && !BridgeEval.checkCond(ee.thread(), ee.location(), cond)) continue;
                     countExcHits(st, ee);
                     if (stop != null) continue;
+                    parkReason = "exception";
                     st.thread = ee.thread();
                     st.location = ee.location();
                     st.stopInfo = BridgeEval.exceptionInfo(ee);
@@ -389,6 +406,7 @@ class BridgeSession {
                     if (stop != null) continue;
                     st.thread = we.thread();
                     st.location = we.location();
+                    parkReason = "watch";
                     st.stopInfo = BridgeEval.watchInfo(we.field(), "write", we.valueToBe());
                     trackChanges(st);
                     st.suspended = true;
@@ -400,6 +418,7 @@ class BridgeSession {
                     if (stop != null) continue;
                     st.thread = we.thread();
                     st.location = we.location();
+                    parkReason = "watch";
                     st.stopInfo = BridgeEval.watchInfo(we.field(), "read", we.valueCurrent());
                     trackChanges(st);
                     st.suspended = true;
@@ -409,6 +428,7 @@ class BridgeSession {
                     if (!BridgeEval.wantedExit(st.cfg, me)) continue;
                     try { bump(st, "exit|" + me.method().declaringType().name() + "." + me.method().name()); } catch (Exception ignored) {}
                     if (stop != null) continue;
+                    parkReason = "exit";
                     st.thread = me.thread();
                     st.location = me.location();
                     st.stopInfo = BridgeEval.exitInfo(me);
@@ -420,6 +440,7 @@ class BridgeSession {
                     try { cp.request().disable(); } catch (Exception ignored) {}
                     try {
                         plantPending(vm, st.cfg, cp.referenceType(), st.planted);
+                        plantCaptureForClass(st, cp.referenceType());
                     } catch (Exception e) {
                         // Don't poison the session: resume before surfacing
                         // (e.g. unknown method name in method:Class.m).
@@ -434,15 +455,30 @@ class BridgeSession {
                 }
             }
             if (stop != null) {
+                notePark(st, parkReason);
                 publishState(st, true);
                 return stop;
             }
             set.resume();
+            } // synchronized (st.sessionLock): one pump's set is fully
+              // reconciled (flags, JDI reads, hit counts) before any rival
+              // dispatch observes it; the blocking remove() above stays out.
         }
     }
 
     static class StopTimeout extends BridgeException {
         StopTimeout(String message) { super(message); }
+    }
+
+    /** Timeout message with the compact observed-identity hint (names the
+     *  target, never claims root cause). */
+    static String timeoutText(SessionState st, long timeoutMs) {
+        String msg = "timeout: no stop within " + (timeoutMs / 1000) + "s";
+        if (st != null && st.cfg != null && st.cfg.observedHint != null
+                && !st.cfg.observedHint.isEmpty()) {
+            msg += "; " + st.cfg.observedHint;
+        }
+        return msg;
     }
 
     static boolean amOwner(SessionState st) {
@@ -456,8 +492,19 @@ class BridgeSession {
         }
     }
 
+    /** M5: at most this many concurrent connection handlers; overflow is
+     *  an immediate rejection, never an unbounded thread/task spawn. One
+     *  response per connection, as before. */
+    static final int MAX_ACTIVE_HANDLERS = 8;
+
     static void serveLoop(SessionState st, Path dir) throws Exception {
         st.server.setSoTimeout(100);
+        ExecutorService pool = Executors.newFixedThreadPool(MAX_ACTIVE_HANDLERS, r -> {
+            Thread t = new Thread(r);
+            t.setDaemon(true);
+            return t;
+        });
+        try {
         while (true) {
             // Abandoned (dir rm'd or respawned under our name)? Clean up and
             // vanish; legit flows always close (which returns from here)
@@ -466,9 +513,25 @@ class BridgeSession {
                 cleanup(st);
                 return;
             }
+            synchronized (st.sessionLock) {
+                if (st.closing) {
+                    // Bounded grace for in-flight handlers to flush their
+                    // aborts, then unconditional exit — no joining a handler
+                    // that itself awaits a stop.
+                    try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                    return;
+                }
+            }
             // Use the same event handler between commands, without a second
             // consumer or shared mutable stop state. A parked VM is not resumed.
-            if (!st.exited && !st.suspended) {
+            // M5: only while NO resume is outstanding — the outstanding
+            // resume's pump owns eventQueue consumption (a second consumer
+            // would steal its stop).
+            boolean idlePump;
+            synchronized (st.sessionLock) {
+                idlePump = !st.exited && !st.suspended && st.outstanding == null;
+            }
+            if (idlePump) {
                 try { awaitStopInner(st, 10); }
                 catch (StopTimeout idle) { /* no pending stop */ }
                 catch (Exception e) { System.err.println("event: " + JdiBridge.shortMsg(e)); }
@@ -481,25 +544,76 @@ class BridgeSession {
             } catch (Exception e) {
                 return; // server closed
             }
+            synchronized (st.sessionLock) {
+                if (st.closing) {
+                    try { sock.close(); } catch (Exception ignored) {}
+                    return;
+                }
+                if (st.activeHandlers >= MAX_ACTIVE_HANDLERS) {
+                    try {
+                        sock.setSoTimeout(5000);
+                        BridgeProto.writeFrame(sock.getOutputStream(),
+                                "{\"ok\":false,\"error\":\"overloaded: too many active handlers\"}");
+                    } catch (Exception ignored) {}
+                    try { sock.close(); } catch (Exception ignored) {}
+                    continue;
+                }
+                st.activeHandlers++;
+            }
+            pool.execute(() -> handleOne(st, sock));
+        }
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    /** Serve one CLI connection: exactly one request and one response.
+     *  Socket IO never holds sessionLock; dispatch/cases take it for
+     *  bounded sections only. A client disconnect drops only its own
+     *  response — target-side work still publishes. */
+    static void handleOne(SessionState st, Socket sock) {
+        try {
+            sock.setSoTimeout(5000);
+            String req;
             try {
-                sock.setSoTimeout(5000);
-                String req = BridgeProto.readFrame(sock.getInputStream());
-                String resp = dispatch(st, req);
-                BridgeProto.writeFrame(sock.getOutputStream(), resp);
-            } catch (CloseSession c) {
-                try {
-                    BridgeProto.writeFrame(sock.getOutputStream(), "{\"ok\":true,\"closed\":true}");
-                } catch (Exception ignored) {}
-                try { sock.close(); } catch (Exception ignored) {}
-                cleanup(st);
-                return;
+                req = BridgeProto.readFrame(sock.getInputStream());
             } catch (Exception e) {
                 try {
                     BridgeProto.writeFrame(sock.getOutputStream(),
                             "{\"ok\":false,\"error\":" + JdiBridge.quote(JdiBridge.shortMsg(e)) + "}");
                 } catch (Exception ignored) {}
-            } finally {
-                try { sock.close(); } catch (Exception ignored) {}
+                return;
+            }
+            try {
+                String resp = dispatch(st, req);
+                try {
+                    BridgeProto.writeFrame(sock.getOutputStream(), resp);
+                } catch (Exception ignored) {
+                    // Client went away mid-command: work already ran.
+                }
+            } catch (CloseSession c) {
+                // Terminal and accepted despite any outstanding resume: never
+                // wait for a handler that itself awaits a stop — tear down
+                // now (launch kills its VM, attach detaches). In-flight
+                // resume handlers abort on the torn-down transport.
+                try {
+                    BridgeProto.writeFrame(sock.getOutputStream(), "{\"ok\":true,\"closed\":true}");
+                } catch (Exception ignored) {}
+                synchronized (st.sessionLock) {
+                    st.closing = true;
+                }
+                cleanup(st);
+            } catch (Exception e) {
+                try {
+                    BridgeProto.writeFrame(sock.getOutputStream(),
+                            "{\"ok\":false,\"error\":" + JdiBridge.quote(JdiBridge.shortMsg(e)) + "}");
+                } catch (Exception ignored) {}
+            }
+        } catch (Exception ignored) {
+        } finally {
+            try { sock.close(); } catch (Exception ignored) {}
+            synchronized (st.sessionLock) {
+                st.activeHandlers--;
             }
         }
     }
@@ -537,12 +651,73 @@ class BridgeSession {
         return base + suffix;
     }
 
+    /** M5 immediate busy rejection (single target main): a second resume
+     *  (continue/step), any breakpoint mutation, or an eval (exclusive: it
+     *  can mutate) while one is outstanding never silently queues. Live
+     *  reads and context/vars/stack never busy-reject (the latter fail fast
+     *  via requireStopped once the resume publishes running). Caller holds
+     *  sessionLock. */
+    static String busyError(SessionState st, String cmd) {
+        if (st.outstanding == null) return null;
+        // wait never resumes but still occupies the slot (a rival resume
+        // would steal the stop it long-polls for); capture resumes at the
+        // end, so it occupies the slot throughout.
+        if (cmd.equals("continue") || cmd.equals("step")
+                || cmd.equals("wait") || cmd.equals("capture")
+                || cmd.equals("breaksAdd") || cmd.equals("breaksRemove")
+                || cmd.equals("breaksClear") || cmd.equals("eval")) {
+            return "busy: " + st.outstanding + " outstanding for main";
+        }
+        return null;
+    }
+
     static String dispatch(SessionState st, String reqJson) throws Exception {
         // cmd first (depth-aware): breaksAdd carries a JSON array the flat
         // parser cannot hold, so it branches before flat parsing.
         String cmd = BridgeProto.parseCmd(reqJson);
+        // M5 acceptance (atomic under sessionLock): close is always served;
+        // a closing session fails the rest fast; rivals busy-reject; the
+        // resume registers BEFORE any JDI so a simultaneous rival observes
+        // it. Locking below is per bounded section — never across waits.
+        synchronized (st.sessionLock) {
+            if (st.closing && !cmd.equals("close")) {
+                throw new BridgeException("session is closing");
+            }
+            String busy = busyError(st, cmd);
+            if (busy != null) throw new BridgeException(busy);
+            if (cmd.equals("continue") || cmd.equals("step")
+                    || cmd.equals("wait") || cmd.equals("capture")) {
+                st.outstanding = cmd;
+            }
+        }
+        boolean resume = cmd.equals("continue") || cmd.equals("step")
+                || cmd.equals("wait") || cmd.equals("capture");
+        try {
+            return dispatchInner(st, reqJson, cmd);
+        } finally {
+            if (resume) {
+                synchronized (st.sessionLock) {
+                    if (cmd.equals(st.outstanding)) st.outstanding = null;
+                }
+            }
+        }
+    }
+
+    static String dispatchInner(SessionState st, String reqJson, String cmd) throws Exception {
         if (cmd.equals("breaksAdd")) {
-            return breaksAddJson(st, BridgeProto.parseStringArray(reqJson, "breaks"));
+            synchronized (st.sessionLock) {
+                return breaksAddJson(st, BridgeProto.parseStringArray(reqJson, "breaks"));
+            }
+        }
+        if (cmd.equals("breaksRemove")) {
+            synchronized (st.sessionLock) {
+                return breaksRemoveJson(st, BridgeProto.parseStringArray(reqJson, "breaks"));
+            }
+        }
+        if (cmd.equals("breaksClear")) {
+            synchronized (st.sessionLock) {
+                return breaksClearJson(st);
+            }
         }
         Map<String, String> req = BridgeProto.parseJsonObject(reqJson);
         long timeout = req.containsKey("timeout")
@@ -552,7 +727,14 @@ class BridgeSession {
             case "threads": {
                 // Momentary freeze for an instant thread dump. Balanced
                 // suspend/resume pair: a stopped session stays stopped.
+                // M5: while a resume is outstanding the dump serves the
+                // published running truth with NO JDI (the pump owns the
+                // event queue) — prompt and never stale.
+                synchronized (st.sessionLock) {
                 if (st.exited) throw new BridgeException("target VM has exited — close this session");
+                if (st.outstanding != null) {
+                    return "{\"ok\":true,\"running\":true,\"threads\":[]}";
+                }
                 boolean wasSuspended = st.suspended;
                 if (!wasSuspended) {
                     try {
@@ -572,13 +754,17 @@ class BridgeSession {
                     }
                 }
                 return "{\"ok\":true,\"running\":" + (!wasSuspended) + ",\"threads\":" + dump + "}";
+                }
             }
             case "breaks": {
                 // Arm-time intent with live plant state, no stop required.
+                synchronized (st.sessionLock) {
                 if (st.exited) throw new BridgeException("target VM has exited — close this session");
                 return breaksJson(st);
+                }
             }
             case "logs": {
+                synchronized (st.sessionLock) {
                 int tail = 50;
                 if (req.containsKey("tail")) {
                     try { tail = Integer.parseInt(req.get("tail")); } catch (NumberFormatException ignored) {}
@@ -597,19 +783,28 @@ class BridgeSession {
                 // any line was ever evicted (historical drops, not just cut).
                 return "{\"ok\":true,\"total\":" + total + ",\"truncated\":" + (total > lines.size() || st.logDropped > 0)
                         + ",\"dropped\":" + st.logDropped + ",\"lines\":" + toJsonArray(lines) + "}";
+                }
             }
             case "context": {
+                synchronized (st.sessionLock) {
                 requireStopped(st);
                 return "{\"ok\":true,\"stopInfo\":" + stopInfoJson(st)
                         + ",\"location\":" + BridgeSnapshot.locationJson(st.location, st.cfg)
                         + ",\"threads\":" + BridgeSnapshot.threadsJson(st.vm, st.thread)
-                        + ",\"frames\":" + BridgeSnapshot.framesJson(st.thread, true) + "}";
+                        + ",\"frames\":" + BridgeSnapshot.framesJson(st.thread, true)
+                        + ",\"diag\":" + stopDiagJson(st)
+                        + ",\"warning\":" + JdiBridge.quote(PARK_WARNING)
+                        + ",\"target\":\"main\"}";
+                }
             }
             case "stack": {
+                synchronized (st.sessionLock) {
                 requireStopped(st);
                 return "{\"ok\":true,\"frames\":" + BridgeSnapshot.framesJson(st.thread, false) + "}";
+                }
             }
             case "vars": {
+                synchronized (st.sessionLock) {
                 requireStopped(st);
                 int frame = req.containsKey("frame") ? Integer.parseInt(req.get("frame")) : 0;
                 List<StackFrame> frames = BridgeSnapshot.safeFrames(st.thread);
@@ -617,8 +812,10 @@ class BridgeSession {
                     throw new BridgeException("no frame " + frame + " (have " + frames.size() + ")");
                 }
                 return "{\"ok\":true,\"frame\":" + frame + ",\"locals\":" + BridgeSnapshot.localsJson(frames.get(frame)) + "}";
+                }
             }
             case "eval": {
+                synchronized (st.sessionLock) {
                 requireStopped(st);
                 String expr = req.get("expr");
                 if (expr == null) throw new BridgeException("eval needs an expr");
@@ -629,23 +826,35 @@ class BridgeSession {
                 }
                 String value = BridgeEval.evalExpr(st.thread, frames.get(frame), expr);
                 return "{\"ok\":true,\"expr\":" + JdiBridge.quote(expr) + ",\"value\":" + JdiBridge.quote(value) + "}";
+                }
             }
             case "continue": {
-                requireLive(st);
-                if (st.suspended) st.vm.resume();
-                st.suspended = false;
-                publishState(st, false);
+                synchronized (st.sessionLock) {
+                    requireLive(st);
+                    if (st.suspended) st.vm.resume();
+                    st.suspended = false;
+                    publishState(st, false);
+                }
+                // M5: the stop wait never holds sessionLock — live reads
+                // stay prompt and the single event-queue consumer is this
+                // pump (the serve loop skips its idle pump while outstanding).
                 String snap = awaitStop(st, timeout);
-                return "{\"ok\":true,\"stopped\":true,\"changed\":" + st.lastChanged + ",\"stopInfo\":" + stopInfoJson(st) + ",\"snapshot\":" + snap + "}";
+                synchronized (st.sessionLock) {
+                    return "{\"ok\":true,\"stopped\":true,\"changed\":" + st.lastChanged + ",\"stopInfo\":" + stopInfoJson(st) + ",\"snapshot\":" + snap
+                            + ",\"diag\":" + stopDiagJson(st)
+                            + ",\"warning\":" + JdiBridge.quote(PARK_WARNING)
+                            + ",\"target\":\"main\"}";
+                }
             }
             case "step": {
+                com.sun.jdi.request.StepRequest sr;
+                synchronized (st.sessionLock) {
                 requireLive(st);
                 // Stepping needs a stopped thread to step from (uniform
                 // contract on all bridges); continuing works from running
                 // (it just waits for the next stop).
                 requireStopped(st);
                 String mode = req.getOrDefault("mode", "over");
-                com.sun.jdi.request.StepRequest sr;
                 try {
                     sr = st.vm.eventRequestManager().createStepRequest(
                             st.thread,
@@ -662,17 +871,453 @@ class BridgeSession {
                 sr.addCountFilter(1);
                 sr.setSuspendPolicy(EventRequest.SUSPEND_ALL);
                 sr.enable();
+                if (st.suspended) st.vm.resume();
+                st.suspended = false;
+                publishState(st, false);
+                }
                 try {
-                    if (st.suspended) st.vm.resume();
-                    st.suspended = false;
-                    publishState(st, false);
                     String snap = awaitStop(st, timeout);
-                    return "{\"ok\":true,\"stopped\":true,\"changed\":" + st.lastChanged + ",\"stopInfo\":" + stopInfoJson(st) + ",\"snapshot\":" + snap + "}";
+                    synchronized (st.sessionLock) {
+                        return "{\"ok\":true,\"stopped\":true,\"changed\":" + st.lastChanged + ",\"stopInfo\":" + stopInfoJson(st) + ",\"snapshot\":" + snap
+                                + ",\"diag\":" + stopDiagJson(st)
+                                + ",\"warning\":" + JdiBridge.quote(PARK_WARNING)
+                                + ",\"target\":\"main\"}";
+                    }
                 } finally {
-                    try { st.vm.eventRequestManager().deleteEventRequest(sr); } catch (Exception ignored) {}
+                    synchronized (st.sessionLock) {
+                        try { st.vm.eventRequestManager().deleteEventRequest(sr); } catch (Exception ignored) {}
+                    }
+                }
+            }
+            case "wait": {
+                // Pure long-poll: NEVER resumes. Immediate success when
+                // already parked; otherwise awaitStop without any resume.
+                // Timeout preserves session/intents (typed message).
+                synchronized (st.sessionLock) {
+                    requireLive(st);
+                    if (st.suspended) {
+                        requireStopped(st);
+                        String snap = BridgeSnapshot.snapshot(
+                                st.vm, st.cfg, st.thread, st.location, st.out, st.err);
+                        return waitJson(st, snap, false);
+                    }
+                }
+                String snap = awaitStop(st, timeout);
+                synchronized (st.sessionLock) {
+                    return waitJson(st, snap, true);
+                }
+            }
+            case "capture": {
+                // One-shot bounded stop. Pre-parked: collect WITHOUT
+                // resuming. Fresh: collect, REMOVE EPHEMERAL BEFORE RESUME,
+                // auto-resume within the pause budget (overrun still
+                // resumes, then reports). Collection/removal failure still
+                // resumes; timeout never resumes (nothing parked). No eval,
+                // no persisted vars.
+                long[] budgetOut = new long[1];
+                String[] specOut = new String[1];
+                int[] bounds = parseCaptureBounds(req, budgetOut, specOut);
+                int framesN = bounds[0];
+                int varsN = bounds[1];
+                long budgetMs = budgetOut[0];
+                AddedLine cap = null;
+                if (specOut[0] != null) {
+                    String raw = specOut[0];
+                    String head = raw.contains("|")
+                            ? raw.substring(0, raw.indexOf('|')) : raw;
+                    if (head.equals("exc") || head.startsWith("exc:")
+                            || head.startsWith("method:")) {
+                        throw new BridgeException(
+                                "capture takes line breaks only (got '" + raw + "')");
+                    }
+                    try {
+                        cap = parseAddedLine(raw);
+                    } catch (UsageException ue) {
+                        throw new BridgeException(ue.getMessage());
+                    }
+                }
+                boolean prepark;
+                synchronized (st.sessionLock) {
+                    requireLive(st);
+                    prepark = st.suspended;
+                }
+                if (prepark) {
+                    synchronized (st.sessionLock) {
+                        requireStopped(st);
+                        String snap = BridgeSnapshot.snapshotBounded(st.vm, st.cfg,
+                                st.thread, st.location, st.out, st.err, framesN, varsN);
+                        int total = BridgeSnapshot.safeFrames(st.thread).size();
+                        return "{\"ok\":true,\"stopped\":true,"
+                                + "\"targetWasPaused\":true,\"resumed\":false,"
+                                + "\"pauseDurationMs\":0,\"pauseBudgetMs\":" + budgetMs + ","
+                                + "\"ephemeralPlanted\":false,"
+                                + "\"truncated\":{\"frames\":" + (total > framesN)
+                                + ",\"vars\":false},"
+                                + "\"snapshot\":" + snap
+                                + ",\"diag\":" + stopDiagJson(st)
+                                + ",\"warning\":" + JdiBridge.quote(PARK_WARNING)
+                                + ",\"target\":\"main\"}";
+                    }
+                }
+                // Fresh path: plant first (failure parks nothing, so no
+                // resume is owed). A stop that lands between the check and
+                // the plant is impossible (the outstanding slot owns the
+                // event queue), but re-check defensively: a live park
+                // becomes a prepark collect.
+                boolean planted;
+                synchronized (st.sessionLock) {
+                    requireLive(st);
+                    if (st.suspended) {
+                        requireStopped(st);
+                        String snap = BridgeSnapshot.snapshotBounded(st.vm, st.cfg,
+                                st.thread, st.location, st.out, st.err, framesN, varsN);
+                        int total = BridgeSnapshot.safeFrames(st.thread).size();
+                        return "{\"ok\":true,\"stopped\":true,"
+                                + "\"targetWasPaused\":true,\"resumed\":false,"
+                                + "\"pauseDurationMs\":0,\"pauseBudgetMs\":" + budgetMs + ","
+                                + "\"ephemeralPlanted\":false,"
+                                + "\"truncated\":{\"frames\":" + (total > framesN)
+                                + ",\"vars\":false},"
+                                + "\"snapshot\":" + snap
+                                + ",\"diag\":" + stopDiagJson(st)
+                                + ",\"warning\":" + JdiBridge.quote(PARK_WARNING)
+                                + ",\"target\":\"main\"}";
+                    }
+                    planted = plantCaptureBreak(st, cap);
+                }
+                String snap;
+                try {
+                    snap = awaitStop(st, timeout);
+                } catch (Exception e) {
+                    // Timeout/exit: nothing parked by us — no resume — but
+                    // the ephemeral must not leak.
+                    synchronized (st.sessionLock) {
+                        try {
+                            unplantCaptureBreak(st);
+                        } catch (Exception ue) {
+                            throw new BridgeException(e.getMessage()
+                                    + "; capture ephemeral may still be planted"
+                                    + " (breaks remove to clear)");
+                        }
+                    }
+                    throw e;
+                }
+                synchronized (st.sessionLock) {
+                    long parkMs = st.parkedAtMs;
+                    String snapErr = null;
+                    String removeErr = null;
+                    String resumeErr = null;
+                    String bounded;
+                    try {
+                        bounded = BridgeSnapshot.snapshotBounded(st.vm, st.cfg,
+                                st.thread, st.location, st.out, st.err,
+                                framesN, varsN);
+                    } catch (Exception e) {
+                        snapErr = JdiBridge.shortMsg(e);
+                        bounded = "{\"mode\":\"session\",\"location\":"
+                                + BridgeSnapshot.locationJson(st.location, st.cfg)
+                                + ",\"threads\":[],\"frames\":[]}";
+                    }
+                    int total = BridgeSnapshot.safeFrames(st.thread).size();
+                    // REMOVE EPHEMERAL BEFORE RESUME — even on failure.
+                    try {
+                        unplantCaptureBreak(st);
+                    } catch (Exception e) {
+                        removeErr = JdiBridge.shortMsg(e);
+                    }
+                    // Resume while still marked suspended (honest on
+                    // failure: the park stands and resumed:false reports).
+                    boolean resumed = false;
+                    try {
+                        if (st.suspended && st.vm != null) st.vm.resume();
+                        st.suspended = false;
+                        publishState(st, false);
+                        resumed = true;
+                    } catch (Exception e) {
+                        resumeErr = JdiBridge.shortMsg(e);
+                    }
+                    long pauseMs = Math.max(0,
+                            System.currentTimeMillis() - (parkMs > 0 ? parkMs
+                                    : System.currentTimeMillis()));
+                    StringBuilder resp = new StringBuilder(
+                            "{\"ok\":true,\"stopped\":true,");
+                    resp.append("\"targetWasPaused\":false,\"resumed\":").append(resumed);
+                    resp.append(",\"pauseDurationMs\":").append(pauseMs);
+                    resp.append(",\"pauseBudgetMs\":").append(budgetMs);
+                    resp.append(",\"budgetExceeded\":").append(pauseMs > budgetMs);
+                    resp.append(",\"ephemeralPlanted\":").append(planted);
+                    resp.append(",\"truncated\":{\"frames\":").append(total > framesN);
+                    resp.append(",\"vars\":false},");
+                    resp.append("\"snapshot\":").append(bounded);
+                    resp.append(",\"diag\":").append(stopDiagJson(st));
+                    resp.append(",\"warning\":").append(JdiBridge.quote(PARK_WARNING));
+                    if (snapErr != null) {
+                        resp.append(",\"snapshotError\":").append(JdiBridge.quote(snapErr));
+                    }
+                    if (removeErr != null) {
+                        resp.append(",\"removeError\":").append(JdiBridge.quote(removeErr));
+                    }
+                    if (resumeErr != null) {
+                        resp.append(",\"resumeError\":").append(JdiBridge.quote(resumeErr));
+                    }
+                    resp.append(",\"target\":\"main\"}");
+                    return resp.toString();
                 }
             }
             default: throw new BridgeException("unknown cmd: " + cmd);
+        }
+    }
+
+    /** Parked-stop UX warning (suspend semantics, HTTP handler impact).
+     *  No root-cause claim, ever. */
+    static final String PARK_WARNING =
+            "parked breakpoint suspends target; HTTP handler remains open"
+            + " until continue/capture-resume/close(detach)";
+
+    /** Tag on JDI requests planted by a capture ephemeral (line-break tags
+     *  stay untouched, so unplant deletes exactly the ephemeral). */
+    static final String CAPTURE_TAG = "agent-debugger-capture";
+
+    /** Record one genuine park for stop diagnostics. Caller holds
+     *  sessionLock; st.thread/st.location are the winning stop. */
+    static void notePark(SessionState st, String reason) {
+        String file = "?";
+        int line = -1;
+        long tid = -1;
+        try {
+            file = BridgeSnapshot.sourcePath(st.location.declaringType().name());
+        } catch (Exception ignored) {}
+        try { line = st.location.lineNumber(); } catch (Exception ignored) {}
+        try { tid = st.thread.uniqueID(); } catch (Exception ignored) {}
+        long now = System.currentTimeMillis();
+        Long elapsed = st.prevParkFile == null ? null : now - st.prevParkAtMs;
+        boolean sameLoc = file.equals(st.prevParkFile == null ? "" : st.prevParkFile)
+                && line == st.prevParkLine;
+        boolean sameThread = tid != -1 && tid == st.prevParkThreadId;
+        st.stopDiagSeq++;
+        st.prevParkFile = file;
+        st.prevParkLine = line;
+        st.prevParkThreadId = tid;
+        st.prevParkAtMs = now;
+        st.stopReason = reason;
+        st.parkedAtMs = now;
+        st.lastStopId = st.stopDiagSeq;
+        st.lastSameLoc = sameLoc;
+        st.lastSameThread = sameThread;
+        st.lastElapsedMs = elapsed;
+    }
+
+    /** Additive stop diagnostics for the parked target (caller holds
+     *  sessionLock). Native hit ids stay null on JDI (never fabricated);
+     *  requested/bound resolve from the armed intent (or the live capture
+     *  ephemeral) when attributable, else null. */
+    static String stopDiagJson(SessionState st) {
+        String cls = "?";
+        String file = "?";
+        int line = -1;
+        String method = "?";
+        long tid = -1;
+        String tname = null;
+        try { cls = st.location.declaringType().name(); } catch (Exception ignored) {}
+        try { file = BridgeSnapshot.sourcePath(cls); } catch (Exception ignored) {}
+        try { line = st.location.lineNumber(); } catch (Exception ignored) {}
+        try { method = st.location.method().name(); } catch (Exception ignored) {}
+        try { tid = st.thread.uniqueID(); } catch (Exception ignored) {}
+        try { tname = st.thread.name(); } catch (Exception ignored) {}
+        String requested = null;
+        Integer bound = null;
+        Integer hits = null;
+        List<Integer> lines = st.cfg.breakpoints.get(cls);
+        if (lines != null && lines.contains(line)) {
+            String cond = st.cfg.condByLoc.get(cls + ":" + line);
+            requested = cls + ":" + line + (cond == null ? "" : "|" + cond);
+            bound = line;
+            hits = hitsOf(st, "break|" + cls + "|" + line);
+        } else {
+            List<String> methods = st.cfg.methodBreaks.get(cls);
+            if (methods != null && methods.contains(method)) {
+                requested = "method:" + cls + "." + method;
+                bound = line;
+                hits = hitsOf(st, "method|" + cls + "." + method);
+            } else if (st.captureCls != null && st.captureCls.equals(cls)
+                    && st.captureLine == line) {
+                requested = st.captureCls + ":" + st.captureLine
+                        + (st.captureCond == null ? "" : "|" + st.captureCond);
+                bound = line;
+                hits = hitsOf(st, "break|" + cls + "|" + line);
+            }
+        }
+        StringBuilder sb = new StringBuilder("{");
+        sb.append("\"stopId\":").append(st.lastStopId);
+        sb.append(",\"parkedAtMs\":").append(st.parkedAtMs);
+        sb.append(",\"target\":\"main\"");
+        sb.append(",\"reason\":").append(st.stopReason == null ? "null"
+                : JdiBridge.quote(st.stopReason));
+        sb.append(",\"stoppingThread\":{\"id\":").append(tid);
+        sb.append(",\"name\":").append(tname == null ? "null" : JdiBridge.quote(tname));
+        sb.append("}");
+        sb.append(",\"hitBreakpoints\":null");
+        sb.append(",\"requestedBreak\":").append(requested == null ? "null"
+                : JdiBridge.quote(requested));
+        sb.append(",\"boundLine\":").append(bound == null ? "null" : bound);
+        sb.append(",\"hitCount\":").append(hits == null ? "null" : hits);
+        sb.append(",\"sameLocation\":").append(st.lastSameLoc);
+        sb.append(",\"sameThread\":").append(st.lastSameThread);
+        sb.append(",\"elapsedSincePreviousStopMs\":").append(st.lastElapsedMs == null
+                ? "null" : st.lastElapsedMs);
+        // Name the stop without claiming root cause.
+        sb.append(",\"file\":").append(JdiBridge.quote(file));
+        sb.append(",\"line\":").append(line);
+        sb.append(",\"method\":").append(JdiBridge.quote(method));
+        return sb.append('}').toString();
+    }
+
+    static String waitJson(SessionState st, String snap, boolean waited) {
+        return "{\"ok\":true,\"stopped\":true,\"waited\":" + waited
+                + ",\"changed\":" + st.lastChanged
+                + ",\"stopInfo\":" + stopInfoJson(st)
+                + ",\"snapshot\":" + snap
+                + ",\"diag\":" + stopDiagJson(st)
+                + ",\"warning\":" + JdiBridge.quote(PARK_WARNING)
+                + ",\"target\":\"main\"}";
+    }
+
+    /** Capture bounds from the flat request map (bridge-side enforcement;
+     *  the CLI mirrors). Returns {frames, vars}; budget and spec ride out
+     *  via the single-element holders. */
+    static int[] parseCaptureBounds(Map<String, String> req, long[] budgetOut,
+            String[] specOut) throws BridgeException {
+        int frames;
+        int vars;
+        long budget;
+        try {
+            frames = req.containsKey("frames") ? Integer.parseInt(req.get("frames")) : 1;
+            vars = req.containsKey("vars") ? Integer.parseInt(req.get("vars")) : 20;
+            budget = req.containsKey("pauseBudgetMs") ? Long.parseLong(req.get("pauseBudgetMs"))
+                    : 2000;
+        } catch (NumberFormatException nfe) {
+            throw new BridgeException("capture needs integer frames/vars/pauseBudgetMs");
+        }
+        if (frames < 1 || frames > 10) {
+            throw new BridgeException("capture frames must be between 1 and 10");
+        }
+        if (vars < 1 || vars > 20) {
+            throw new BridgeException("capture vars must be between 1 and 20");
+        }
+        if (budget < 1 || budget > 10000) {
+            throw new BridgeException("capture pause budget must be between 1 and 10000 ms");
+        }
+        budgetOut[0] = budget;
+        String spec = req.get("break");
+        specOut[0] = spec;
+        return new int[]{frames, vars};
+    }
+
+    /** A capture-ephemeral stop at this location? (cfg intent untouched.) */
+    static boolean isCaptureBreak(SessionState st, Location loc) {
+        if (st.captureCls == null) return false;
+        try {
+            return st.captureCls.equals(loc.declaringType().name())
+                    && st.captureLine == loc.lineNumber();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** The capture-ephemeral condition for this location, if any. */
+    static String captureCond(SessionState st, Location loc) {
+        return isCaptureBreak(st, loc) ? st.captureCond : null;
+    }
+
+    /** Plant one ephemeral line-only break for a capture. Returns true when
+     *  planted (false when the exact line is already armed — idempotent,
+     *  nothing to remove). Throws BEFORE anything parks on invalid or
+     *  conflicting specs. Never touches cfg intent, stops.json, watches,
+     *  or inheritance. Caller holds sessionLock. */
+    static boolean plantCaptureBreak(SessionState st, AddedLine p) throws Exception {
+        if (p == null) return false;
+        String loc = p.cls + ":" + p.line;
+        List<Integer> have = st.cfg.breakpoints.get(p.cls);
+        String haveCond = st.cfg.condByLoc.get(loc);
+        if (have != null && have.contains(p.line)) {
+            if (condEqual(haveCond, p.cond)) return false; // already armed
+            throw new BridgeException("conflicting condition for " + loc + " (already armed"
+                    + (haveCond == null ? " plain" : " as '" + haveCond + "'") + "): " + p.raw);
+        }
+        for (Logpoint lp : st.cfg.logpoints) {
+            if (lp.cls.equals(p.cls) && lp.line == p.line) {
+                throw new BridgeException("conflicting logpoint for " + loc
+                        + " (already armed as logpoint): " + p.raw);
+            }
+        }
+        // Read-only line check for loaded classes (no JDI mutation yet).
+        List<ReferenceType> loaded = st.vm.classesByName(p.cls);
+        for (ReferenceType rt : loaded) {
+            List<Location> locs;
+            try {
+                locs = rt.locationsOfLine(p.line);
+            } catch (AbsentInformationException aie) {
+                throw new BridgeException("class " + p.cls
+                        + " has no debug info — recompile with -g");
+            }
+            if (locs.isEmpty()) {
+                throw new BridgeException("no executable code at " + p.cls + ":" + p.line);
+            }
+        }
+        st.captureCls = p.cls;
+        st.captureLine = p.line;
+        st.captureCond = p.cond;
+        if (!loaded.isEmpty()) {
+            for (ReferenceType rt : loaded) {
+                plantCaptureForClass(st, rt);
+            }
+        } else {
+            watchClass(st.vm, p.cls); // deferred: ClassPrepare plants it
+        }
+        return true;
+    }
+
+    /** Plant the live capture ephemeral on one prepared class. */
+    static void plantCaptureForClass(SessionState st, ReferenceType rt) throws Exception {
+        if (st.captureCls == null || !st.captureCls.equals(rt.name())) return;
+        List<Location> locs;
+        try {
+            locs = rt.locationsOfLine(st.captureLine);
+        } catch (AbsentInformationException aie) {
+            throw new BridgeException("class " + rt.name()
+                    + " has no line info — recompile with -g");
+        }
+        if (locs.isEmpty()) {
+            throw new BridgeException("no executable code at " + rt.name() + ":" + st.captureLine);
+        }
+        for (Location l : locs) {
+            BreakpointRequest bp =
+                    st.vm.eventRequestManager().createBreakpointRequest(l);
+            bp.setSuspendPolicy(EventRequest.SUSPEND_ALL);
+            bp.putProperty(CAPTURE_TAG, st.captureCls + ":" + st.captureLine);
+            bp.enable();
+        }
+    }
+
+    /** Remove a capture ephemeral BEFORE resume. Always clears the fields
+     *  (orphaned JDI requests are benign: later pumps skip and resume them,
+     *  close drops them). Throws on backend failure — the caller still
+     *  resumes, then reports removeError. Caller holds sessionLock. */
+    static void unplantCaptureBreak(SessionState st) throws Exception {
+        try {
+            List<BreakpointRequest> doomed = new ArrayList<>();
+            for (BreakpointRequest req : st.vm.eventRequestManager().breakpointRequests()) {
+                Object tag = null;
+                try { tag = req.getProperty(CAPTURE_TAG); } catch (Exception ignored) {}
+                if (tag != null) doomed.add(req);
+            }
+            for (BreakpointRequest req : doomed) {
+                st.vm.eventRequestManager().deleteEventRequest(req);
+            }
+        } finally {
+            st.captureCls = null;
+            st.captureLine = -1;
+            st.captureCond = null;
         }
     }
 
@@ -697,13 +1342,15 @@ class BridgeSession {
         try { port = st.server.getLocalPort(); } catch (Exception ignored) {}
         String name = "?";
         try { name = st.dir.getFileName().toString(); } catch (Exception ignored) {}
+        String observed = st.cfg.observedTargetJson == null ? "null" : st.cfg.observedTargetJson;
         BridgeProto.writeFile(st.dir.resolve("session.json"),
                 "{\"name\":" + JdiBridge.quote(name)
                 + ",\"kind\":" + JdiBridge.quote(st.cfg.sessionKind)
                 + ",\"port\":" + port
                 + ",\"stopped\":" + stopped
                 + ",\"lastStop\":" + (st.lastStopJson == null ? "null" : st.lastStopJson)
-                + ",\"updatedAt\":" + now + "}");
+                + ",\"updatedAt\":" + now
+                + ",\"observedTarget\":" + observed + "}");
     }
 
     /** Trimmed stop locator (no snippet — file reads stay in snapshots). */
@@ -847,6 +1494,8 @@ class BridgeSession {
         for (AddedLine p : fresh) {
             st.cfg.breakpoints.computeIfAbsent(p.cls, k -> new ArrayList<>()).add(p.line);
             if (p.cond != null) st.cfg.condByLoc.put(p.cls + ":" + p.line, p.cond);
+            st.cfg.breakRaws.putIfAbsent(
+                    p.cls + ":" + p.line + "|" + (p.cond == null ? "" : p.cond), p.raw);
             List<ReferenceType> loaded = st.vm.classesByName(p.cls);
             boolean verified;
             String detail = null;
@@ -887,6 +1536,252 @@ class BridgeSession {
     }
 
     /** Line-break-only parse (mirrors BridgeCli.parseBreakpoint normalization). */
+    /**
+     * Remove live line breaks by stored identity (running or parked — never
+     * suspended/resumed here). Phase 1 matches the whole batch with zero JDI
+     * mutation (unparseable or unmatched specs land in `missing`, never
+     * ok:false); phase 2 deletes each confirmed break's tagged JDI requests.
+     * `removed[]` echoes the persisted stored raws so the CLI drops exactly
+     * the confirmed entries. A removed break re-arms a same-line shadowed
+     * logpoint via the normal logpoint path (armed now when the class is
+     * loaded, deferred watch otherwise, pending + warning on plant failure).
+     */
+    static String breaksRemoveJson(SessionState st, List<String> raws) throws Exception {
+        if (st.exited) throw new BridgeException("target VM has exited — close this session");
+        if (raws.isEmpty()) throw new BridgeException("breaks remove needs at least one --break");
+        List<AddedLine> matched = new ArrayList<>();
+        List<String> missing = new ArrayList<>();
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        for (String raw : raws) {
+            if (raw == null || raw.isEmpty()) throw new BridgeException("bad break spec: " + raw);
+            if (!seen.add(raw)) continue; // intra-batch duplicate: idempotent
+            AddedLine p;
+            try {
+                p = parseAddedLine(raw);
+            } catch (UsageException ue) {
+                missing.add(raw); // malformed can never match stored identity
+                continue;
+            }
+            String loc = p.cls + ":" + p.line;
+            List<Integer> have = st.cfg.breakpoints.get(p.cls);
+            if (have == null || !have.contains(p.line)
+                    || !condEqual(st.cfg.condByLoc.get(loc), p.cond)) {
+                // Stored-raw fallback (covers spellings the lexer cannot
+                // reproduce); plain specs never match conditional records.
+                AddedLine alt = matchStoredRaw(st, raw);
+                if (alt == null) {
+                    missing.add(raw);
+                    continue;
+                }
+                p = alt;
+                loc = p.cls + ":" + p.line;
+            }
+            boolean dup = false;
+            for (AddedLine m : matched) {
+                if (m.cls.equals(p.cls) && m.line == p.line && condEqual(m.cond, p.cond)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) matched.add(p);
+        }
+        if (matched.isEmpty()) {
+            return "{\"ok\":true,\"removed\":[],\"missing\":" + toJsonArray(missing)
+                    + ",\"stops\":" + stopsArrayJson(st) + "}";
+        }
+        return dropBreakKeys(st, matched, missing);
+    }
+
+    /** Stored-raw fallback: the exact persisted string identifies its key
+     *  even when the request spelling lexes differently. */
+    static AddedLine matchStoredRaw(SessionState st, String raw) {
+        for (Map.Entry<String, String> e : st.cfg.breakRaws.entrySet()) {
+            if (!e.getValue().equals(raw)) continue;
+            String key = e.getKey();
+            int bar = key.lastIndexOf('|');
+            String loc = bar < 0 ? key : key.substring(0, bar);
+            String cond = bar < 0 ? null : key.substring(bar + 1);
+            if (cond != null && cond.isEmpty()) cond = null;
+            int colon = loc.lastIndexOf(':');
+            if (colon <= 0) continue;
+            AddedLine p = new AddedLine();
+            p.raw = raw;
+            p.cls = loc.substring(0, colon);
+            try {
+                p.line = Integer.parseInt(loc.substring(colon + 1));
+            } catch (NumberFormatException nfe) {
+                continue;
+            }
+            p.cond = cond;
+            List<Integer> have = st.cfg.breakpoints.get(p.cls);
+            if (have != null && have.contains(p.line)
+                    && condEqual(st.cfg.condByLoc.get(loc), p.cond)) {
+                return p;
+            }
+        }
+        return null;
+    }
+
+    static String breaksClearJson(SessionState st) throws Exception {
+        if (st.exited) throw new BridgeException("target VM has exited — close this session");
+        List<AddedLine> ordered = new ArrayList<>();
+        for (Map.Entry<String, List<Integer>> e : st.cfg.breakpoints.entrySet()) {
+            for (int line : e.getValue()) {
+                AddedLine p = new AddedLine();
+                p.cls = e.getKey();
+                p.line = line;
+                p.cond = st.cfg.condByLoc.get(e.getKey() + ":" + line);
+                String key = p.cls + ":" + p.line + "|" + (p.cond == null ? "" : p.cond);
+                p.raw = st.cfg.breakRaws.getOrDefault(key, p.cls + ":" + p.line
+                        + (p.cond == null ? "" : "|" + p.cond));
+                ordered.add(p);
+            }
+        }
+        if (ordered.isEmpty()) {
+            return "{\"ok\":true,\"removed\":[],\"stops\":" + stopsArrayJson(st) + "}";
+        }
+        return dropBreakKeys(st, ordered, new ArrayList<>());
+    }
+
+    static String dropBreakKeys(SessionState st, List<AddedLine> keys, List<String> missing)
+            throws Exception {
+        StringBuilder removed = new StringBuilder("[");
+        StringBuilder failed = new StringBuilder("[");
+        List<String> rearmWarnings = new ArrayList<>();
+        boolean rFirst = true;
+        boolean fFirst = true;
+        int okCount = 0;
+        for (AddedLine p : keys) {
+            String loc = p.cls + ":" + p.line;
+            String storedRaw = st.cfg.breakRaws.getOrDefault(
+                    loc + "|" + (p.cond == null ? "" : p.cond), p.raw);
+            List<BreakpointRequest> doomed = new ArrayList<>();
+            try {
+                for (BreakpointRequest req
+                        : st.vm.eventRequestManager().breakpointRequests()) {
+                    Object tag = null;
+                    try { tag = req.getProperty("agent-debugger-break"); } catch (Exception ignored) {}
+                    if (tag != null && tag.equals(loc)) doomed.add(req);
+                }
+                for (BreakpointRequest req : doomed) {
+                    st.vm.eventRequestManager().deleteEventRequest(req);
+                }
+            } catch (Exception e) {
+                if (!fFirst) failed.append(',');
+                fFirst = false;
+                failed.append("{\"raw\":").append(JdiBridge.quote(storedRaw));
+                failed.append(",\"spec\":").append(JdiBridge.quote(keySpec(p)));
+                failed.append(",\"error\":").append(JdiBridge.quote(JdiBridge.shortMsg(e)));
+                failed.append('}');
+                continue;
+            }
+            List<Integer> lines = st.cfg.breakpoints.get(p.cls);
+            if (lines != null) {
+                lines.remove(Integer.valueOf(p.line));
+                if (lines.isEmpty()) st.cfg.breakpoints.remove(p.cls);
+            }
+            if (p.cond != null) st.cfg.condByLoc.remove(loc);
+            st.cfg.breakRaws.remove(loc + "|" + (p.cond == null ? "" : p.cond));
+            String warn = rearmShadowedLogpoint(st, p);
+            if (warn != null) rearmWarnings.add(warn);
+            boolean loaded;
+            try {
+                loaded = !st.vm.classesByName(p.cls).isEmpty();
+            } catch (Exception e) {
+                loaded = false;
+            }
+            if (!rFirst) removed.append(',');
+            rFirst = false;
+            removed.append("{\"raw\":").append(JdiBridge.quote(storedRaw));
+            removed.append(",\"spec\":").append(JdiBridge.quote(keySpec(p)));
+            removed.append(",\"kind\":\"break\"");
+            removed.append(",\"state\":").append(JdiBridge.quote(loaded ? "verified" : "pending"));
+            removed.append(",\"hits\":").append(hitsOf(st, "break|" + p.cls + "|" + p.line));
+            removed.append('}');
+            okCount++;
+        }
+        if (okCount == 0) {
+            if (!failed.toString().equals("[")) {
+                throw new BridgeException("breaks remove failed: " + failed + "]");
+            }
+            return "{\"ok\":true,\"removed\":[],\"missing\":" + toJsonArray(missing)
+                    + ",\"stops\":" + stopsArrayJson(st) + "}";
+        }
+        StringBuilder resp = new StringBuilder("{\"ok\":true,\"removed\":");
+        resp.append(removed).append(']');
+        resp.append(",\"stops\":").append(stopsArrayJson(st));
+        if (!missing.isEmpty()) resp.append(",\"missing\":").append(toJsonArray(missing));
+        if (!fFirst) {
+            resp.append(",\"failed\":").append(failed).append(']');
+        }
+        // One warning key, deterministically ordered: partial-delete first,
+        // then re-arm notes (duplicate keys would let one silently win).
+        String warning = removeWarning(!fFirst, rearmWarnings);
+        if (warning != null) {
+            resp.append(",\"warning\":").append(JdiBridge.quote(warning));
+        }
+        return resp.append('}').toString();
+    }
+
+    /** Single combined remove/clear warning (null when nothing to report).
+     *  Extracted so the one-key contract is checkable without a live VM. */
+    static String removeWarning(boolean partialFailed, List<String> rearmWarnings) {
+        StringBuilder sb = new StringBuilder();
+        if (partialFailed) sb.append("partial remove: some breaks kept");
+        if (rearmWarnings != null && !rearmWarnings.isEmpty()) {
+            if (sb.length() > 0) sb.append("; ");
+            sb.append("re-arm: ").append(String.join("; ", rearmWarnings));
+        }
+        return sb.length() == 0 ? null : sb.toString();
+    }
+
+    static String keySpec(AddedLine p) {
+        return p.cls + ":" + p.line + (p.cond == null ? "" : "|" + p.cond);
+    }
+
+    /**
+     * Re-arm a same-line shadowed logpoint freed by a break removal. The
+     * break won, so no plant exists: the current logpoint path runs once —
+     * armed now when the class is loaded, deferred watch otherwise, pending
+     * + warning when the plant fails. Returns a warning or null.
+     */
+    static String rearmShadowedLogpoint(SessionState st, AddedLine p) {
+        Logpoint shadow = null;
+        for (Logpoint lp : st.cfg.logpoints) {
+            if (lp.cls.equals(p.cls) && lp.line == p.line) {
+                shadow = lp;
+                break;
+            }
+        }
+        // Only shadowed logpoints re-arm here: an armed (planted) logpoint
+        // on the same line cannot exist (add-time conflict), and planting
+        // over one would double-fire.
+        if (shadow == null) return null;
+        List<ReferenceType> loaded;
+        try {
+            loaded = st.vm.classesByName(shadow.cls);
+        } catch (Exception e) {
+            loaded = new ArrayList<>();
+        }
+        if (loaded.isEmpty()) {
+            try {
+                watchClass(st.vm, shadow.cls);
+            } catch (Exception ignored) {}
+            return null; // deferred: plantPending arms it on class load
+        }
+        try {
+            for (ReferenceType rt : loaded) {
+                BridgeConn.setLines(st.vm, rt,
+                        java.util.Collections.singletonList(shadow.line),
+                        EventRequest.SUSPEND_EVENT_THREAD, true);
+            }
+        } catch (Exception e) {
+            return "logpoint " + shadow.cls + ":" + shadow.line
+                    + " re-arm failed: " + JdiBridge.shortMsg(e);
+        }
+        return null;
+    }
+
     static AddedLine parseAddedLine(String raw) throws UsageException {
         String cond = null;
         String head = raw;

@@ -36,6 +36,8 @@ class BridgeCli {
                 case "--timeout": cfg.timeoutMs = timeoutMillis(next(argv, ++i, "--timeout")); break;
                 case "--dir": cfg.sessionDir = next(argv, ++i, "--dir"); break;
                 case "--kind": cfg.sessionKind = next(argv, ++i, "--kind"); break;
+                case "--observed-target": cfg.observedTargetJson = coerceObserved(next(argv, ++i, "--observed-target")); break;
+                case "--observed-hint": cfg.observedHint = next(argv, ++i, "--observed-hint"); break;
                 default: throw new UsageException("unknown arg: " + a);
             }
         }
@@ -108,9 +110,19 @@ class BridgeCli {
         return argv[i];
     }
 
+    /** Keep only plausible objects (we generate the JSON CLI-side); anything
+     *  else reads as unknown, never persisted verbatim. */
+    static String coerceObserved(String raw) {
+        if (raw == null) return null;
+        String t = raw.trim();
+        if ((t.startsWith("{") && t.endsWith("}")) || t.equals("null")) return raw;
+        return null;
+    }
+
     static void parseBreakpoint(Config cfg, String spec) throws UsageException {
         // Forms: com.Foo:30 | com.Foo:30|x == null | method:com.Foo.bar
         //        method:com.Foo.bar|x != null | exc:java.lang.NullPointerException
+        String origSpec = spec;
         String cond = null;
         int bar = spec.indexOf('|');
         if (bar >= 0) {
@@ -148,6 +160,8 @@ class BridgeCli {
         if (line < 1) throw new UsageException("bad line in --break (must be >= 1): " + spec);
         cfg.breakpoints.computeIfAbsent(cls, k -> new ArrayList<>()).add(line);
         if (cond != null) cfg.condByLoc.put(cls + ":" + line, cond);
+        // Stored raw for remove/clear echo (dedup keeps first).
+        cfg.breakRaws.putIfAbsent(cls + ":" + line + "|" + (cond == null ? "" : cond), origSpec);
     }
 
     /**

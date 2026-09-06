@@ -725,6 +725,35 @@ class LiveTests(unittest.TestCase):
         self.assertIn(os.path.basename(self.py_stdlib), data["error"])
         self._assert_absent("py-unverified-timeout")
 
+    def test_11b_py_logpoint_only_fast_exit(self):
+        """Logpoints-only fast exit keeps the intended collect-logs shape:
+        the error-file truth wins when setup fails, but a clean fast run
+        never surfaces an outer ok:false. Either live shape is accepted
+        (threads when the first read wins the race, warning+logs when the
+        exit wins it); both carry target identity, and the collect shape
+        carries the already-exited warning with the target output."""
+        self._ensure_py_path_fixtures()
+        name = "py-logpoint-fast"
+        self.sessions.add(name)
+        data = self.cli(name, "py", "start", str(self.py_fast),
+                        "--logpoint", f"{self.py_fast}:1:fast-exit-marker",
+                        "--timeout", "10")
+        self.assertIn("requestedTarget", data)
+        self.assertIn("observedTarget", data)
+        if "logs" in data:
+            self.assertIn("already exited", data.get("warning", ""))
+            lines = data["logs"]["lines"]
+            self.assertTrue(any("done" in ln or "fast-exit-marker" in ln
+                                for ln in lines), lines)
+        else:
+            self.assertIn("threads", data)
+        try:
+            self.cli(name, "close", timeout=85)
+        except Exception:
+            pass
+        self.sessions.remove(name)
+        self._assert_absent(name)
+
     def test_12_py_attach_pending_survives(self):
         """Attach with a never-binding (pending) break stays a live running
         session; bare `breaks` exposes the pending record."""
@@ -1320,6 +1349,705 @@ class LiveTests(unittest.TestCase):
         self.assertEqual(row["lastStop"]["line"], 7)
         self.assertTrue(self.cli(name, "close")["confirmed"])
         self.sessions.remove(name)
+
+    def _ensure_mod_fixture(self):
+        """Project-owned minimal module fixture (no pytest dependency)."""
+        if hasattr(self, "mod_runner"):
+            return
+        pkg = self.fixture / "modpkg"
+        pkg.mkdir(exist_ok=True)
+        (pkg / "__init__.py").write_text("")
+        self.mod_runner = pkg / "runner.py"
+        self.mod_runner.write_text(
+            "import sys\nimport time\nprint(\"modready\", flush=True)\n"
+            "marker = sys.argv[1:]\n"
+            "total = 0\n"
+            "for i in range(200):\n"
+            "    total += i\n"
+            "    time.sleep(0.05)\n"
+            "print(total, flush=True)\n")
+
+    def test_23_py_module_launch(self):
+        """M1: `py start --module dotted.name -- args` launches as python -m
+        (real test-body breakpoint + argv passing + cwd import); file launch
+        is untouched; bad/ambiguous module forms fail fast with no dir."""
+        self._ensure_mod_fixture()
+        name = "m1-mod"
+        self.sessions.add(name)
+        data = self.cli(name, "py", "start", "--module", "modpkg.runner",
+                        "--break", f"{self.mod_runner}:5",
+                        "--timeout", "15", "--", "--arg", "1", cwd=str(self.fixture))
+        self.assertEqual(data["location"]["line"], 5)
+        self.assertEqual(self.cli(name, "eval", "marker")["value"], "['--arg', '1']")
+        stops_file = self.home / ".agent-debugger/sessions" / name / "stops.json"
+        intent = json.loads(stops_file.read_text())
+        self.assertEqual(intent["target"].get("module"), "modpkg.runner")
+        self.assertIn("requestedTarget", intent)
+        self.assertEqual(intent["requestedTarget"].get("module"), "modpkg.runner")
+        self.assertIsNone(intent["requestedTarget"].get("pid"))
+        row = next(r for r in self.cli(name, "status")["sessions"] if r["name"] == name)
+        self.assertEqual(row["target"].get("module"), "modpkg.runner")
+        ctx = self.cli(name, "context")
+        self.assertEqual(ctx["requestedTarget"].get("module"), "modpkg.runner")
+        observed = ctx["observedTarget"]
+        self.assertEqual(observed["kind"], "process")
+        self.assertIn("-m", observed["argv"])
+        self.assertIn("modpkg.runner", observed["argv"])
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+        # Unknown module: launch fails (the break forces module resolution),
+        # name reusable.
+        data = self.cli("m1-mod-bad", "py", "start", "--module", "nosuchpkg.mod",
+                        "--break", f"{self.mod_runner}:5",
+                        "--timeout", "10", cwd=str(self.fixture), ok=False)
+        self.assertFalse(data["ok"])
+        self._assert_absent("m1-mod-bad")
+        # Malformed module: CLI fail-fast before any target runs.
+        data = self.cli("m1-mod-bad2", "py", "start", "--module", "a-b",
+                        cwd=str(self.fixture), ok=False)
+        self.assertFalse(data["ok"])
+        self.assertIn("module", data["error"])
+        self._assert_absent("m1-mod-bad2")
+        # File + module together: parse-time conflict (clap exits before
+        # the JSON envelope, so assert on the process itself).
+        result = subprocess.run(
+            [str(BIN), "--session", "m1-mod-bad3", "py", "start", "app.py",
+             "--module", "m"],
+            env=self.env, cwd=str(self.fixture),
+            capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self._assert_absent("m1-mod-bad3")
+
+    def test_24_attach_target_identity(self):
+        """M-I: attach responses + status/context surface requestedTarget
+        (endpoint, pid null) and observedTarget (kernel-observed pid/exe/
+        argv/cwd, redacted); secrets never persist; browser reports tab
+        metadata with no process claim."""
+        self._ensure_idle_fixtures()
+        sentinel = "BATCH1SECRET-9f8e7d"
+        # Java target carries a secret JVM flag (JVM-accepted, no behavior change).
+        port = free_port()
+        target = ["java", f"-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:{port}",
+                  f"-Dtoken={sentinel}", "-cp", str(self.fixture), "IdleAttach"]
+        proc = self._launch_target(target, "mi-java")
+        self._wait_log("mi-java", "ready")
+        time.sleep(1)
+        name = "mi-java"
+        self.sessions.add(name)
+        data = self.cli(name, "java", "attach", "--port", str(port), "--timeout", "3")
+        requested = data["requestedTarget"]
+        self.assertEqual(requested["port"], port)
+        self.assertIsNone(requested.get("pid"))
+        observed = data["observedTarget"]
+        self.assertEqual(observed["kind"], "process")
+        self.assertEqual(observed["pid"], proc.pid)
+        argv = observed["argv"]
+        self.assertTrue(any("IdleAttach" in a for a in argv))
+        redacted = [a for a in argv if "token" in a.lower()]
+        self.assertTrue(redacted and all("[redacted]" in a for a in redacted),
+                        f"secret flag must redact: {argv}")
+        self.assertNotIn(sentinel, json.dumps(data))
+        # No raw secret in any persisted file or surfaced output.
+        for fname in ["session.json", "stops.json", "bridge.log"]:
+            f = self.home / ".agent-debugger/sessions" / name / fname
+            if f.exists():
+                self.assertNotIn(sentinel, f.read_text(),
+                                 f"raw secret leaked into {fname}")
+        ctx = self.cli(name, "context") if data.get("location") else None
+        status_row = next(r for r in self.cli(name, "status")["sessions"] if r["name"] == name)
+        self.assertEqual(status_row["observedTarget"]["pid"], proc.pid)
+        self.assertEqual(status_row["requestedTarget"]["port"], port)
+        self.assertNotIn(sentinel, json.dumps(status_row))
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+        # Python attach: same-file listener identity via OS lookup.
+        port = free_port()
+        proc = self._launch_target(self._m1_target("py", port), "mi-py")
+        self._wait_log("mi-py", "ready")
+        time.sleep(1)
+        name = "mi-py"
+        self.sessions.add(name)
+        data = self.cli(name, "py", "attach", "--port", str(port), "--timeout", "2")
+        observed = data["observedTarget"]
+        # debugpy forks: the kernel-observed listener is a child of the
+        # spawned process, so verify it is the debugpy listener itself.
+        self.assertTrue(any("debugpy" in a for a in observed["argv"]))
+        self.assertTrue(any(str(port) in a for a in observed["argv"]))
+        self.assertEqual(observed["source"], "os-lsof-ps")
+        self.assertEqual(observed["unavailable"], [])
+        listener = subprocess.run(["ps", "-p", str(observed["pid"]), "-o", "args="],
+                                  capture_output=True, text=True, timeout=10)
+        self.assertIn("debugpy", listener.stdout)
+        self.assertIn(str(port), listener.stdout)
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+
+    def test_25_wrong_process_same_path(self):
+        """M-I: the same script in two processes is distinguishable — each
+        attach shows the observed pid/argv of its own listener, so a break
+        armed on the wrong port is visibly the wrong target."""
+        self._ensure_idle_fixtures()
+        gate_a = self.fixture / "migo-a"
+        gate_b = self.fixture / "migo-b"
+        for g in (gate_a, gate_b):
+            try:
+                g.unlink()
+            except OSError:
+                pass
+        script = self.fixture / "mi_two.py"
+        script.write_text(
+            "import pathlib\nimport sys\nimport time\nprint(\"ready\", flush=True)\n"
+            "GATE = pathlib.Path(sys.argv[1])\nwhile True:\n"
+            "    if GATE.exists():\n        value = 99\n        print(\"hit\", flush=True)\n"
+            "    time.sleep(0.05)\n")
+        port_a, port_b = free_port(), free_port()
+        proc_a = self._launch_target(
+            [str(VENV_PY), "-Xfrozen_modules=off", "-m", "debugpy",
+             "--listen", f"127.0.0.1:{port_a}", str(script), str(gate_a)], "mi-two-a")
+        proc_b = self._launch_target(
+            [str(VENV_PY), "-Xfrozen_modules=off", "-m", "debugpy",
+             "--listen", f"127.0.0.1:{port_b}", str(script), str(gate_b)], "mi-two-b")
+        self._wait_log("mi-two-a", "ready")
+        self._wait_log("mi-two-b", "ready")
+        time.sleep(1)
+        seen = {}
+        for name, port, proc, gate in [("mi-two-a", port_a, proc_a, gate_a),
+                                       ("mi-two-b", port_b, proc_b, gate_b)]:
+            self.sessions.add(name)
+            data = self.cli(name, "py", "attach", "--port", str(port), "--timeout", "2")
+            observed = data["observedTarget"]
+            # debugpy forks: the observed listener is a child process, so
+            # each twin is identified by its own port in its own argv.
+            self.assertTrue(any("debugpy" in a for a in observed["argv"]))
+            self.assertTrue(any(str(port) in a for a in observed["argv"]),
+                            f"{name} identity must name its own port: {observed['argv']}")
+            seen[name] = observed["pid"]
+            self.assertTrue(self.cli(name, "close")["confirmed"])
+            self.sessions.remove(name)
+        self.assertNotEqual(seen["mi-two-a"], seen["mi-two-b"])
+
+    def test_26_breaks_remove_clear_live(self):
+        """M2: live add->remove->breaks + stops.json convergence on
+        py/node/java, incl. deleted-source removal, cond semantics, and
+        missing-as-non-error; clear drops every line break only."""
+        self._ensure_idle_fixtures()
+        flows = {
+            "m2r-py": ("py", str(self.py_idle), 7, 8),
+            "m2r-node": ("node", str(self.js_idle), 7, 8),
+            "m2r-java": ("java", "IdleAttach", 10, 11),
+        }
+        for name, (lang, idle, line1, line2) in flows.items():
+            port = free_port()
+            gate = self.fixture / f"go-{name}"
+            try:
+                gate.unlink()
+            except OSError:
+                pass
+            if lang == "java":
+                target = ["java", f"-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:{port}",
+                          "-cp", str(self.fixture), "IdleAttach"]
+                first, second = f"{idle}:{line1}", f"{idle}:{line2}"
+            else:
+                target = self._m1_target(lang, port)
+                first, second = f"{idle}:{line1}", f"{idle}:{line2}"
+            self._launch_target(target, f"m2r-{lang}")
+            self._wait_log(f"m2r-{lang}", "ready")
+            time.sleep(1)
+            self.sessions.add(name)
+            timeout = "3" if lang == "java" else "2"
+            self.cli(name, lang, "attach", "--port", str(port), "--timeout", timeout)
+            added = self.cli(name, "breaks", "add", "--break", first, "--break", second)
+            self.assertEqual(len(added["added"]), 2)
+            stops_file = self.home / ".agent-debugger/sessions" / name / "stops.json"
+            # Remove one: live recs + file converge, raw echoed verbatim.
+            removed = self.cli(name, "breaks", "remove", "--break", first)
+            self.assertEqual(len(removed["removed"]), 1)
+            self.assertEqual(removed["removed"][0]["raw"], first)
+            live = [s["spec"] for s in self.cli(name, "breaks")["stops"] if s["kind"] == "break"]
+            self.assertFalse(any(s.endswith(f":{line1}") for s in live))
+            self.assertTrue(any(s.endswith(f":{line2}") for s in live))
+            file_breaks = json.loads(stops_file.read_text())["breaks"]
+            self.assertNotIn(first, file_breaks)
+            self.assertIn(second, file_breaks)
+            # Missing spec is non-fatal.
+            miss = self.cli(name, "breaks", "remove", "--break",
+                            first if lang == "java" else f"{idle}:99")
+            self.assertTrue(miss["ok"])
+            self.assertEqual(miss["removed"], [])
+            self.assertEqual(len(miss.get("missing", [])), 1)
+            self.assertEqual(json.loads(stops_file.read_text())["breaks"], file_breaks)
+            # Clear drops the rest; bare breaks then shows no line breaks.
+            cleared = self.cli(name, "breaks", "clear")
+            self.assertTrue(cleared["ok"])
+            self.assertEqual(len(cleared["removed"]), 1)
+            self.assertEqual(cleared["removed"][0]["raw"], second)
+            self.assertEqual(json.loads(stops_file.read_text())["breaks"], [])
+            live = [s for s in self.cli(name, "breaks")["stops"] if s["kind"] == "break"]
+            self.assertEqual(live, [])
+            row = next(r for r in self.cli(name, "status")["sessions"] if r["name"] == name)
+            self.assertEqual(row["armed"]["breaks"], 0)
+            self.assertTrue(self.cli(name, "close")["confirmed"])
+            self.sessions.remove(name)
+        # Deleted-source removal (py): the file is gone, removal still works.
+        port = free_port()
+        doomed = self.fixture / "m2r_doomed.py"
+        doomed.write_text('import time\nprint("ready", flush=True)\nwhile True:\n    time.sleep(0.05)\n')
+        target = [str(VENV_PY), "-Xfrozen_modules=off", "-m", "debugpy",
+                  "--listen", f"127.0.0.1:{port}", str(doomed)]
+        self._launch_target(target, "m2r-doomed")
+        self._wait_log("m2r-doomed", "ready")
+        time.sleep(1)
+        name = "m2r-doomed"
+        self.sessions.add(name)
+        self.cli(name, "py", "attach", "--port", str(port), "--timeout", "2")
+        raw = f"{doomed}:2"
+        self.assertEqual(len(self.cli(name, "breaks", "add", "--break", raw)["added"]), 1)
+        doomed.unlink()
+        removed = self.cli(name, "breaks", "remove", "--break", raw)
+        self.assertEqual([e["raw"] for e in removed["removed"]], [raw])
+        stops_file = self.home / ".agent-debugger/sessions" / name / "stops.json"
+        self.assertNotIn(raw, json.loads(stops_file.read_text())["breaks"])
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+        # Cond semantics (py): plain spec never removes a conditional record.
+        port = free_port()
+        self._launch_target(self._m1_target("py", port), "m2r-cond")
+        self._wait_log("m2r-cond", "ready")
+        time.sleep(1)
+        name = "m2r-cond"
+        self.sessions.add(name)
+        self.cli(name, "py", "attach", "--port", str(port), "--timeout", "2")
+        cond_raw = f"{self.py_idle}:7|value == 99"
+        self.assertEqual(len(self.cli(name, "breaks", "add", "--break", cond_raw)["added"]), 1)
+        miss = self.cli(name, "breaks", "remove", "--break", f"{self.py_idle}:7")
+        self.assertEqual(miss["removed"], [])
+        self.assertEqual(miss["missing"], [f"{self.py_idle}:7"])
+        gone = self.cli(name, "breaks", "remove", "--break", cond_raw)
+        self.assertEqual([e["raw"] for e in gone["removed"]], [cond_raw])
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+        # Java shadow re-arm: a logpoint shadowed by a break revives through
+        # the normal logpoint path once the break is removed.
+        port = free_port()
+        self._launch_target(
+            ["java", f"-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:{port}",
+             "-cp", str(self.fixture), "IdleAttach"], "m2r-shadow")
+        self._wait_log("m2r-shadow", "ready")
+        time.sleep(1)
+        name = "m2r-shadow"
+        self.sessions.add(name)
+        self.cli(name, "java", "attach", "--port", str(port),
+                 "--break", "IdleAttach:10",
+                 "--logpoint", "IdleAttach:10:hit", "--timeout", "3")
+        shadowed = [s for s in self.cli(name, "breaks")["stops"]
+                    if s["kind"] == "logpoint"]
+        self.assertEqual(len(shadowed), 1)
+        self.assertEqual(shadowed[0]["state"], "shadowed")
+        removed = self.cli(name, "breaks", "remove", "--break", "IdleAttach:10")
+        self.assertEqual([e["raw"] for e in removed["removed"]], ["IdleAttach:10"])
+        rearmed = [s for s in self.cli(name, "breaks")["stops"]
+                   if s["kind"] == "logpoint"]
+        self.assertEqual(len(rearmed), 1)
+        self.assertNotEqual(rearmed[0]["state"], "shadowed")
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+
+    def test_27_browser_remove_clear_and_identity(self):
+        """M2+M-I browser: tab identity in attach/status, add->remove,
+        reload never restores removed breaks, clear empties stops.json."""
+        chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        if not Path(chrome).exists():
+            self.skipTest("Chrome unavailable")
+
+        class QuietHandler(http.server.SimpleHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+        handler = functools.partial(QuietHandler, directory=str(ROOT / "examples/browser-demo"))
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.shutdown)
+        self.addCleanup(httpd.server_close)
+        cdp_port = free_port()
+        url = f"http://127.0.0.1:{httpd.server_port}/index.html"
+        proc = subprocess.Popen(
+            [chrome, "--headless", "--disable-gpu", "--no-first-run",
+             f"--remote-debugging-port={cdp_port}",
+             f"--user-data-dir={self.home}/m2rchrome", url],
+            stdout=self.log, stderr=self.log)
+        self.addCleanup(proc.terminate)
+        deadline = time.monotonic() + 20
+        while True:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{cdp_port}/json/list", timeout=1) as response:
+                    if any(t.get("url") == url for t in json.load(response)):
+                        break
+            except OSError:
+                pass
+            if time.monotonic() > deadline:
+                self.fail("Chrome did not expose test tab")
+            time.sleep(.1)
+        name = "m2r-browser"
+        self.sessions.add(name)
+        data = self.cli(name, "browser", "attach", "--port", str(cdp_port), "--tab", url,
+                        "--break", "app.js:8")
+        observed = data["observedTarget"]
+        self.assertEqual(observed["kind"], "tab")
+        self.assertEqual(observed["url"], url)
+        self.assertTrue(observed["targetId"])
+        self.assertEqual(observed["debugEndpoint"], f"localhost:{cdp_port}")
+        self.assertIn("cwd", observed["notApplicable"])
+        self.assertIn("argv", observed["notApplicable"])
+        row = next(r for r in self.cli(name, "status")["sessions"] if r["name"] == name)
+        self.assertEqual(row["observedTarget"]["kind"], "tab")
+        self.assertEqual(row["observedTarget"]["url"], url)
+        self.assertEqual(row["requestedTarget"]["port"], cdp_port)
+        added = self.cli(name, "breaks", "add", "--break", "app.js:2")
+        self.assertEqual(len(added["added"]), 1)
+        removed = self.cli(name, "breaks", "remove", "--break", "app.js:8")
+        self.assertEqual([e["raw"] for e in removed["removed"]], ["app.js:8"])
+        # Reload lands on the surviving break, never the removed one.
+        stop = self.cli(name, "reload", "--timeout", "10")
+        self.assertEqual(stop["snapshot"]["location"]["line"], 2)
+        stops_file = self.home / ".agent-debugger/sessions" / name / "stops.json"
+        self.assertEqual(json.loads(stops_file.read_text())["breaks"], ["app.js:2"])
+        cleared = self.cli(name, "breaks", "clear")
+        self.assertEqual([e["raw"] for e in cleared["removed"]], ["app.js:2"])
+        self.assertEqual(json.loads(stops_file.read_text())["breaks"], [])
+        # No breaks armed: reload returns fast instead of burning the timeout.
+        quick = self.cli(name, "reload", "--timeout", "10")
+        self.assertTrue(quick.get("reloaded"))
+        self.assertTrue(self.cli(name, "close")["confirmed"])
+        self.sessions.remove(name)
+
+    def test_28_py_child_popen_targeting_and_breaks(self):
+        """M3/Batch2 Python: Popen child is a visible, addressable target.
+        Child-only startup break parks the child (auto-select); context/
+        eval/continue route by target; global intent inherits; ephemeral
+        target breaks skip stops.json; scoped/global/clear removals obey
+        scope; close reaps the tree."""
+        self._ensure_idle_fixtures()
+        child = self.fixture / "b2_child.py"
+        child.write_text(
+            "import time\nfor i in range(200):\n    tick = i * 2\n"
+            "    print(f\"child tick {tick}\", flush=True)\n    time.sleep(0.2)\n")
+        parent = self.fixture / "b2_parent.py"
+        parent.write_text(
+            "import subprocess, sys, os, time\n"
+            "here = os.path.dirname(os.path.abspath(__file__))\n"
+            "p = subprocess.Popen([sys.executable, os.path.join(here, \"b2_child.py\")])\n"
+            "print(\"parent spawned\", p.pid, flush=True)\n"
+            "for i in range(200):\n"
+            "    print(f\"parent {i}\", flush=True)\n    time.sleep(0.2)\n"
+            "p.wait()\n")
+        name = "b2t28-py-child"
+        self.sessions.add(name)
+        try:
+            start = self.cli(name, "py", "start", "--subprocess", str(parent),
+                             "--break", f"{child}:4", "--timeout", "40")
+            self.assertTrue(start["target"].startswith("child:"))
+            self.assertEqual(start["location"]["line"], 4)
+            child_id = start["target"]
+            roster = self.cli(name, "targets")
+            ids = [t["id"] for t in roster["targets"]]
+            self.assertIn("main", ids)
+            self.assertIn(child_id, ids)
+            entry = next(t for t in roster["targets"] if t["id"] == child_id)
+            self.assertEqual(entry["kind"], "child")
+            self.assertEqual(entry["state"], "stopped")
+            self.assertEqual(entry["observed"]["source"], "debugpy-subProcessId")
+            self.assertEqual(entry["scope"], "inherited")
+            self.assertEqual(roster["selected"], child_id)
+            # Targetless commands auto-select the parked child.
+            ctx = self.cli(name, "context")
+            self.assertEqual(ctx["target"], child_id)
+            self.assertEqual(ctx["location"]["line"], 4)
+            self.assertEqual(self.cli(name, "eval", "tick")["value"], "0")
+            cont = self.cli(name, "continue", "--timeout", "15")
+            self.assertEqual(cont["target"], child_id)
+            # Global add inherits onto the child; ephemeral does not persist.
+            added = self.cli(name, "breaks", "add", "--break", f"{parent}:7")
+            self.assertEqual(added["target"], "main")
+            live = self.cli(name, "breaks")["stops"]
+            self.assertTrue(any(s.get("target") == child_id and s["spec"].endswith("b2_parent.py:7")
+                                for s in live))
+            stops_file = self.home / ".agent-debugger/sessions" / name / "stops.json"
+            before = json.loads(stops_file.read_text())["breaks"]
+            eph = self.cli(name, "breaks", "add", "--break", f"{child}:5",
+                           "--target", child_id)
+            self.assertEqual(eph["target"], child_id)
+            self.assertEqual(json.loads(stops_file.read_text())["breaks"], before)
+            rm = self.cli(name, "breaks", "remove", "--break", f"{child}:5",
+                          "--target", child_id)
+            self.assertEqual(rm["target"], child_id)
+            # Unknown targets fail explicitly.
+            bad = self.cli(name, "context", "--target", "child:999999999", ok=False)
+            self.assertIn("unknown target", bad["error"])
+            # Global remove drops the intent plus the inherited copy.
+            self.cli(name, "breaks", "remove", "--break", f"{parent}:7")
+            live = self.cli(name, "breaks")["stops"]
+            self.assertFalse(any(s["spec"].endswith("b2_parent.py:7") for s in live))
+            cleared = self.cli(name, "breaks", "clear")
+            self.assertEqual(cleared["target"], "main")
+            self.assertEqual(self.cli(name, "breaks")["stops"], [])
+            self.assertTrue(self.cli(name, "close")["confirmed"])
+            self.sessions.remove(name)
+        finally:
+            if name in self.sessions:
+                try:
+                    self.cli(name, "close", timeout=85)
+                except Exception:
+                    pass
+                self.sessions.remove(name)
+
+    def test_29_py_child_spawn_fork_overflow(self):
+        """M3/Batch2 Python: multiprocessing spawn workers are tracked (the
+        resource_tracker shim is skipped without budget); os.fork children
+        attach; 9 children overflow to ignored+released; exits reconcile
+        without killing the session."""
+        self._ensure_idle_fixtures()
+        mp = self.fixture / "b2_mp.py"
+        mp.write_text(
+            "import multiprocessing as mp\nimport time\n\n"
+            "def worker(n):\n    total = n * 3\n"
+            "    print(f\"mp worker total {total}\", flush=True)\n    time.sleep(15)\n\n"
+            "def main():\n    ctx = mp.get_context(\"spawn\")\n"
+            "    w = ctx.Process(target=worker, args=(1,))\n    w.start()\n"
+            "    print(\"mp parent started\", flush=True)\n    w.join()\n\n"
+            "if __name__ == \"__main__\":\n    main()\n")
+        name = "b2t29-py-spawn"
+        self.sessions.add(name)
+        try:
+            start = self.cli(name, "py", "start", "--subprocess", str(mp),
+                             "--break", f"{mp}:5", "--timeout", "60")
+            self.assertTrue(start["target"].startswith("child:"))
+            roster = self.cli(name, "targets")
+            live = [t for t in roster["targets"] if t["state"] in ("running", "stopped")]
+            self.assertGreaterEqual(len(live), 2)  # main + at least one worker
+            kinds = {t["kind"] for t in roster["targets"]}
+            self.assertIn("child", kinds)
+            self.assertGreaterEqual(roster.get("helpersReleased", 0), 1)
+            self.assertTrue(self.cli(name, "close")["confirmed"])
+            self.sessions.remove(name)
+        finally:
+            if name in self.sessions:
+                try:
+                    self.cli(name, "close", timeout=85)
+                except Exception:
+                    pass
+                self.sessions.remove(name)
+        if not hasattr(__import__("os"), "fork"):
+            self.skipTest("os.fork unavailable")
+        fork = self.fixture / "b2_fork.py"
+        fork.write_text(
+            "import os, time\nprint(\"fork parent ready\", flush=True)\n"
+            "pid = os.fork()\nif pid == 0:\n"
+            "    print(\"fork child here\", flush=True)\n    time.sleep(12)\n"
+            "    os._exit(0)\n"
+            "print(f\"fork parent spawned {pid}\", flush=True)\n"
+            "time.sleep(15)\nos.waitpid(pid, 0)\n")
+        name = "b2t29-py-fork"
+        self.sessions.add(name)
+        try:
+            start = self.cli(name, "py", "start", "--subprocess", str(fork),
+                             "--break", f"{fork}:5", "--timeout", "40")
+            self.assertTrue(start["target"].startswith("child:"))
+            self.assertTrue(self.cli(name, "close")["confirmed"])
+            self.sessions.remove(name)
+        finally:
+            if name in self.sessions:
+                try:
+                    self.cli(name, "close", timeout=85)
+                except Exception:
+                    pass
+                self.sessions.remove(name)
+        many = self.fixture / "b2_many.py"
+        kids = "".join(
+            "p = subprocess.Popen([sys.executable, \"-c\",\n"
+            f"                      \"import time; print('kid{i} go', flush=True); time.sleep(20)\"])\n"
+            "procs.append(p)\n" for i in range(9))
+        many.write_text(
+            "import subprocess, sys, os, time\n"
+            "here = os.path.dirname(os.path.abspath(__file__))\nprocs = []\n"
+            f"{kids}"
+            "print(\"many parent spawned 9\", flush=True)\n"
+            "time.sleep(30)\nfor p in procs:\n    p.wait()\n")
+        parent_line = len(many.read_text().splitlines()) - 3
+        name = "b2t29-py-many"
+        self.sessions.add(name)
+        try:
+            start = self.cli(name, "py", "start", "--subprocess", str(many),
+                             "--break", f"{many}:{parent_line}", "--timeout", "45")
+            self.assertEqual(start["target"], "main")
+            deadline = time.monotonic() + 60
+            roster = None
+            while time.monotonic() < deadline:
+                roster = self.cli(name, "targets")
+                act = [t for t in roster["targets"]
+                       if t["id"] != "main" and t["state"] in ("running", "stopped")]
+                if len(act) >= 8 and roster["ignored"] >= 1:
+                    break
+                time.sleep(2)
+            self.assertGreaterEqual(len(act), 8)
+            self.assertGreaterEqual(roster["ignored"], 1)
+            self.assertLessEqual(len(act), 8)
+            # Progress, not just presence: every kid (tracked or ignored)
+            # runs free and reaps on its own — nothing hangs parked.
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                gone = subprocess.run(
+                    ["pgrep", "-f", "kid[0-8] go"],
+                    capture_output=True, text=True, timeout=10)
+                if gone.returncode != 0:
+                    break
+                time.sleep(3)
+            else:
+                self.fail("spawned kids never reaped")
+            self.assertTrue(self.cli(name, "close")["confirmed"])
+            self.sessions.remove(name)
+        finally:
+            if name in self.sessions:
+                try:
+                    self.cli(name, "close", timeout=85)
+                except Exception:
+                    pass
+                self.sessions.remove(name)
+
+    def test_30_node_worker_targeting_and_breaks(self):
+        """M4/Batch2 Node: worker_threads are visible, addressable targets.
+        Worker-only startup break parks the worker (hitBreakpoints truth,
+        even with reason other); context/eval/step/continue route by
+        target; global intent inherits; ephemeral worker breaks skip
+        stops.json; scoped/global/clear removals obey scope; natural exit
+        reconciles; close reaps."""
+        self._ensure_idle_fixtures()
+        prog = self.fixture / "b2_worker.js"
+        prog.write_text(
+            "const { Worker, isMainThread, workerData } = require('worker_threads');\n"
+            "if (isMainThread) {\n"
+            "  const w = new Worker(__filename, { workerData: { n: 21 } });\n"
+            "  w.on('message', (m) => console.log(\"main got\", m));\n"
+            "  setInterval(() => console.log(\"main tick\"), 2000);\n"
+            "} else {\n"
+            "  const result = workerData.n * 2;\n"
+            "  for (let i = 0; i < 40; i++) {\n"
+            "    const dbl = result + i;\n"
+            "    require('worker_threads').parentPort.postMessage(dbl);\n"
+            "    const t = Date.now(); while (Date.now() - t < 500);\n"
+            "  }\n"
+            "}\n")
+        name = "b2t30-node-worker"
+        self.sessions.add(name)
+        try:
+            start = self.cli(name, "node", "start", "--workers", str(prog),
+                             "--break", f"{prog}:10", "--timeout", "40")
+            self.assertTrue(start["target"].startswith("worker:"))
+            wid = start["target"]
+            roster = self.cli(name, "targets")
+            entry = next(t for t in roster["targets"] if t["id"] == wid)
+            self.assertEqual(entry["kind"], "worker")
+            self.assertEqual(entry["state"], "stopped")
+            self.assertEqual(entry["scope"], "inherited")
+            self.assertTrue((entry["observed"] or {}).get("url", "").endswith("b2_worker.js"))
+            self.assertEqual(roster["selected"], wid)
+            self.assertEqual(self.cli(name, "eval", "result", "--target", wid)["value"], "42")
+            step = self.cli(name, "step", "over", "--target", wid, "--timeout", "15")
+            self.assertEqual(step["target"], wid)
+            added = self.cli(name, "breaks", "add", "--break", f"{prog}:4")
+            self.assertEqual(added["target"], "main")
+            live = self.cli(name, "breaks")["stops"]
+            self.assertTrue(any(s.get("target") == wid and s["spec"].endswith("b2_worker.js:4")
+                                for s in live))
+            stops_file = self.home / ".agent-debugger/sessions" / name / "stops.json"
+            before = json.loads(stops_file.read_text())["breaks"]
+            eph = self.cli(name, "breaks", "add", "--break", f"{prog}:11",
+                           "--target", wid)
+            self.assertEqual(eph["target"], wid)
+            self.assertEqual(json.loads(stops_file.read_text())["breaks"], before)
+            bad = self.cli(name, "context", "--target", "worker:missing", ok=False)
+            self.assertIn("unknown target", bad["error"])
+            self.cli(name, "breaks", "remove", "--break", f"{prog}:10")
+            live = self.cli(name, "breaks")["stops"]
+            self.assertFalse(any(s["spec"].endswith("b2_worker.js:10") for s in live))
+            self.cli(name, "breaks", "clear")
+            self.assertEqual(self.cli(name, "breaks")["stops"], [])
+            # Let the worker run out, then prove independent exit + reap.
+            cont = self.cli(name, "continue", "--target", wid, "--timeout", "50",
+                            timeout=70, ok=False)
+            roster = self.cli(name, "targets")
+            states = {t["id"]: t["state"] for t in roster["targets"]}
+            self.assertEqual(states.get(wid), "exited")
+            self.assertEqual(states.get("main"), "running")
+            _ = cont
+            self.assertTrue(self.cli(name, "close")["confirmed"])
+            self.sessions.remove(name)
+        finally:
+            if name in self.sessions:
+                try:
+                    self.cli(name, "close", timeout=85)
+                except Exception:
+                    pass
+                self.sessions.remove(name)
+
+    def test_31_node_worker_overflow_progress(self):
+        """M4/Batch2 Node: 9 workers overflow to 8 tracked + 1 ignored; the
+        ignored worker is kicked (resume + run gate) so it RUNS and EXITS on
+        its own — assert it reaches exited history, not just the roster
+        count (a released-but-hung worker would never retire)."""
+        self._ensure_idle_fixtures()
+        prog = self.fixture / "b2_wmany.js"
+        prog.write_text(
+            "const { Worker, isMainThread } = require('worker_threads');\n"
+            "if (isMainThread) {\n"
+            "  for (let i = 0; i < 9; i++) {\n"
+            "    new Worker(__filename);\n"
+            "  }\n"
+            "  console.log(\"wmain spawned 9\");\n"
+            "  setInterval(() => console.log(\"main tick\"), 2000);\n"
+            "} else {\n"
+            "  const t = Date.now(); while (Date.now() - t < 8000);\n"
+            "}\n")
+        name = "b2t31-node-overflow"
+        self.sessions.add(name)
+        try:
+            start = self.cli(name, "node", "start", "--workers", str(prog),
+                             "--break", f"{prog}:6", "--timeout", "40")
+            self.assertEqual(start["target"], "main")
+            deadline = time.monotonic() + 60
+            roster = None
+            ignored_id = None
+            while time.monotonic() < deadline:
+                roster = self.cli(name, "targets")
+                act = [t for t in roster["targets"]
+                       if t["id"] != "main" and t["state"] in ("running", "stopped")]
+                ign = [t for t in roster["targets"] if t["state"] == "ignored"]
+                if len(act) >= 8 and len(ign) >= 1 and roster["ignored"] >= 1:
+                    ignored_id = ign[0]["id"]
+                    break
+                time.sleep(2)
+            self.assertIsNotNone(ignored_id, "expected 8 tracked + 1 ignored")
+            self.assertLessEqual(len(act), 8)
+            # Progress, not just presence: the kicked worker runs out and
+            # retires to exited history on its own.
+            deadline = time.monotonic() + 90
+            retired = False
+            while time.monotonic() < deadline:
+                roster = self.cli(name, "targets")
+                if any(t["id"] == ignored_id and t["state"] == "exited"
+                       for t in roster["targets"]):
+                    retired = True
+                    break
+                time.sleep(3)
+            self.assertTrue(retired, f"ignored {ignored_id} never exited")
+            self.assertTrue(self.cli(name, "close")["confirmed"])
+            self.sessions.remove(name)
+        finally:
+            if name in self.sessions:
+                try:
+                    self.cli(name, "close", timeout=85)
+                except Exception:
+                    pass
+                self.sessions.remove(name)
 
     def _m1_target(self, lang, port):
         if lang == "py":

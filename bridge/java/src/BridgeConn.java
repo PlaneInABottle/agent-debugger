@@ -220,6 +220,12 @@ class BridgeConn {
             for (Location loc : locs) {
                 BreakpointRequest bp = vm.eventRequestManager().createBreakpointRequest(loc);
                 bp.setSuspendPolicy(policy);
+                if (!singleLoc) {
+                    // Line-break tag (logpoints plant untagged): remove/clear
+                    // deletes exactly our line plants, never method breaks
+                    // or logpoints sharing the line.
+                    bp.putProperty("agent-debugger-break", rt.name() + ":" + line);
+                }
                 bp.enable();
                 if (singleLoc) break;
             }

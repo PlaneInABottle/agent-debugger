@@ -6,8 +6,10 @@ import java.util.List;
 /** M4 unit parity for the Java bridge (no JUnit on this path — plain
  *  asserts, nonzero exit on failure). Covers: log ring keeps the latest
  *  2000 physical lines with dropped accounting, multiline flattening,
- *  atomic state writes (no torn reads, no temp leftovers), and the
- *  sanitized unexpected-crash payload (capped, no env).
+ *  atomic state writes (no torn reads, no temp leftovers), the
+ *  sanitized unexpected-crash payload (capped, no env), and the
+ *  multi-target uniformity rule (java rejects `targets`; the CLI serves
+ *  the main-only roster and rejects foreign target ids).
  *
  *  Compile: javac -cp <bridge classes> -d <out> tests/M4JavaCheck.java
  *  Run:     java -cp <bridge classes>:<out> M4JavaCheck
@@ -87,6 +89,31 @@ public class M4JavaCheck {
         check(msg.startsWith("internal: IllegalStateException:"), "sanitized prefix + class");
         check(msg.length() <= 2048, "sanitized payload capped (got " + msg.length() + ")");
         check(!msg.contains("HOME=") && !msg.contains("PATH="), "no env in payload");
+
+        // 6. Remove/clear warning contract: at most one warning, fixed order.
+        check(BridgeSession.removeWarning(false, java.util.Collections.emptyList()) == null,
+                "no warning when nothing failed");
+        check(BridgeSession.removeWarning(true, java.util.Collections.emptyList())
+                .equals("partial remove: some breaks kept"), "partial-only warning");
+        check(BridgeSession.removeWarning(false, java.util.Collections.singletonList("logpoint C:1 re-arm failed: x"))
+                .equals("re-arm: logpoint C:1 re-arm failed: x"), "rearm-only warning");
+        check(BridgeSession.removeWarning(true, java.util.Collections.singletonList("r"))
+                .equals("partial remove: some breaks kept; re-arm: r"),
+                "combined warning is one string, partial first");
+
+        // 7. Multi-target uniformity is Rust-owned: the Java bridge
+        // rejects `targets` (and never silently serves a foreign target
+        // id) — the CLI serves the main-only roster without contacting it.
+        boolean rejected = false;
+        try {
+            SessionState stx = new SessionState();
+            stx.dir = tmp;
+            stx.cfg = new Config();
+            BridgeSession.dispatch(stx, "{\"cmd\":\"targets\"}");
+        } catch (Exception e) {
+            rejected = String.valueOf(e.getMessage()).contains("unknown cmd");
+        }
+        check(rejected, "java bridge rejects targets (Rust serves the main-only roster)");
 
         if (failures > 0) {
             System.out.println(failures + " FAILURE(S)");

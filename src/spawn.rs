@@ -17,8 +17,10 @@ pub(super) enum Target<'a> {
         port: u16,
     },
     PyLaunch {
-        program: &'a str,
+        program: Option<&'a str>,
+        module: Option<&'a str>,
         python: Option<&'a str>,
+        subprocess: bool,
     },
     PyAttach {
         host: &'a str,
@@ -27,6 +29,7 @@ pub(super) enum Target<'a> {
     NodeLaunch {
         program: &'a str,
         node: Option<&'a str>,
+        workers: bool,
     },
     NodeAttach {
         host: &'a str,
@@ -49,6 +52,11 @@ pub(super) fn cmd_spawn(
 ) -> anyhow::Result<Value> {
     // Empty breaks allowed: thread dumps and log collection need no stop.
     // Commands needing a stop fail gracefully until one arrives.
+    // Identity first: both builders only borrow the target; the args match
+    // below moves it.
+    let requested = requested_target(&target, kind);
+    let observed = observed_target(&target);
+    let observed_hint = session::compact_hint(&observed);
     let mut args: Vec<String> = Vec::new();
     match target {
         Target::JavaLaunch { main, classpath } => {
@@ -63,12 +71,36 @@ pub(super) fn cmd_spawn(
             args.push("--port".to_string());
             args.push(port.to_string());
         }
-        Target::PyLaunch { program, python } => {
-            args.push("--program".to_string());
-            args.push(program.to_string());
+        Target::PyLaunch {
+            program,
+            module,
+            python,
+            subprocess,
+        } => {
+            // Exactly one of file/program and dotted module, checked before
+            // any target runs (clap already rejects both; neither is a
+            // dispatch-level fail-fast here).
+            match (program, module) {
+                (Some(p), None) => {
+                    args.push("--program".to_string());
+                    args.push(p.to_string());
+                }
+                (None, Some(m)) => {
+                    check_module(m)?;
+                    args.push("--module".to_string());
+                    args.push(m.to_string());
+                }
+                _ => anyhow::bail!(
+                    "py start needs exactly one of PROGRAM and --module \
+                     (got neither or both)"
+                ),
+            }
             if let Some(py) = python {
                 args.push("--python".to_string());
                 args.push(py.to_string());
+            }
+            if subprocess {
+                args.push("--subprocess".to_string());
             }
         }
         Target::PyAttach { host, port } => {
@@ -77,12 +109,19 @@ pub(super) fn cmd_spawn(
             args.push("--port".to_string());
             args.push(port.to_string());
         }
-        Target::NodeLaunch { program, node } => {
+        Target::NodeLaunch {
+            program,
+            node,
+            workers,
+        } => {
             args.push("--program".to_string());
             args.push(program.to_string());
             if let Some(n) = node {
                 args.push("--node".to_string());
                 args.push(n.to_string());
+            }
+            if workers {
+                args.push("--workers".to_string());
             }
         }
         Target::NodeAttach { host, port } => {
@@ -142,6 +181,7 @@ pub(super) fn cmd_spawn(
         "sources": stops.source_paths,
         "timeout": stops.timeout,
         "target": session::target_summary(&args),
+        "requestedTarget": requested.clone(),
     });
 
     session::spawn(
@@ -152,6 +192,194 @@ pub(super) fn cmd_spawn(
             bridge_args: args,
             wait_secs: stops.timeout.saturating_add(10),
             stops: intent,
+            requested,
+            observed,
+            observed_hint,
         },
     )
+}
+
+/// Module names run as `python -m`: dotted ASCII identifiers validated
+/// before the target runs (each segment `[A-Za-z_][A-Za-z0-9_]*`).
+fn check_module(module: &str) -> anyhow::Result<()> {
+    let ok = !module.is_empty()
+        && module.split('.').all(|seg| {
+            let mut chars = seg.chars();
+            matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+    if ok {
+        Ok(())
+    } else {
+        anyhow::bail!("bad --module '{module}' (want dotted.name like mypkg.mod)")
+    }
+}
+
+/// WHAT the user asked to attach/launch (endpoint + CLI flags). Never an
+/// observation: `pid` stays null (v1 has no pid input; reserved), and the
+/// requested value is never presented as observed.
+fn requested_target(target: &Target<'_>, kind: &str) -> Value {
+    let _ = kind;
+    match target {
+        Target::JavaLaunch { main, classpath } => json!({
+            "main": main,
+            "classpath": classpath.unwrap_or("."),
+            "pid": Value::Null,
+        }),
+        Target::JavaAttach { host, port } => json!({
+            "host": host, "port": port, "pid": Value::Null,
+        }),
+        Target::PyLaunch {
+            program,
+            module,
+            python,
+            subprocess,
+        } => {
+            let mut m = serde_json::Map::new();
+            if let Some(p) = program {
+                m.insert("program".to_string(), Value::String(p.to_string()));
+            }
+            if let Some(mo) = module {
+                m.insert("module".to_string(), Value::String(mo.to_string()));
+            }
+            if let Some(py) = python {
+                m.insert("python".to_string(), Value::String(py.to_string()));
+            }
+            if *subprocess {
+                m.insert("subprocess".to_string(), Value::Bool(true));
+            }
+            m.insert("pid".to_string(), Value::Null);
+            Value::Object(m)
+        }
+        Target::PyAttach { host, port } => json!({
+            "host": host, "port": port, "pid": Value::Null,
+        }),
+        Target::NodeLaunch {
+            program,
+            node,
+            workers,
+        } => {
+            let mut m = serde_json::Map::new();
+            m.insert("program".to_string(), Value::String(program.to_string()));
+            m.insert(
+                "node".to_string(),
+                Value::String(node.unwrap_or("node").to_string()),
+            );
+            if *workers {
+                m.insert("workers".to_string(), Value::Bool(true));
+            }
+            m.insert("pid".to_string(), Value::Null);
+            Value::Object(m)
+        }
+        Target::NodeAttach { host, port } => json!({
+            "host": host, "port": port, "pid": Value::Null,
+        }),
+        Target::BrowserAttach { host, port, tab } => json!({
+            "host": host, "port": port,
+            "tab": tab.map(|t| Value::String(t.to_string())).unwrap_or(Value::Null),
+            "pid": Value::Null,
+        }),
+    }
+}
+
+/// Bridge-observed identity for process targets, computed CLI-side from
+/// bounded OS-native sources (never target eval, never env):
+/// launch argv/cwd from our own spawn, attach pid/exe/argv/cwd via a
+/// localhost port lookup. Browser identity comes from the bridge's
+/// `/json/list` entry instead (no process claim here).
+fn observed_target(target: &Target<'_>) -> Value {
+    match target {
+        Target::PyLaunch {
+            program,
+            module,
+            python,
+            subprocess: _,
+        } => {
+            let exe = python.unwrap_or("python3");
+            let mut argv = vec![exe.to_string()];
+            match (program, module) {
+                (Some(p), _) => argv.push(p.to_string()),
+                (_, Some(m)) => {
+                    argv.push("-m".to_string());
+                    argv.push(m.to_string());
+                }
+                _ => {}
+            }
+            session::launch_observed(exe, argv, "launcher-args")
+        }
+        Target::NodeLaunch {
+            program,
+            node,
+            workers: _,
+        } => session::launch_observed(
+            node.unwrap_or("node"),
+            vec![node.unwrap_or("node").to_string(), program.to_string()],
+            "launcher-args",
+        ),
+        Target::JavaLaunch { main, classpath } => session::launch_observed(
+            "java",
+            vec![
+                "java".to_string(),
+                "-cp".to_string(),
+                classpath.unwrap_or(".").to_string(),
+                main.to_string(),
+            ],
+            "launcher-args",
+        ),
+        Target::PyAttach { host, port }
+        | Target::NodeAttach { host, port }
+        | Target::JavaAttach { host, port } => session::attach_observed(host, *port),
+        Target::BrowserAttach { .. } => Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_names_validate_before_target_runs() {
+        for ok in ["mod", "mypkg.mod", "_a.b2.C3", "pytest"] {
+            assert!(check_module(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "", ".mod", "mod.", "a..b", "a-b", "a b", "9lives", "mod/sub", "mödule",
+        ] {
+            assert!(check_module(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn requested_target_never_carries_a_pid() {
+        let v = requested_target(
+            &Target::PyAttach {
+                host: "localhost",
+                port: 5678,
+            },
+            "attach",
+        );
+        assert_eq!(v["port"], json!(5678));
+        assert!(v["pid"].is_null());
+        let v = requested_target(
+            &Target::PyLaunch {
+                program: None,
+                module: Some("m"),
+                python: None,
+                subprocess: false,
+            },
+            "launch",
+        );
+        assert_eq!(v["module"], json!("m"));
+        assert!(v.get("program").is_none());
+        assert!(v["pid"].is_null());
+        let v = requested_target(
+            &Target::BrowserAttach {
+                host: "h",
+                port: 9222,
+                tab: Some("shop"),
+            },
+            "attach",
+        );
+        assert_eq!(v["tab"], json!("shop"));
+    }
 }

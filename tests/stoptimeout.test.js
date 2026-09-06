@@ -11,7 +11,8 @@ test('StopTimeout is a typed BridgeErr subclass', () => {
 });
 
 test('first-stop pump throws the typed timeout, not a generic error', () => {
-  assert.match(SRC, /throw new StopTimeout\(`timeout: no stop within/);
+  assert.match(SRC, /throw new StopTimeout\(this\.timeoutText\(timeout\)\)/);
+  assert.match(SRC, /timeout: no stop within \$\{fmtTimeout\(timeout\)\}/);
 });
 
 test('attach-only fallback is checked before generic error handling', () => {

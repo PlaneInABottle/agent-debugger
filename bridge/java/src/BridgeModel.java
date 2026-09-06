@@ -28,6 +28,9 @@ class Config {
         Map<String, List<String>> methodBreaks = new LinkedHashMap<>();
         List<String> excFilters = new ArrayList<>();
         Map<String, String> condByLoc = new LinkedHashMap<>(); // "cls:line" -> condition
+        Map<String, String> breakRaws = new LinkedHashMap<>(); // "cls:line|cond" -> stored raw (remove/clear echo)
+        String observedTargetJson = null; // redacted CLI-observed identity (verbatim JSON)
+        String observedHint = ""; // one-line redacted diagnostic hint
         List<Logpoint> logpoints = new ArrayList<>();
         List<Watchpoint> watchpoints = new ArrayList<>();
         Map<String, List<String>> exitMethods = new LinkedHashMap<>(); // cls -> methods
@@ -61,9 +64,17 @@ class SessionState {
         ServerSocket server;
         ThreadReference thread;
         Location location;
-        // All session state is owned by the single serving/event thread.
+        // M5: sessionLock serializes ALL session-state access and every JDI
+        // call (JDI objects are touched only while holding it). It is NEVER
+        // held across blocking waits (eventQueue.remove, accept, socket IO),
+        // so live reads stay prompt while a resume is outstanding.
+        final Object sessionLock = new Object();
+        // All session state below is owned by sessionLock holders.
         boolean suspended;
         boolean exited;
+        String outstanding = null; // resume cmd in flight (continue/step)
+        int activeHandlers = 0;    // live connection handlers (bounded)
+        volatile boolean closing = false; // close accepted: further cmds fail fast
         Map<String, String> lastTop; // top-frame locals at previous stop
         String lastChanged = "[]"; // JSON array of new/changed local names
         String stopInfo; // JSON object describing WHY we stopped (watch/exit/exception)
@@ -74,5 +85,26 @@ class SessionState {
         String ownerNonce; // session ownership token (see amOwner)
         String lastStopJson; // pre-rendered {"file","line","method"}, null until first stop
         Map<String, Integer> hitCounts = new java.util.HashMap<>(); // hit-key -> stops fired (served by `breaks`)
+        // -- stop diagnostics (UX batch): session-monotonic stop id plus the
+        // previous park for same-location/same-thread diagnosis. Owned by
+        // sessionLock holders, like every field above.
+        long stopDiagSeq = 0; // session-monotonic stop id
+        String prevParkFile = null; // previous park file (rel form), null until first park
+        int prevParkLine = -1; // previous park line
+        long prevParkThreadId = -1; // previous park thread uniqueId
+        long prevParkAtMs = 0; // previous park wall clock
+        String stopReason = null; // reason of the current park (breakpoint/step/exception/watch/exit)
+        long parkedAtMs = 0; // wall clock ms of the current park
+        long lastStopId = 0; // stopId of the current park
+        boolean lastSameLoc = false; // same file+line as the previous park
+        boolean lastSameThread = false; // same thread+target as the previous park
+        Long lastElapsedMs = null; // ms since the previous park (null before the second)
+        // -- capture ephemeral (UX batch): one line-only break, target-scoped,
+        // never in cfg intent (no stops.json, no inheritance). Set while a
+        // capture waits, cleared by unplant BEFORE resume (or on timeout).
+        // hasStoppingBreak/countBreakHit consult it alongside cfg.
+        String captureCls = null;
+        int captureLine = -1;
+        String captureCond = null;
     }
 class CloseSession extends Exception {}

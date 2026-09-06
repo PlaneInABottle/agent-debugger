@@ -25,12 +25,20 @@ import java.util.Map;
 class BridgeSnapshot {
     static String snapshot(VirtualMachine vm, Config cfg, ThreadReference thread,
             Location loc, StreamGobbler out, StreamGobbler err) throws Exception {
+        return snapshotBounded(vm, cfg, thread, loc, out, err,
+                JdiBridge.MAX_FRAMES, JdiBridge.MAX_VARS);
+    }
+
+    /** Bounded snapshot for capture (frames 1..10, frame-0 vars 1..20). */
+    static String snapshotBounded(VirtualMachine vm, Config cfg, ThreadReference thread,
+            Location loc, StreamGobbler out, StreamGobbler err,
+            int maxFrames, int maxVars) throws Exception {
         StringBuilder sb = new StringBuilder(4096);
         sb.append('{');
         JdiBridge.kv(sb, "mode", cfg.mode, true);
         sb.append(",\"location\":").append(locationJson(loc, cfg));
         sb.append(",\"threads\":").append(threadsJson(vm, thread));
-        sb.append(",\"frames\":").append(framesJson(thread, true));
+        sb.append(",\"frames\":").append(framesJsonBounded(thread, true, maxFrames, maxVars));
         if (out != null || err != null) sb.append(",\"output\":").append(JdiBridge.quote(combinedOutput(out, err)));
         sb.append('}');
         return sb.toString();
@@ -127,9 +135,16 @@ class BridgeSnapshot {
      */
 
     static String framesJson(ThreadReference thread, boolean withLocals) {
+        return framesJsonBounded(thread, withLocals, JdiBridge.MAX_FRAMES, JdiBridge.MAX_VARS);
+    }
+
+    /** Bounded frame listing for capture (frames 1..10, frame-0 vars 1..20).
+     *  Depth and string caps reuse the existing formatValue rules. */
+    static String framesJsonBounded(ThreadReference thread, boolean withLocals,
+            int maxFrames, int maxVars) {
         List<StackFrame> frames = safeFrames(thread);
         StringBuilder sb = new StringBuilder("[");
-        for (int i = 0; i < Math.min(frames.size(), JdiBridge.MAX_FRAMES); i++) {
+        for (int i = 0; i < Math.min(frames.size(), maxFrames); i++) {
             if (i > 0) sb.append(',');
             StackFrame f = frames.get(i);
             sb.append("{\"index\":").append(i).append(',');
@@ -143,13 +158,18 @@ class BridgeSnapshot {
             sb.append(',');
             JdiBridge.kv(sb, "method", mname, true);
             sb.append(",\"line\":").append(fline);
-            if (withLocals && i == 0) sb.append(",\"locals\":").append(localsJson(f));
+            if (withLocals && i == 0) sb.append(",\"locals\":").append(localsJsonBounded(f, maxVars));
             sb.append('}');
         }
         return sb.append(']').toString();
     }
 
     static String localsJson(StackFrame f) {
+        return localsJsonBounded(f, JdiBridge.MAX_VARS);
+    }
+
+    /** Bounded locals listing for capture (vars 1..20). */
+    static String localsJsonBounded(StackFrame f, int maxVars) {
         StringBuilder sb = new StringBuilder("[");
         try {
             List<LocalVariable> vars = f.visibleVariables();
@@ -159,9 +179,9 @@ class BridgeSnapshot {
             entries.sort(Comparator.comparing(e -> e.getKey().name()));
             int n = 0;
             for (Map.Entry<LocalVariable, Value> ve : entries) {
-                if (n >= JdiBridge.MAX_VARS) {
-                    if (n == JdiBridge.MAX_VARS) sb.append(",{\"name\":\"…\",\"note\":"
-                            + JdiBridge.quote("+" + (vals.size() - JdiBridge.MAX_VARS) + " more") + "}");
+                if (n >= maxVars) {
+                    if (n == maxVars) sb.append(",{\"name\":\"…\",\"note\":"
+                            + JdiBridge.quote("+" + (vals.size() - maxVars) + " more") + "}");
                     n++;
                     continue;
                 }

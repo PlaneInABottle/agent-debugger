@@ -11,10 +11,10 @@ Node speaks raw CDP, no borrowed parts). You never install or open an
 editor.
 
 Target commands live under a language group (`java ...`, `py ...`,
-`node ...`); session commands (`continue step eval vars stack context
-threads breaks logs reload close`, plus `breaks add --break SPEC`) are
-language-agnostic and read the session's language themselves (`reload`
-is browser-only).
+`node ...`); session commands (`continue step wait capture eval vars
+stack context threads breaks logs reload close`, plus `breaks add
+--break SPEC`) are language-agnostic and read the session's language
+themselves (`reload` is browser-only).
 Output shapes are identical across languages: learn once.
 
 ## Core Workflow
@@ -79,8 +79,41 @@ agent-debugger --session cart context  # where it is parked (if stopped)
   persist to `stops.json`, so `status`/`breaks`/intent reconverge on their
    own. Duplicates are idempotent; a same-line different-condition (or a
    same-line logpoint on Java/Node/browser) rejects the whole batch atomically.
-  Never add while a `continue`/`step`/`reload` is still outstanding — the
-  command queues behind it, so park (or stay idle-running) first.
+- While a `continue`/`step`/`reload`/`wait`/`capture` is outstanding,
+  live reads (`threads`/`breaks`/`logs`/`targets`) answer immediately
+  from published state instead of queueing behind it — poll those, never
+  sleep. A second `continue`/`step`/`reload`/`wait`/`capture` or
+  breakpoint mutation on the SAME target is rejected at once with
+  `busy: <cmd> outstanding for <target>` (no silent queue); different
+  Python/Node targets proceed independently. A global `breaks
+  add/remove/clear` conflicts with any outstanding resume/wait/capture,
+  and `eval` is exclusive to its target while one is outstanding. `context`/
+  `vars`/`stack` only succeed on a currently parked target (never stale
+  frames); `close` is always accepted and settles the session type (launch
+  reaps, attach detaches).
+- Removing breaks: `breaks remove --break app.py:55` drops live line
+  breaks by stored identity (the source may be deleted or changed and
+  removal still works; a plain spec never removes a `|cond` record).
+  `breaks clear` drops every live line break (logpoints/watches/exits
+  untouched) and takes no args. Only confirmed removals leave
+  `stops.json`; unmatched specs report `missing` without failing, backend
+  failures keep the entries plus `failed[]`. Removing a Java break re-arms
+  a same-line shadowed logpoint (armed now, or deferred when the class is
+  not loaded); Node/browser do the same for startup-shadowed logpoints.
+  Reload never restores removed breaks.
+- Target identity: `start`/`attach` responses, `status` rows, and
+  `context` carry `requestedTarget` (what you asked: endpoint/flags, pid
+  always null — there is no pid input) and `observedTarget` (what the
+  bridge/OS independently saw: pid/executable/redacted argv/cwd plus
+  `source`, or structured `unavailable` entries when nothing independent
+  exists). Browser tabs report url/title/targetId/debugEndpoint instead
+  (cwd/argv are not applicable). argv is redacted (`--token` values and
+  `password`/`api-key`/`authorization` variants become `[redacted]`) and
+  capped before it is ever persisted or shown — raw command lines never
+  land in `session.json`/`stops.json`/logs/errors. Same file attached on
+  the wrong port is visible here: compare the observed pid/argv before
+  concluding the code is unreachable. `verified` still means "planted",
+  never "this code ran".
 - Delayed recipe: Java/Python/Node `attach --break` first waits up to
   `--timeout` for an immediate stop. If the line is not reached, it then
   returns a live running session with the breakpoint still armed (the
@@ -191,6 +224,61 @@ iterations cost zero LLM roundtrips.
 - Eval/vars/step need a stopped thread; on a running session they fail
   fast with "no stopped thread" instead of hanging.
 
+## Waiting Without Sleep (event-driven stops)
+
+Never `sleep 8; status; context` and never poll `status` in a loop. The
+bridges long-poll for you:
+
+- Safe recipe for request/mail/queue triggers (all four adapters):
+  `attach` with a short timeout (session stays running, break armed) →
+  trigger the request → `wait --timeout 20` (pure long-poll, NEVER
+  resumes; immediate success if already parked, typed
+  `timeout: no stop within Ns; <hint>` otherwise, session and intents
+  preserved) → inspect/`continue` promptly. A parked HTTP handler keeps
+  its connection open until you `continue`, a capture auto-resumes, or
+  you `close` (detach) — every parked response carries this `warning`.
+- `continue` resumes and then waits for the NEXT stop: after it wakes a
+  parked handler, the request completes, and the command itself reports
+  `timeout: no stop within Ns` when nothing else hits. That timeout
+  means "resumed, nothing more hit" — not a stuck request. Verify with
+  `threads` (running) instead of re-polling.
+- One-shot alternative: `capture --break SPEC --timeout 20` on the
+  running target plants an ephemeral line-only break (same parser as
+  `breaks add`, never persisted, never inherited), waits for the park,
+  collects a bounded snapshot (`--frames 1..10`, `--vars 1..20`),
+  removes the ephemeral BEFORE resuming, and auto-resumes within
+  `--pause-budget` (default 2000ms, max 10000ms; overrun still resumes,
+  then reports `budgetExceeded`). Response: `pauseDurationMs`,
+  `targetWasPaused`, `resumed` (+ `resumeError`/`removeError` when
+  degraded), `truncated`. On an already-parked target it collects
+  WITHOUT resuming (`targetWasPaused:true, resumed:false`) — it never
+  resumes a pre-existing park and never leaves a fresh command-caused
+  park suspended (collection/removal failure still resumes; timeout
+  never resumes). Capture carries no eval expression and captured
+  locals live only in the response. Browser capture does not survive a
+  reload (navigation drops it into a timeout, never a stale resume).
+- A logpoint (`--logpoint`) is the true no-park alternative (fires and
+  auto-resumes, never parks) but costs expression evaluation per hit;
+  use it for tracing, `wait`/`capture` for inspecting.
+- Suspend impact is real: while parked, a Java VM is fully suspended
+  (all threads) and a Node process holds its event loop — keep the park
+  short (inspect, then `continue` or let `capture` auto-resume) or the
+  parked request times out on the client side.
+- Same-line `continue` that stops immediately on the same line is
+  usually legitimate, not a stale replay: a loop re-hit, step re-entry,
+  another thread, an async continuation, or a slid plant. Diagnose,
+  don't assume: every stop/context/capture response carries additive
+  `diag` — session-monotonic `stopId`, `parkedAtMs`, stopping thread
+  `{id,name}`, `reason`, native `hitBreakpoints` when the adapter
+  reports them (null otherwise — never fabricated), attributed
+  `requestedBreak`/`boundLine`/`hitCount` when known (null when not),
+  `sameLocation`/`sameThread` vs the previous park, and
+  `elapsedSincePreviousStopMs`. A loop re-hit reads
+  `sameLocation:true` with `stopId+1` — expected, not a bug.
+- Omitted `--target` auto-selects at acceptance time (already-parked
+  target first); a fresh wait may be satisfied by the first stop on ANY
+  target and the response stamps the actual one.
+
 ## Speed Rules (measured)
 
 - Warm commands (`vars eval step context stack`) answer in ~10ms. Use them
@@ -245,6 +333,11 @@ iterations cost zero LLM roundtrips.
 - `py start app.py -- args` launches via an isolated venv (auto-created,
   debugpy auto-installed once). `py attach --port` connects to a target
   started with `python -m debugpy --listen PORT app.py`.
+- `py start --module mypkg.mod -- args` runs `python -m` instead of a file
+  (exactly one of the positional program and `--module`; the name is a
+  dotted identifier validated before anything runs). Module resolution is
+  debugpy's, from the target cwd (your CLI cwd) — run from the package
+  root. File launch is unchanged.
 - `py attach --break ...` is not instant: it waits up to `--timeout` for the
   first hit, then returns running with the break still armed if nothing has
   hit. For a mail/job/request you will trigger later, use a short timeout
@@ -269,6 +362,32 @@ iterations cost zero LLM roundtrips.
 - justMyCode is always on: stdlib/site-packages frames are skipped.
 - Startup banners never pollute `logs`; module-frame vars resolve via
   Globals fallback.
+- Subprocesses: opt-in multi-target via `py start --subprocess` (default
+  stays main-only; `attach` never follows children). `subprocess.Popen`,
+  `multiprocessing` spawn, and `os.fork` children are addressable targets
+  (see Targets below). The `resource_tracker` daemon is skipped without
+  budget. Over-budget children are released (never parked, app never
+  hangs); the parent's exit never marks live children exited.
+
+## Targets (Python child / Node worker)
+
+- `targets` lists the roster: `{id, kind: main|child|worker, pid,
+  state: running|stopped|exited|ignored, lastStop, observed, scope}` plus
+  `selected`/`ignored`/`droppedExited`. Ids are opaque (`child:<pid>`,
+  `worker:<sessionId>`), never reused. Max 8 live non-main targets + 16
+  exited history.
+- Every served response names its `"target"` (no silent rerouting).
+  Targetless `context`/`eval`/`vars`/`stack`/`threads`/`continue`/`step`
+  serve the most recently stopped live target, else main. Bare `breaks`
+  aggregates all live targets (each record tagged).
+- The first stop on ANY target satisfies launch. Startup `--break` is
+  global intent and inherits into later targets; `breaks add --target X`
+  is ephemeral (no `stops.json`, no inheritance); `remove --target X`
+  matches only X's ephemeral records; bare `remove` drops the global
+  intent plus inherited copies; bare `clear` resets all line breaks.
+- Unknown/exited targets error explicitly (`unknown target` / `has
+  exited`). `status` stays main-focused; `targets` owns the roster.
+  `close` on launch reaps the whole tree (Python) / process (Node).
 
 ## Node Notes (raw CDP)
 
@@ -299,9 +418,11 @@ iterations cost zero LLM roundtrips.
   microseconds). Keep logpoint templates cheap and stopped sessions short.
 - Inspector chatter (`Debugger attached.` etc.) never pollutes `logs`;
   program stdout AND stderr are both captured.
-- `worker_threads`: main thread only — worker code runs on separate
-  inspector targets the bridge does not follow (same boundary as
-  subprocesses elsewhere). Breakpoints on worker-only lines time out.
+- `worker_threads`: opt-in multi-target via `node start --workers`
+  (default stays main-only). Each worker is an addressable target (see
+  Targets below); worker-only lines hit only with tracking on. Hit truth
+  is `hitBreakpoints`, never the `reason` label. Workers that exit retire
+  to history; main exit retires every worker.
 
 ## Browser Notes (CDP tab attach)
 

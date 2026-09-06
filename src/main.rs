@@ -61,7 +61,9 @@ fn dispatch(session: &str, cmd: cli::Commands) -> (&'static str, anyhow::Result<
         cli::Commands::Py(group) => match group.cmd {
             cli::PyCmd::Start {
                 program,
+                module,
                 python,
+                subprocess,
                 stops,
                 program_args,
             } => (
@@ -71,8 +73,10 @@ fn dispatch(session: &str, cmd: cli::Commands) -> (&'static str, anyhow::Result<
                     "py",
                     "launch",
                     spawn::Target::PyLaunch {
-                        program: &program,
+                        program: program.as_deref(),
+                        module: module.as_deref(),
                         python: python.as_deref(),
+                        subprocess,
                     },
                     &stops,
                     &program_args,
@@ -94,6 +98,7 @@ fn dispatch(session: &str, cmd: cli::Commands) -> (&'static str, anyhow::Result<
             cli::NodeCmd::Start {
                 program,
                 node,
+                workers,
                 stops,
                 program_args,
             } => (
@@ -105,6 +110,7 @@ fn dispatch(session: &str, cmd: cli::Commands) -> (&'static str, anyhow::Result<
                     spawn::Target::NodeLaunch {
                         program: &program,
                         node: node.as_deref(),
+                        workers,
                     },
                     &stops,
                     &program_args,
@@ -144,20 +150,63 @@ fn dispatch(session: &str, cmd: cli::Commands) -> (&'static str, anyhow::Result<
                 ),
             ),
         },
-        cli::Commands::Continue { timeout } => (
+        cli::Commands::Continue { timeout, target } => (
             "continue",
-            session::forward(
+            session::forward_target(
                 session,
                 &json!({"cmd": "continue", "timeout": timeout}),
                 Duration::from_secs(timeout.saturating_add(5)),
+                target.as_deref(),
             ),
         ),
-        cli::Commands::Step { mode, timeout } => (
+        cli::Commands::Wait { timeout, target } => (
+            "wait",
+            session::forward_target(
+                session,
+                &json!({"cmd": "wait", "timeout": timeout}),
+                Duration::from_secs(timeout.saturating_add(5)),
+                target.as_deref(),
+            ),
+        ),
+        cli::Commands::Capture {
+            timeout,
+            pause_budget,
+            target,
+            break_spec,
+            frames,
+            vars,
+        } => {
+            let mut body = json!({
+                "cmd": "capture",
+                "timeout": timeout,
+                "pauseBudgetMs": pause_budget,
+                "frames": frames,
+                "vars": vars,
+            });
+            if let Some(spec) = break_spec.as_deref() {
+                body["break"] = Value::String(spec.to_string());
+            }
+            (
+                "capture",
+                session::forward_target(
+                    session,
+                    &body,
+                    Duration::from_secs(timeout.saturating_add(5)),
+                    target.as_deref(),
+                ),
+            )
+        }
+        cli::Commands::Step {
+            mode,
+            timeout,
+            target,
+        } => (
             "step",
-            session::forward(
+            session::forward_target(
                 session,
                 &json!({"cmd": "step", "mode": mode, "timeout": timeout}),
                 Duration::from_secs(timeout.saturating_add(5)),
+                target.as_deref(),
             ),
         ),
         cli::Commands::Reload { timeout } => (
@@ -168,41 +217,67 @@ fn dispatch(session: &str, cmd: cli::Commands) -> (&'static str, anyhow::Result<
                 Duration::from_secs(timeout.saturating_add(5)),
             ),
         ),
-        cli::Commands::Context => (
+        cli::Commands::Context { target } => (
             "context",
-            session::forward(session, &json!({"cmd": "context"}), Duration::from_secs(10)),
+            session::cmd_context_target(session, target.as_deref()),
         ),
-        cli::Commands::Stack => (
+        cli::Commands::Stack { target } => (
             "stack",
-            session::forward(session, &json!({"cmd": "stack"}), Duration::from_secs(10)),
+            session::forward_target(
+                session,
+                &json!({"cmd": "stack"}),
+                Duration::from_secs(10),
+                target.as_deref(),
+            ),
         ),
-        cli::Commands::Threads => (
+        cli::Commands::Threads { target } => (
             "threads",
-            session::forward(session, &json!({"cmd": "threads"}), Duration::from_secs(15)),
+            session::forward_target(
+                session,
+                &json!({"cmd": "threads"}),
+                Duration::from_secs(15),
+                target.as_deref(),
+            ),
         ),
+        cli::Commands::Targets => ("targets", session::cmd_targets(session)),
         cli::Commands::Breaks { cmd } => match cmd {
             None => (
                 "breaks",
                 session::forward(session, &json!({"cmd": "breaks"}), Duration::from_secs(10)),
             ),
-            Some(cli::BreaksCmd::Add { breaks }) => {
-                ("breaks", session::cmd_breaks_add(session, &breaks))
-            }
+            Some(cli::BreaksCmd::Add { breaks, target }) => (
+                "breaks",
+                session::cmd_breaks_add(session, &breaks, target.as_deref()),
+            ),
+            Some(cli::BreaksCmd::Remove { breaks, target }) => (
+                "breaks",
+                session::cmd_breaks_remove(session, &breaks, target.as_deref()),
+            ),
+            Some(cli::BreaksCmd::Clear { target }) => (
+                "breaks",
+                session::cmd_breaks_clear(session, target.as_deref()),
+            ),
         },
-        cli::Commands::Vars { frame } => (
+        cli::Commands::Vars { frame, target } => (
             "vars",
-            session::forward(
+            session::forward_target(
                 session,
                 &json!({"cmd": "vars", "frame": frame}),
                 Duration::from_secs(10),
+                target.as_deref(),
             ),
         ),
-        cli::Commands::Eval { expression, frame } => (
+        cli::Commands::Eval {
+            expression,
+            frame,
+            target,
+        } => (
             "eval",
-            session::forward(
+            session::forward_target(
                 session,
                 &json!({"cmd": "eval", "expr": expression, "frame": frame}),
                 Duration::from_secs(15),
+                target.as_deref(),
             ),
         ),
         cli::Commands::Logs { tail } => (

@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import socket
 import tempfile
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -285,7 +287,8 @@ class BridgeTests(unittest.TestCase):
             st.stop_states = [{"spec": "a.py:5", "kind": "break", "state": "verified", "hits": 0}]
             st._hitkeys = [("break", path, 5, 5)]
             resp = st.cmd_breaks_add({"breaks": [f"{path}:5", f"{path}:5"]})
-            self.assertEqual(resp, {"ok": True, "added": [], "stops": st.stop_states})
+            self.assertEqual(resp, {"ok": True, "added": [], "stops": st.stop_states,
+                                    "target": "main"})
             st.dap_request.assert_not_called()
 
     def test_breaks_add_success_confirms_subset(self):
@@ -966,6 +969,825 @@ class BridgeTests(unittest.TestCase):
             dap._read_msg()
         right.sendall(body[4:])
         self.assertEqual(dap._read_msg(), message)
+
+
+    def test_module_launch_args_use_module_not_program(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            argv = ["session", "--kind", "launch", "--dir", tmp,
+                    "--module", "mypkg.mod", "--", "--arg", "1"]
+            cfg = bridge.parse_args(argv)
+            self.assertEqual(cfg.module, "mypkg.mod")
+            self.assertIsNone(cfg.program)
+            st = bridge.Session(cfg)
+            seen = {}
+
+            class FakeDap:
+                def send_only(self, command, args=None):
+                    seen["command"] = command
+                    seen["args"] = args
+
+                def request(self, command, args=None, timeout=30):
+                    return {}
+
+            st.dap = FakeDap()
+            st.arm_breakpoints = lambda: None
+            st._drain_launch_response = lambda: None
+            st.handshake_launch()
+            self.assertEqual(seen["command"], "launch")
+            self.assertEqual(seen["args"]["module"], "mypkg.mod")
+            self.assertEqual(seen["args"]["args"], ["--arg", "1"])
+            self.assertNotIn("program", seen["args"])
+
+    def test_module_launch_needs_exactly_one_form(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(bridge.Usage):
+                bridge.parse_args(["session", "--kind", "launch", "--dir", tmp])
+            with self.assertRaises(bridge.Usage):
+                bridge.parse_args(["session", "--kind", "launch", "--dir", tmp,
+                                   "--program", "a.py", "--module", "m"])
+            for bad in ["", ".mod", "a..b", "a-b", "9lives"]:
+                with self.assertRaises(bridge.Usage):
+                    bridge.parse_args(["session", "--kind", "launch", "--dir", tmp,
+                                       "--module", bad])
+
+    def test_breaks_remove_echoes_stored_raw_and_drops_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.realpath(str(Path(tmp) / "a.py"))
+            Path(path).write_text("".join(f"line {n}\n" for n in range(12)))
+            st = self.add_session(tmp, breaks=[(path, 5, None), (path, 8, None)])
+            st.cfg.break_raws = {(path, 5, None): f"{path}:5",
+                                 (path, 8, None): f"{path}:8"}
+            st.stop_states = [
+                {"spec": "a.py:5", "kind": "break", "state": "verified", "hits": 0},
+                {"spec": "a.py:8", "kind": "break", "state": "verified", "hits": 0},
+            ]
+            st._hitkeys = [("break", path, 5, 5), ("break", path, 8, 8)]
+            st.dap_request.return_value = {"breakpoints": []}
+            resp = st.cmd_breaks_remove({"breaks": [f"{path}:5"]})
+            self.assertTrue(resp["ok"])
+            self.assertEqual([e["raw"] for e in resp["removed"]], [f"{path}:5"])
+            self.assertEqual(st.cfg.breaks, [(path, 8, None)])
+            self.assertEqual(len(st.stop_states), 1)
+            # DAP re-sent the file merged without the removed line.
+            _, kwargs = st.dap_request.call_args
+            sent = kwargs["args"] if "args" in kwargs else st.dap_request.call_args[0][1]
+            self.assertEqual(sent["breakpoints"], [{"line": 8}])
+
+    def test_breaks_remove_missing_is_not_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.add_session(tmp)
+            resp = st.cmd_breaks_remove({"breaks": ["ghost.py:9"]})
+            self.assertTrue(resp["ok"])
+            self.assertEqual(resp["removed"], [])
+            self.assertEqual(resp["missing"], ["ghost.py:9"])
+            st.dap_request.assert_not_called()
+
+    def test_breaks_remove_works_after_source_deleted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.realpath(str(Path(tmp) / "gone.py"))
+            Path(path).write_text("".join(f"line {n}\n" for n in range(12)))
+            st = self.add_session(tmp, breaks=[(path, 5, None)])
+            st.cfg.break_raws = {(path, 5, None): f"{path}:5"}
+            st.stop_states = [
+                {"spec": "gone.py:5", "kind": "break", "state": "verified", "hits": 0}
+            ]
+            st._hitkeys = [("break", path, 5, 5)]
+            os.unlink(path)
+            st.dap_request.return_value = {"breakpoints": []}
+            resp = st.cmd_breaks_remove({"breaks": [f"{path}:5"]})
+            self.assertTrue(resp["ok"])
+            self.assertEqual([e["raw"] for e in resp["removed"]], [f"{path}:5"])
+            self.assertEqual(st.cfg.breaks, [])
+
+    def test_breaks_remove_cond_needs_full_spec(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.realpath(str(Path(tmp) / "a.py"))
+            Path(path).write_text("".join(f"line {n}\n" for n in range(12)))
+            st = self.add_session(tmp, breaks=[(path, 5, "x > 1")])
+            st.cfg.break_raws = {(path, 5, "x > 1"): f"{path}:5|x > 1"}
+            st.stop_states = [
+                {"spec": "a.py:5|x > 1", "kind": "break", "state": "verified", "hits": 0}
+            ]
+            st._hitkeys = [("break", path, 5, 5)]
+            # Plain spec does not match the conditional record.
+            resp = st.cmd_breaks_remove({"breaks": [f"{path}:5"]})
+            self.assertTrue(resp["ok"])
+            self.assertEqual(resp["removed"], [])
+            self.assertEqual(resp["missing"], [f"{path}:5"])
+            self.assertEqual(st.cfg.breaks, [(path, 5, "x > 1")])
+
+    def test_breaks_clear_drops_only_line_breaks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.realpath(str(Path(tmp) / "a.py"))
+            Path(a).write_text("".join(f"line {n}\n" for n in range(12)))
+            st = self.add_session(tmp, breaks=[(a, 5, None), (a, 8, None)])
+            st.cfg.break_raws = {(a, 5, None): f"{a}:5", (a, 8, None): f"{a}:8"}
+            st.cfg.logpoints = [(a, 3, "tmpl")]
+            st.stop_states = [
+                {"spec": "a.py:5", "kind": "break", "state": "verified", "hits": 0},
+                {"spec": "a.py:8", "kind": "break", "state": "verified", "hits": 0},
+            ]
+            st._hitkeys = [("break", a, 5, 5), ("break", a, 8, 8)]
+            st.dap_request.return_value = {"breakpoints": []}
+            resp = st.cmd_breaks_clear()
+            self.assertTrue(resp["ok"])
+            self.assertEqual(len(resp["removed"]), 2)
+            self.assertEqual(st.cfg.breaks, [])
+            self.assertEqual(st.cfg.logpoints, [(a, 3, "tmpl")])
+            # The logpoint rode along in the replace call.
+            sent = st.dap_request.call_args[0][1]
+            self.assertEqual(sent["breakpoints"], [{"line": 3, "logMessage": "tmpl"}])
+
+    def test_breaks_remove_backend_failure_keeps_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.realpath(str(Path(tmp) / "a.py"))
+            Path(path).write_text("".join(f"line {n}\n" for n in range(12)))
+            st = self.add_session(tmp, breaks=[(path, 5, None)])
+            st.cfg.break_raws = {(path, 5, None): f"{path}:5"}
+            st.dap_request.side_effect = bridge.BridgeErr("adapter exploded")
+            with self.assertRaises(bridge.BridgeErr):
+                st.cmd_breaks_remove({"breaks": [f"{path}:5"]})
+            self.assertEqual(st.cfg.breaks, [(path, 5, None)])
+
+    def test_breaks_remove_different_spelling_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.getcwd()
+            os.chdir(tmp)
+            self.addCleanup(os.chdir, old)
+            Path("a.py").write_text("".join(f"line {n}\n" for n in range(12)))
+            st = self.add_session(tmp)
+            st.dap_request.return_value = {"breakpoints": [{"verified": True}]}
+            added = st.cmd_breaks_add({"breaks": ["a.py:5"]})
+            self.assertEqual(len(added["added"]), 1)
+            canon = os.path.realpath(os.path.join(tmp, "a.py"))
+            self.assertEqual(st.cfg.breaks, [(canon, 5, None)])
+            # A different spelling of the same file matches stored identity.
+            st.dap_request.return_value = {"breakpoints": []}
+            resp = st.cmd_breaks_remove({"breaks": ["./a.py:5"]})
+            self.assertTrue(resp["ok"])
+            self.assertEqual([e["raw"] for e in resp["removed"]], ["a.py:5"])
+            self.assertEqual(st.cfg.breaks, [])
+
+    def test_breaks_remove_src_spelling_and_deleted_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "srcroot"
+            (root / "pkg").mkdir(parents=True)
+            target = root / "pkg" / "mod.py"
+            target.write_text("".join(f"line {n}\n" for n in range(12)))
+            old = os.getcwd()
+            os.chdir(tmp)
+            self.addCleanup(os.chdir, old)
+            st = self.session()
+            st.cfg.dir = tmp
+            st.cfg.src_dirs = [str(root)]
+            st.dap_request = Mock()
+            st.dap_request.return_value = {"breakpoints": [{"verified": True}]}
+            added = st.cmd_breaks_add({"breaks": ["pkg/mod.py:5"]})
+            self.assertEqual(len(added["added"]), 1)
+            # Absolute spelling matches the --src-joined stored identity.
+            st.dap_request.return_value = {"breakpoints": []}
+            resp = st.cmd_breaks_remove({"breaks": [f"{target}:5"]})
+            self.assertTrue(resp["ok"])
+            self.assertEqual([e["raw"] for e in resp["removed"]], ["pkg/mod.py:5"])
+            self.assertEqual(st.cfg.breaks, [])
+            # Re-add, delete the file, remove by yet another spelling.
+            st.dap_request.return_value = {"breakpoints": [{"verified": True}]}
+            st.cmd_breaks_add({"breaks": ["pkg/mod.py:7"]})
+            os.unlink(target)
+            st.dap_request.return_value = {"breakpoints": []}
+            resp = st.cmd_breaks_remove({"breaks": [f"{target}:7"]})
+            self.assertTrue(resp["ok"])
+            self.assertEqual([e["raw"] for e in resp["removed"]], ["pkg/mod.py:7"])
+            self.assertEqual(st.cfg.breaks, [])
+
+    def test_timeout_text_carries_identity_hint(self):
+        st = self.session()
+        st.cfg.observed_hint = "target identity: python3 a.py (cwd /t)"
+        self.assertIn("target identity", st.timeout_text(5))
+        st.cfg.observed_hint = ""
+        self.assertNotIn("identity", st.timeout_text(5))
+
+    def test_publish_state_carries_observed_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.session()
+            st.cfg.dir = tmp
+            st.session_port = 4242
+            st.cfg.observed_target = {"kind": "process", "pid": 7}
+            st.publish_state(False)
+            saved = json.loads(Path(tmp, "session.json").read_text())
+            self.assertEqual(saved["observedTarget"], {"kind": "process", "pid": 7})
+
+    # -- multi-target roster (M-T/M3) -------------------------------------
+
+    def target_session(self, tmp):
+        st = self.session()
+        st.cfg.dir = tmp
+        st.cfg.subprocess = True
+        st.cfg.kind = "launch"
+        st.adapter_port = 4711
+        return st
+
+    def fake_child(self, st, pid, suspended=False):
+        tid = f"child:{pid}"
+        child = bridge.ChildTarget(tid, pid, Mock(), Mock(),
+                                   {"pid": pid, "source": "debugpy-subProcessId"})
+        st.targets[tid] = child
+        st.target_order.append(tid)
+        st._seen_ids.add(tid)
+        child.state = "stopped" if suspended else "running"
+        child.suspended = suspended
+        if suspended:
+            st._stop_seq += 1
+            child.stop_seq = st._stop_seq
+        return child
+
+    def test_targets_roster_shape_and_selected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            st.suspended = True
+            st._main_seq = 1
+            st._stop_seq = 1
+            self.fake_child(st, 111, suspended=True)
+            st._stop_seq += 1
+            st.targets["child:111"].stop_seq = st._stop_seq
+            resp = st.cmd_targets()
+            self.assertTrue(resp["ok"])
+            self.assertEqual(resp["target"], "main")
+            ids = [t["id"] for t in resp["targets"]]
+            self.assertEqual(ids, ["main", "child:111"])
+            main, child = resp["targets"]
+            self.assertEqual(main["kind"], "main")
+            self.assertEqual(main["scope"], "global")
+            self.assertEqual(child["kind"], "child")
+            self.assertEqual(child["pid"], 111)
+            self.assertEqual(child["state"], "stopped")
+            self.assertEqual(child["observed"],
+                             {"pid": 111, "source": "debugpy-subProcessId"})
+            self.assertEqual(child["scope"], "inherited")
+            # Most recent stop wins auto-select.
+            self.assertEqual(resp["selected"], "child:111")
+            self.assertEqual(resp["ignored"], 0)
+            self.assertEqual(resp["droppedExited"], 0)
+
+    def test_resolve_target_auto_and_explicit_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            # Nothing parked: auto is main.
+            self.assertEqual(st.resolve_target({}), "main")
+            c1 = self.fake_child(st, 1, suspended=True)
+            c2 = self.fake_child(st, 2, suspended=True)
+            self.assertEqual(st.resolve_target({}), "child:2")
+            self.assertEqual(st.resolve_target({"target": "child:1"}), "child:1")
+            with self.assertRaises(bridge.BridgeErr) as cm:
+                st.resolve_target({"target": "child:9"})
+            self.assertIn("unknown target", str(cm.exception))
+            st._note_exit("child:1")
+            with self.assertRaises(bridge.BridgeErr) as cm:
+                st.resolve_target({"target": "child:1"})
+            self.assertIn("has exited", str(cm.exception))
+
+    def test_note_exit_bounded_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            for pid in range(20):
+                self.fake_child(st, pid)
+                st._note_exit(f"child:{pid}")
+            self.assertEqual(len(st.exited_targets), bridge.MAX_EXITED_HISTORY)
+            self.assertEqual(st.dropped_exited, 20 - bridge.MAX_EXITED_HISTORY)
+            ids = [e["id"] for e in st.exited_targets]
+            self.assertNotIn("child:0", ids)  # oldest evicted first
+
+    def test_ephemeral_add_remove_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.realpath(str(Path(tmp) / "w.py"))
+            Path(path).write_text("".join(f"line {n}\n" for n in range(12)))
+            st = self.target_session(tmp)
+            child = self.fake_child(st, 7)
+            answers = iter([
+                {"breakpoints": [{"verified": True, "line": 5}]},
+                {"breakpoints": [{"verified": True, "line": 5}]},
+            ])
+            real_request = bridge.DapConn.request
+            st.dap = Mock()
+            st.dap.stash = []
+            with st._TargetScope(st, "child:7"):
+                pass  # scope enter/exit restores main state
+            # Drive the ephemeral path with a stubbed transport.
+            st.dap_request = Mock(side_effect=lambda *a, **k: next(answers))
+            resp = st.cmd_breaks_add({"target": "child:7",
+                                      "breaks": [f"{path}:5"]})
+            self.assertTrue(resp["ok"])
+            self.assertEqual(resp["target"], "child:7")
+            self.assertEqual(resp["added"][0]["raw"], f"{path}:5")
+            # Ephemeral: global intent untouched, child carries the record.
+            self.assertEqual(st.cfg.breaks, [])
+            self.assertEqual(len(child.stop_states), 1)
+            self.assertTrue(child.stop_states[0]["spec"].endswith("w.py:5"))
+            key = (path, 5, None)
+            self.assertIn(key, child.target_raws)
+            self.assertNotIn(key, child.inherited_keys)
+            # Scoped remove drops only the ephemeral record.
+            st.dap_request = Mock(side_effect=lambda *a, **k: next(answers))
+            rm = st.cmd_breaks_remove({"target": "child:7",
+                                       "breaks": [f"{path}:5"]})
+            self.assertTrue(rm["ok"])
+            self.assertEqual(rm["target"], "child:7")
+            self.assertEqual(rm["removed"][0]["raw"], f"{path}:5")
+            self.assertEqual(child.stop_states, [])
+            self.assertEqual(child.target_raws, {})
+            _ = real_request
+
+    def test_match_child_break_ignores_global_intent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.realpath(str(Path(tmp) / "g.py"))
+            Path(path).write_text("".join(f"line {n}\n" for n in range(12)))
+            st = self.target_session(tmp)
+            child = self.fake_child(st, 9)
+            # Global intent exists, but the child has no ephemeral records:
+            # scoped remove reports missing, never touches global.
+            st.cfg.breaks = [(path, 5, None)]
+            st.cfg.break_raws = {(path, 5, None): f"{path}:5"}
+            resp = st.cmd_breaks_remove({"target": "child:9",
+                                         "breaks": [f"{path}:5"]})
+            self.assertTrue(resp["ok"])
+            self.assertEqual(resp["removed"], [])
+            self.assertEqual(resp["missing"], [f"{path}:5"])
+            self.assertEqual(st.cfg.breaks, [(path, 5, None)])
+
+    def test_accept_child_ignored_when_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.session()
+            st.cfg.dir = tmp
+            st.cfg.kind = "launch"
+            st.cfg.subprocess = False
+            st._accept_child({"subProcessId": 123, "connect": {}})
+            self.assertEqual(st.targets, {})
+
+    def test_resource_tracker_skipped_without_connection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            st._child_cmdline = Mock(return_value=(
+                "python -X frozen_modules=off -c import pydevd; "
+                "from multiprocessing.resource_tracker import main;main(4)"))
+            st._accept_child({"subProcessId": 4242, "connect": {}})
+            self.assertEqual(st.helpers_released, 1)
+            self.assertEqual(st.targets, {})
+            self.assertIn("child:4242", st._seen_ids)
+
+    def test_is_resource_tracker_matches_shim_only(self):
+        st = self.session()
+        st._child_cmdline = Mock(return_value="/usr/bin/python3 /app/w.py")
+        self.assertFalse(st._is_resource_tracker(11))
+        st._child_cmdline = Mock(return_value="python -c spawn_main(tracker_fd=5)")
+        self.assertFalse(st._is_resource_tracker(12))
+        st._child_cmdline = Mock(return_value="python -c from multiprocessing.resource_tracker import main;main(4)")
+        self.assertTrue(st._is_resource_tracker(13))
+        st._child_cmdline = Mock(side_effect=OSError("gone"))
+        self.assertFalse(st._is_resource_tracker(14))
+
+    def test_over_budget_child_minimal_handshake_then_close(self):
+        # Over budget: full minimal handshake (initialize, verbatim attach,
+        # NO setBreakpoints, configurationDone, drained) then raw close of
+        # the established session and a socket-less ignored record. The
+        # child is configured (never-configured servers suspend forever)
+        # with zero breakpoints, so it can never park.
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            st._child_cmdline = Mock(return_value="/usr/bin/python3 /app/w.py")
+            for pid in range(100, 100 + bridge.MAX_ACTIVE_NONMAIN):
+                self.fake_child(st, pid)
+            calls = []
+
+            class MiniDap:
+                def __init__(self, sock):
+                    self.sock = sock
+                    self.stash = []
+                def request(self, cmd, args=None, timeout=30):
+                    calls.append(cmd)
+                    if cmd == "setBreakpoints":
+                        raise AssertionError("release must plant no breaks")
+                    return {}
+                def send_only(self, cmd, args=None):
+                    calls.append("send:" + cmd)
+                def _read_msg(self):
+                    return {"type": "response", "command": "attach",
+                            "request_seq": 1, "success": True, "body": {}}
+
+            sock = Mock()
+            from unittest.mock import patch
+            with patch.object(bridge.socket, "create_connection",
+                              return_value=sock) as cc:
+                with patch.object(bridge, "DapConn", MiniDap):
+                    st._accept_child({"subProcessId": 999, "connect": {}})
+            cc.assert_called_once()
+            self.assertIn("initialize", calls)
+            self.assertIn("send:attach", calls)
+            self.assertIn("configurationDone", calls)
+            self.assertNotIn("setBreakpoints", calls)
+            # Established close happened; ignored record is socket-less.
+            sock.close.assert_called_once_with()
+            self.assertEqual(st.ignored, 1)
+            t = st.targets["child:999"]
+            self.assertEqual(t.state, "ignored")
+            self.assertIsNone(t.dap)
+            self.assertIsNone(t.sock)
+            self.assertEqual(st._retired_sockets, [])
+            with self.assertRaises(bridge.BridgeErr) as cm:
+                st.resolve_target({"target": "child:999"})
+            self.assertIn("released", str(cm.exception))
+
+    def test_failed_handshakes_retire_bounded_and_close_only_at_cleanup(self):
+        # A fault storm (every handshake fails) must retain each abandoned
+        # socket OPEN (closing a half-built debugpy session kills the
+        # adapter) in a bounded list; past the bound, children are marked
+        # ignored BEFORE any socket opens; cleanup closes everything.
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            st._child_cmdline = Mock(return_value="/usr/bin/python3 /app/w.py")
+            opened = []
+
+            def fake_connect(*a, **k):
+                sock = Mock()
+                opened.append(sock)
+                return sock
+
+            class FailDap:
+                def __init__(self, sock):
+                    self.sock = sock
+                    self.stash = []
+                def request(self, *a, **k):
+                    raise bridge.BridgeErr("boom")
+                def send_only(self, *a, **k):
+                    pass
+
+            total = bridge.MAX_RETIRED_SOCKETS + 2
+            with patch.object(bridge.socket, "create_connection",
+                              side_effect=fake_connect):
+                with patch.object(bridge, "DapConn", FailDap):
+                    for pid in range(5000, 5000 + total):
+                        st._accept_child({"subProcessId": pid, "connect": {}})
+            # Bounded ownership: exactly MAX opens, rest ignored pre-connect.
+            self.assertEqual(len(opened), bridge.MAX_RETIRED_SOCKETS)
+            self.assertEqual(len(st._retired_sockets), bridge.MAX_RETIRED_SOCKETS)
+            self.assertEqual(st.ignored, total - bridge.MAX_RETIRED_SOCKETS)
+            for _tid, sock in st._retired_sockets:
+                sock.close.assert_not_called()
+            # No live tracked targets (only socket-less ignored records),
+            # bounded exited history from the failures.
+            self.assertEqual(st.active_nonmain(), [])
+            self.assertEqual(
+                sorted(st.targets),
+                ["child:5016", "child:5017"])
+            self.assertLessEqual(len(st.exited_targets), bridge.MAX_EXITED_HISTORY)
+            # Cleanup closes every retired socket exactly once.
+            st.adapter = None
+            st.dap = None
+            st.cleanup()
+            self.assertEqual(st._retired_sockets, [])
+            for sock in opened:
+                sock.close.assert_called_once_with()
+
+    def test_retired_full_marks_ignored_without_connect(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            st._child_cmdline = Mock(return_value="/usr/bin/python3 /app/w.py")
+            st._retired_sockets = [("child:1", Mock())
+                                   for _ in range(bridge.MAX_RETIRED_SOCKETS)]
+            with patch.object(bridge.socket, "create_connection") as cc:
+                st._accept_child({"subProcessId": 777, "connect": {}})
+                cc.assert_not_called()
+            self.assertEqual(st.ignored, 1)
+            self.assertIn("child:777", st._seen_ids)
+
+    def test_every_response_carries_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            st.dap_request = Mock(return_value={"threads": []})
+            resp = st.cmd_threads({})
+            self.assertEqual(resp["target"], "main")
+            resp = st.cmd_breaks({})
+            self.assertEqual(resp["target"], "main")
+
+
+
+    def test_child_suspect_fallback_parks_under_target_scope(self):
+        # A child resume whose `continued` never arrives: the pump deadline
+        # probes the CHILD's held suspects (not just main's), parks the
+        # child, and stamps it — the new stop is served, not timed out.
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            st._nonce = bridge.write_owner(tmp)
+            st.publish_state = Mock()
+            child = self.fake_child(st, 61)
+            child.dap = SimpleNamespace(stash=[])
+            child._awaiting_continued = True
+            child.suspended = False
+            child._suspects = [{"type": "event", "event": "stopped",
+                                "body": {"reason": "breakpoint", "threadId": 3}}]
+            child._co_seen = set()
+            frame = {"id": 9, "name": "w",
+                     "source": {"path": "/tmp/k.py"}, "line": 4}
+            st._co_stop_frame = Mock(return_value=frame)
+            st.refresh_frames = Mock(
+                side_effect=lambda levels=64, timeout=30: st.frames.append(frame))
+            st.dap = SimpleNamespace(stash=[])
+            self.assertEqual(st.pump(0), "stopped")
+            self.assertTrue(child.suspended)
+            self.assertEqual(child.thread_id, 3)
+            self.assertEqual(st._last_park_target, "child:61")
+            self.assertFalse(child._awaiting_continued)
+            # Main was never awaiting: its flag stays untouched.
+            self.assertFalse(st._awaiting_continued)
+            # The parked child is now what targetless commands serve.
+            self.assertEqual(st.resolve_target({}), "child:61")
+
+    def test_main_suspect_fallback_unchanged_without_children(self):
+        # Main-only episode behavior is exactly the legacy path: suspects
+        # park, the flag closes, and an empty episode raises StopTimeout.
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.session()
+            st.cfg.dir = tmp
+            st._nonce = bridge.write_owner(tmp)
+            st.publish_state = Mock()
+            st._awaiting_continued = True
+            st.suspended = False
+            st._co_stop_frame = Mock(return_value=None)
+            stop = {"type": "event", "event": "stopped",
+                    "body": {"reason": "breakpoint", "threadId": 2}}
+            st._suspects = [stop]
+            st.dap = SimpleNamespace(stash=[])
+            with self.assertRaises(bridge.StopTimeout):
+                st.pump(0)
+            self.assertFalse(st._awaiting_continued)
+
+    # -- M5 concurrency: outstanding resume -------------------------------
+
+    def hold_resume(self, st, tid="main", cmd="continue"):
+        st._outstanding[tid] = cmd
+
+    def test_m5_live_reads_prompt_while_resume_held(self):
+        # While a resume is outstanding, live reads are accepted and
+        # answered from published state with zero DAP traffic.
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            st._nonce = bridge.write_owner(tmp)
+            st.publish_state = Mock()
+            (Path(tmp) / "logs.jsonl").write_text("a\nb\n")
+            st.drain_pending = Mock(
+                side_effect=AssertionError("no second DAP reader"))
+            st.dap_request = Mock(
+                side_effect=AssertionError("no DAP traffic on live reads"))
+            self.hold_resume(st)
+            for cmd in ("threads", "breaks", "logs", "targets"):
+                t0 = time.monotonic()
+                resp = st.dispatch({"cmd": cmd})
+                dt = time.monotonic() - t0
+                self.assertTrue(resp["ok"], cmd)
+                self.assertLess(dt, 2.0, cmd)
+            self.assertEqual(st.dispatch({"cmd": "threads"})["running"], True)
+            self.assertEqual(st.dispatch({"cmd": "threads"})["threads"], [])
+            st.drain_pending.assert_not_called()
+            st.dap_request.assert_not_called()
+
+    def test_m5_live_reads_concurrent_from_threads(self):
+        # Eight handler threads hitting live reads at once: all prompt,
+        # all ok, no gate deadlock.
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            st._nonce = bridge.write_owner(tmp)
+            st.publish_state = Mock()
+            (Path(tmp) / "logs.jsonl").write_text("a\n")
+            st.drain_pending = Mock()
+            st.dap_request = Mock(side_effect=AssertionError("no DAP"))
+            self.hold_resume(st)
+            cmds = ["threads", "breaks", "logs", "targets"] * 2
+            out = [None] * len(cmds)
+            def run(i):
+                try:
+                    out[i] = st.dispatch({"cmd": cmds[i]})
+                except Exception as e:  # noqa: BLE001 — collected below
+                    out[i] = e
+            ths = [threading.Thread(target=run, args=(i,))
+                   for i in range(len(cmds))]
+            for t in ths:
+                t.start()
+            for t in ths:
+                t.join(5)
+            for i, r in enumerate(out):
+                self.assertIsInstance(r, dict, (cmds[i], r))
+                self.assertTrue(r["ok"], (cmds[i], r))
+
+    def test_m5_second_resume_same_target_busy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            self.hold_resume(st)
+            for cmd in ("continue", "step"):
+                with self.assertRaises(bridge.BridgeErr) as cm:
+                    st.dispatch({"cmd": cmd})
+                self.assertEqual(str(cm.exception),
+                                 "busy: continue outstanding for main")
+
+    def test_m5_global_mutation_conflicts_any_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            self.fake_child(st, 61)
+            self.hold_resume(st, "child:61")
+            for cmd in ("breaksAdd", "breaksRemove", "breaksClear"):
+                req = {"cmd": cmd}
+                if cmd != "breaksClear":
+                    req["breaks"] = ["x:1"]
+                with self.assertRaises(bridge.BridgeErr) as cm:
+                    st.dispatch(req)
+                self.assertEqual(
+                    str(cm.exception),
+                    "busy: continue outstanding for child:61")
+
+    def test_m5_target_scoped_mutation_conflicts_only_its_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            self.fake_child(st, 61)
+            other = self.fake_child(st, 62)
+            other.dap = SimpleNamespace(stash=[])
+            self.hold_resume(st, "child:61")
+            # Same target: busy.
+            with self.assertRaises(bridge.BridgeErr) as cm:
+                st.dispatch({"cmd": "breaksAdd", "target": "child:61",
+                             "breaks": ["x:1"]})
+            self.assertEqual(str(cm.exception),
+                             "busy: continue outstanding for child:61")
+            # Different target: independent (ephemeral path runs).
+            st._add_ephemeral = Mock(return_value={"ok": True})
+            resp = st.dispatch({"cmd": "breaksAdd", "target": "child:62",
+                                "breaks": ["x:1"]})
+            self.assertTrue(resp["ok"])
+            st._add_ephemeral.assert_called_once()
+
+    def test_m5_different_target_resume_independent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            self.fake_child(st, 61)
+            parked = self.fake_child(st, 62)
+            parked.dap = SimpleNamespace(stash=[])
+            self.hold_resume(st, "child:61")
+            seen = []
+            def fake_wait(timeout, tid="main"):
+                seen.append(tid)
+                return {"ok": True}
+            st._resume_and_wait = fake_wait
+            # Same target rival: busy, never reaches the waiter.
+            with self.assertRaises(bridge.BridgeErr):
+                st.dispatch({"cmd": "continue", "target": "child:61"})
+            self.assertEqual(seen, [])
+            # Different target: accepted and served.
+            resp = st.dispatch({"cmd": "continue", "target": "child:62"})
+            self.assertTrue(resp["ok"])
+            self.assertEqual(seen, ["child:62"])
+            # Registration is released afterwards.
+            self.assertNotIn("child:62", st._outstanding)
+            self.assertEqual(st._outstanding, {"child:61": "continue"})
+
+    def test_m5_eval_busy_despite_parked_frames(self):
+        # eval can mutate: it busy-rejects on its target even when cached
+        # frames exist (never served stale as safe).
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            st.thread_id, st.suspended = 7, True
+            st.frames = [{"id": 1}]
+            self.hold_resume(st)
+            with self.assertRaises(bridge.BridgeErr) as cm:
+                st.dispatch({"cmd": "eval", "expr": "1+1"})
+            self.assertEqual(str(cm.exception),
+                             "busy: continue outstanding for main")
+
+    def test_m5_frame_reads_fail_fast_when_running(self):
+        # context/vars/stack never busy-reject and never expose stale
+        # frames: once the resume publishes running they fail fast.
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            st.suspended, st.thread_id, st.frames = False, None, []
+            self.hold_resume(st)
+            for cmd in ("context", "stack", "vars"):
+                with self.assertRaises(bridge.BridgeErr) as cm:
+                    st.dispatch({"cmd": cmd})
+                self.assertIn("no stopped thread", str(cm.exception))
+
+    def test_m5_close_accepted_despite_outstanding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            self.hold_resume(st)
+            with self.assertRaises(bridge._Close):
+                st.dispatch({"cmd": "close"})
+
+    def test_m5_step_registers_and_releases_outstanding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            st._nonce = bridge.write_owner(tmp)
+            st.publish_state = Mock()
+            st.thread_id, st.suspended = 7, True
+            st.frames = [{"id": 1}]
+            st.dap_request = Mock(return_value={})
+            def fake_wait(timeout, tid="main"):
+                self.assertEqual(st._outstanding.get("main"), "step")
+                raise bridge.BridgeErr("timeout: no stop within 1s")
+            st._resume_and_wait = fake_wait
+            with self.assertRaises(bridge.BridgeErr):
+                st.dispatch({"cmd": "step"})
+            self.assertEqual(st._outstanding, {})
+
+    def client_roundtrip(self, port, req, timeout=10):
+        s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        try:
+            bridge.write_frame(s, req)
+            return bridge.read_frame(s)
+        finally:
+            s.close()
+
+    def test_m5_bounded_handlers_close_and_overload(self):
+        # Eight handlers may block in dispatch; the ninth is rejected
+        # immediately (no unbounded spawn); close is still accepted.
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            st._nonce = bridge.write_owner(tmp)
+            blocker = threading.Event()
+            real_cleanup = st.cleanup
+            def fake_dispatch(req):
+                if req.get("cmd") == "close":
+                    raise bridge._Close()
+                self.assertTrue(blocker.wait(10))
+                return {"ok": True}
+            st.dispatch = fake_dispatch
+            server = socket.socket()
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("127.0.0.1", 0))
+            server.listen(5)
+            port = server.getsockname()[1]
+            srv = threading.Thread(target=bridge.serve, args=(st, server,
+                                                               st._nonce),
+                                   daemon=True)
+            srv.start()
+            results = [None] * 8
+            def run(i):
+                try:
+                    results[i] = self.client_roundtrip(port, {"cmd": "noop"})
+                except Exception as e:  # noqa: BLE001 — collected below
+                    results[i] = e
+            ths = [threading.Thread(target=run, args=(i,)) for i in range(8)]
+            for t in ths:
+                t.start()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with st._gate:
+                    if st._active >= 8:
+                        break
+                time.sleep(0.02)
+            with st._gate:
+                self.assertEqual(st._active, 8)
+            t0 = time.monotonic()
+            resp = self.client_roundtrip(port, {"cmd": "noop"})
+            self.assertLess(time.monotonic() - t0, 3.0)
+            self.assertFalse(resp["ok"])
+            self.assertIn("overloaded", resp["error"])
+            blocker.set()
+            for t in ths:
+                t.join(5)
+            for r in results:
+                self.assertIsInstance(r, dict, r)
+                self.assertTrue(r["ok"], r)
+            closed = self.client_roundtrip(port, {"cmd": "close"})
+            self.assertTrue(closed.get("closed"))
+            srv.join(5)
+            self.assertFalse(srv.is_alive())
+            real_cleanup  # keep linters quiet about the bound method
+
+    def test_m5_disconnect_does_not_cancel(self):
+        # The client goes away mid-command: the work still runs, the state
+        # still publishes, and only the response drops.
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.target_session(tmp)
+            published = threading.Event()
+            st.publish_state = Mock(side_effect=lambda *a: published.set())
+            ran = threading.Event()
+            def fake_dispatch(req):
+                time.sleep(0.2)
+                st.publish_state(False)
+                ran.set()
+                return {"ok": True}
+            st.dispatch = fake_dispatch
+            srv, cli = socket.socketpair()
+            st._active = 1  # serve() owns the increment; direct _handle_one
+            t = threading.Thread(target=bridge._handle_one, args=(st, srv),
+                                 daemon=True)
+            t.start()
+            bridge.write_frame(cli, {"cmd": "continue"})
+            cli.close()  # gone before the response
+            self.assertTrue(ran.wait(5))
+            self.assertTrue(published.is_set())
+            t.join(5)
+            self.assertFalse(t.is_alive())
+            with st._gate:
+                self.assertEqual(st._active, 0)
 
 
 if __name__ == "__main__":

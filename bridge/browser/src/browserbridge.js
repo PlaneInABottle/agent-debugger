@@ -57,6 +57,19 @@ const MAX_FRAMES = 10;
 const MAX_LOG_LINES = 2000;
 const MAX_OUTPUT = 4000;
 const MAX_SOURCE_CACHE = 100;
+// M5 concurrency (frozen, same bounds as nodebridge): concurrent handlers
+// capped (one response per connection), bounded connection queue, rival
+// resume/mutation busy-rejects. Reload is a resume op.
+const MAX_ACTIVE_HANDLERS = 8;
+const MAX_QUEUED_CONNS = 16;
+const RESUME_CMDS = new Set(['continue', 'step', 'reload']);
+const WAIT_CMDS = new Set(['wait']);
+const CAPTURE_CMDS = new Set(['capture']);
+// Parked-stop UX: every parked response carries this warning (suspend
+// semantics, HTTP handler impact). No root-cause claim, ever.
+const PARK_WARNING = 'parked breakpoint suspends target; HTTP handler remains ' +
+  'open until continue/capture-resume/close(detach)';
+const MUTATION_CMDS = new Set(['breaksAdd', 'breaksRemove', 'breaksClear']);
 const EVAL_RETRIES = 3;
 const EVAL_RETRY_MS = 300;
 // Inspector/page chatter (never user data, just noise in logs).
@@ -126,6 +139,7 @@ function parseArgs(argv) {
     host: 'localhost', port: 9222, tab: null,
     srcs: [], breaks: [], logpoints: [],
     wantExc: false, timeout: 20,
+    observedTarget: null, observedHint: '', breakRaws: {},
   };
   const rest = argv;
   let i = 0;
@@ -144,7 +158,17 @@ function parseArgs(argv) {
     else if (a === '--tab') cfg.tab = need(a);
     else if (a === '--timeout') cfg.timeout = needInt(a, need(a));
     else if (a === '--src') cfg.srcs.push(need(a));
-    else if (a === '--break') parseBreak(need(a), cfg);
+    else if (a === '--break') {
+      const raw = need(a);
+      const before = cfg.breaks.length;
+      parseBreak(raw, cfg);
+      if (cfg.breaks.length > before) {
+        // Stored raw for remove/clear echo (dedup keeps first).
+        const b = cfg.breaks[cfg.breaks.length - 1];
+        const key = `${b.frag}:${b.line}|${b.cond || ''}`;
+        if (!(key in cfg.breakRaws)) cfg.breakRaws[key] = raw;
+      }
+    }
     else if (a === '--logpoint') parseLogpoint(need(a), cfg);
     else if (a === '--watch') throw new Usage(`--watch has no CDP equivalent (browser): ${rest[i] || ''}`);
     else if (a === '--exit') throw new Usage(`--exit has no CDP equivalent (browser): ${rest[i] || ''}`);
@@ -166,6 +190,91 @@ function parseArgs(argv) {
 function truncStr(s, limit = MAX_STRING) {
   if (s.length <= limit) return s;
   return `${s.slice(0, limit)}… (+${s.length - limit} more chars)`;
+}
+
+// Observed-identity caps (mirror the CLI contract): every string field to
+// 512 chars, the whole object to 2KB serialized, same `… (+N more chars)`
+// idiom — tab titles/URLs are remote-controlled text and must never bloat
+// session.json or diagnostics.
+const OBSERVED_FIELD_CAP = 512;
+const OBSERVED_TOTAL_CAP = 2048;
+
+function truncField(s) {
+  if (s === null || s === undefined) return s;
+  return truncStr(String(s), OBSERVED_FIELD_CAP);
+}
+
+/** Secret query keys (mirrors the CLI argv redaction): whole/substring
+ *  long keys plus boundary/suffix short keys — never a mere prefix, so
+ *  `?author=` keeps its value while `?token=` and `?apiToken=` redact. */
+function isSecretQueryKey(key) {
+  const flat = key.toLowerCase().replace(/[-_]/g, '');
+  const SUBSTR = ['password', 'passwd', 'secret', 'apikey', 'authorization', 'authtoken', 'accesstoken'];
+  if (SUBSTR.some((k) => flat.includes(k))) return true;
+  return key.toLowerCase().split(/[-_.]/).some((tok) => {
+    if (tok === 'token' || tok === 'auth' || tok === 'pwd') return true;
+    return tok.endsWith('token') || tok.endsWith('auth') || tok.endsWith('pwd');
+  });
+}
+
+/** Redact secret query values before anything persists or prints. Falls
+ *  back to a pattern rewrite when the string is not a parseable URL. */
+function redactUrl(raw) {
+  if (raw === null || raw === undefined) return raw;
+  const s = String(raw);
+  try {
+    const u = new URL(s);
+    let touched = false;
+    for (const key of Array.from(u.searchParams.keys())) {
+      if (isSecretQueryKey(key)) {
+        u.searchParams.set(key, '[redacted]');
+        touched = true;
+      }
+    }
+    return touched ? u.toString() : s;
+  } catch (_) {
+    return s.replace(/([?&][^?&=#]*=)[^&#]*/g, (m, head) => {
+      const name = head.slice(1, -1);
+      return isSecretQueryKey(name) ? `${head.slice(0, 1)}${name}=[redacted]` : m;
+    });
+  }
+}
+
+/** Tab identity for session.json/status (no process claim). Redacted and
+ *  capped before return — raw tab query secrets never persist or print. */
+function buildObservedTab(tab, host, port, nowSec) {
+  const t = tab || {};
+  const obs = {
+    kind: 'tab',
+    url: truncField(redactUrl(t.url || null)),
+    title: truncField(t.title || null),
+    targetId: truncField(t.id || null),
+    debugEndpoint: truncField(`${host}:${port}`),
+    cwd: null,
+    argv: null,
+    notApplicable: ['cwd', 'argv'],
+    source: 'cdp-target-list',
+    observedAt: nowSec,
+    unavailable: [],
+    warnings: [],
+  };
+  // Total cap: shrink the longest free-text field until the object fits.
+  for (;;) {
+    if (JSON.stringify(obs).length <= OBSERVED_TOTAL_CAP) break;
+    const lens = [['url', obs.url], ['title', obs.title]]
+      .filter(([, v]) => typeof v === 'string' && v.length > 1)
+      .sort((a, b) => b[1].length - a[1].length);
+    if (lens.length === 0) break;
+    const [field, val] = lens[0];
+    obs[field] = truncStr(val, Math.max(1, val.length - 64));
+  }
+  return obs;
+}
+
+/** Compact tab hint for timeout diagnostics (already redacted + capped). */
+function tabHint(obs) {
+  const s = `target identity: tab ${(obs && obs.url) || '?'}`;
+  return s.length <= 200 ? s : `${s.slice(0, 200)}`;
 }
 
 function escapeRegex(s) {
@@ -377,6 +486,10 @@ class Session {
     this.defaultContextId = null;
     this.logpointIds = new Map(); // breakpointId -> template
     this.breakIdToRec = new Map(); // breakpointId -> {rec, line} for resolve upgrades
+    this.breakKeys = new Map(); // `frag:line|cond` -> breakpointId (null when rejected)
+    this.breakRecByKey = new Map(); // `frag:line|cond` -> live break rec (incl. rejected)
+    this.breakRaws = new Map(Object.entries((cfg && cfg.breakRaws) || {})); // key -> stored raw
+    this.shadowedLogs = []; // {frag, line, template} startup logpoints shadowed by a break
     this.stopStates = []; // arm-time records served by `breaks`
     this.paused = null;     // {frames, stopInfo} of the current stop
     this.awaitingStep = false;
@@ -391,6 +504,43 @@ class Session {
     this.logDropped = 0; // lifetime lines evicted by the log ring
     this.sessionPort = 0; // our TCP port (set in main, for republishing)
     this.lastStop = null; // {file,line,method} of the latest stop
+    // -- stop diagnostics (UX batch): session-monotonic stop id plus the
+    // previous park for same-location/same-thread diagnosis. Capture does
+    // not survive a reload (navigation drops CDP breakpoints); a reload
+    // between plant and park surfaces as a timeout, never a stale resume.
+    this.stopDiagSeq = 0; // session-monotonic stop id
+    this.prevPark = null; // previous park {target,file,line,threadId,atMs}
+    this.stopReason = null; // reason of the current park
+    this.stopHitBps = null; // native hitBreakpoint ids of the current park
+    this.parkedAtMs = 0; // wall clock ms of the current park
+    this.lastDiag = null; // {target,stopId,sameLocation,sameThread,elapsedMs,atMs}
+    // -- M5 concurrency: the single outstanding resume op (tid is always
+    // 'main': one tab per session); live reads bypass it entirely.
+    this.outstanding = new Map(); // tid -> resume cmd in flight
+    this.activeConns = 0;         // live connection handlers (bounded)
+  }
+
+  /** M5 immediate busy rejection (single target): a second resume or any
+   *  breakpoint mutation while one is outstanding never silently queues;
+   *  eval is exclusive (it can mutate) and busy-rejects even when parked
+   *  frames exist. Live reads and frame-bound context/vars/stack never
+   *  busy-reject (the latter fail fast via requireStopped once the resume
+   *  publishes running). */
+  busyError(cmd) {
+    if (this.outstanding.size === 0) return null;
+    // wait never resumes but still occupies the slot (a rival resume would
+    // steal the stop it long-polls for); capture resumes at the end, so it
+    // occupies the slot throughout.
+    if (RESUME_CMDS.has(cmd) || WAIT_CMDS.has(cmd) || CAPTURE_CMDS.has(cmd) ||
+        MUTATION_CMDS.has(cmd) || cmd === 'eval') {
+      const first = [...this.outstanding.keys()].sort()[0];
+      return `busy: ${this.outstanding.get(first)} outstanding for ${first}`;
+    }
+    return null;
+  }
+
+  clearOutstanding(cmd, tid) {
+    if (this.outstanding.get(tid) === cmd) this.outstanding.delete(tid);
   }
 
   // -- attach lifecycle
@@ -398,6 +548,13 @@ class Session {
   async handshake() {
     const targets = await listTargets(this.cfg.host, this.cfg.port);
     this.tab = pickTab(targets, this.cfg.tab);
+    // Tab identity (no process claim): the /json/list entry we attached
+    // to, persisted redacted into session.json and surfaced in
+    // status/context. cwd/argv are not applicable to tabs. Immutable for
+    // the session (handshake-time only, never re-probed per command).
+    this.cfg.observedTarget = buildObservedTab(
+      this.tab, this.cfg.host, this.cfg.port, Math.floor(Date.now() / 1000));
+    this.cfg.observedHint = tabHint(this.cfg.observedTarget);
     const WebSocket = loadWs();
     const ws = new WebSocket(this.tab.webSocketDebuggerUrl, { maxPayload: 256 * 1024 * 1024 });
     await new Promise((resolve, reject) => {
@@ -470,6 +627,8 @@ class Session {
           spec: this.dispSpec(l, 'logpoint'), kind: 'logpoint',
           state: 'shadowed', detail: msg, hits: 0,
         });
+        // Retained for remove-time re-arm (the break wins; no plant exists).
+        this.shadowedLogs.push({ frag: l.frag, line: l.line, template: l.template });
         continue;
       }
       byLine.set(key, { ...(byLine.get(key) || {}), log: l });
@@ -486,6 +645,10 @@ class Session {
       const bpId = res.breakpointId;
       const rec = { spec: this.dispSpec(spec, kind), kind, hits: 0 };
       if (kind === 'logpoint') rec.detail = spec.template;
+      if (kind === 'break') {
+        this.breakKeys.set(`${spec.frag}:${spec.line}|${spec.cond || ''}`, bpId || null);
+        this.breakRecByKey.set(`${spec.frag}:${spec.line}|${spec.cond || ''}`, rec);
+      }
       if (!bpId) {
         const msg = `breakpoint rejected: ${spec.frag}:${spec.line}`;
         process.stderr.write(`warn: ${msg}\n`);
@@ -674,6 +837,7 @@ class Session {
       // Park first, synchronously — trackChanges awaits must never strand
       // a CDP pause with a running state when they throw.
       this.paused = { frames, stopInfo: this.stopInfo };
+      this.notePark('main', p);
       this.publishState(true);
       try {
         for (const id of logHits) {
@@ -693,6 +857,7 @@ class Session {
       this.stopInfo = null;
       // Park first, synchronously — see above.
       this.paused = { frames, stopInfo: null };
+      this.notePark('main', p);
       this.publishState(true);
       try {
         for (const id of logHits) {
@@ -852,6 +1017,14 @@ class Session {
 
   // -- pump: wait for the next stop (events arrive on their own)
 
+  timeoutText(timeout) {
+    // Timeout message with the compact observed-identity hint (names the
+    // tab, never claims root cause).
+    let msg = `timeout: no stop within ${fmtTimeout(timeout)}`;
+    if (this.cfg.observedHint) msg += `; ${this.cfg.observedHint}`;
+    return msg;
+  }
+
   async pump(timeout) {
     const deadline = Date.now() + timeout * 1000;
     for (;;) {
@@ -862,7 +1035,7 @@ class Session {
       if (this.paused) return 'stopped';
       if (this.exited) throw new BridgeErr(EXITED_MSG);
       if (Date.now() > deadline) {
-        throw new BridgeErr(`timeout: no stop within ${fmtTimeout(timeout)}`);
+        throw new BridgeErr(this.timeoutText(timeout));
       }
       await sleep(50);
     }
@@ -883,7 +1056,8 @@ class Session {
 
   /** Rewrite session.json so `status` shows live truth (parked stop +
    *  time) with zero prior memory. lastStop survives resume/exit — it
-   *  answers 'where was I last', not 'where am I now'. */
+   *  answers 'where was I last', not 'where am I now'. The redacted
+   *  observedTarget (tab identity) rides along verbatim. */
   publishState(stopped) {
     if (stopped) {
       try {
@@ -894,6 +1068,7 @@ class Session {
       name: path.basename(this.cfg.dir), kind: this.cfg.kind,
       port: this.sessionPort, stopped,
       lastStop: this.lastStop, updatedAt: Math.floor(Date.now() / 1000),
+      observedTarget: this.cfg.observedTarget || null,
     }));
   }
 
@@ -1098,12 +1273,16 @@ class Session {
 
   async cmdContext() {
     this.requireStopped();
+    const location = await this.locationJson();
+    const threads = this.threadsJson();
     return {
       ok: true,
       stopInfo: JSON.parse(this.stopInfo || 'null'),
-      location: await this.locationJson(),
-      threads: this.threadsJson(),
+      location,
+      threads,
       frames: await this.framesJson(true),
+      diag: this.stopDiag(threads),
+      warning: PARK_WARNING,
     };
   }
 
@@ -1145,6 +1324,311 @@ class Session {
       ? await this.fmtRemoteDeep(res.result)
       : this.fmtRemote(res.result);
     return { ok: true, expr, value: truncStr(String(value)) };
+  }
+
+  /** Record one genuine park for stop diagnostics (synchronous at
+   *  the park). Session-monotonic stopId plus previous-park comparison.
+   *  hitBreakpoints ride natively (never fabricated). Location resolves
+   *  lazily at response time (frameUrl needs no traffic). */
+  notePark(tid, p) {
+    const now = Date.now();
+    const prev = this.prevPark;
+    const elapsed = prev ? now - prev.atMs : null;
+    // Location at park time, best-effort without traffic: top-frame url +
+    // line (relFile is pure string work).
+    let file = '?', line = -1;
+    try {
+      const frames = (this.paused && this.paused.frames) || [];
+      if (frames.length > 0) {
+        const f = frames[0];
+        file = this.relFile(this.frameUrl(f));
+        line = (f.location && f.location.lineNumber + 1) || -1;
+      }
+    } catch (_) { file = '?'; line = -1; }
+    const sameLoc = !!(prev && prev.file === file && prev.line === line);
+    const sameThr = !!(prev && prev.target === tid && prev.threadId === 1);
+    this.stopDiagSeq += 1;
+    this.prevPark = { target: tid, file, line, threadId: 1, atMs: now };
+    this.stopReason = (p && p.reason) || null;
+    this.stopHitBps = (p && Array.isArray(p.hitBreakpoints)) ? [...p.hitBreakpoints] : null;
+    this.parkedAtMs = now;
+    this.lastDiag = {
+      target: tid, stopId: this.stopDiagSeq,
+      sameLocation: sameLoc, sameThread: sameThr, elapsedMs: elapsed, atMs: now,
+    };
+  }
+
+  /** Additive stop diagnostics for the parked tab. requested/bound
+   *  resolve via native hit ids when attributable, else null. */
+  stopDiag(threads) {
+    let name = null;
+    try {
+      const hit = (threads || []).find((t) => t.id === 1);
+      if (hit) name = hit.name || null;
+    } catch (_) { name = null; }
+    let requested = null, bound = null, hitCount = null;
+    try {
+      for (const id of this.stopHitBps || []) {
+        const entry = this.breakIdToRec.get(id);
+        if (entry && entry.rec) {
+          requested = entry.rec.spec || null;
+          bound = (typeof entry.line === 'number') ? entry.line : null;
+          hitCount = (typeof entry.rec.hits === 'number') ? entry.rec.hits : null;
+          break;
+        }
+      }
+    } catch (_) { requested = null; bound = null; hitCount = null; }
+    const diag = {
+      stopId: null, parkedAtMs: this.parkedAtMs, target: 'main',
+      reason: this.stopReason, stoppingThread: { id: 1, name },
+      hitBreakpoints: this.stopHitBps,
+      requestedBreak: requested, boundLine: bound, hitCount,
+      sameLocation: false, sameThread: false, elapsedSincePreviousStopMs: null,
+    };
+    const last = this.lastDiag;
+    if (last && last.target === 'main') {
+      diag.stopId = last.stopId;
+      diag.sameLocation = !!last.sameLocation;
+      diag.sameThread = !!last.sameThread;
+      diag.elapsedSincePreviousStopMs = last.elapsedMs;
+    }
+    return diag;
+  }
+
+  /** Parked wait response (issues zero resume traffic by construction). */
+  async waitSnapshot(waited) {
+    const snapshot = await this.snapshot();
+    return {
+      ok: true, stopped: true, waited, target: 'main',
+      changed: JSON.parse(this.lastChanged),
+      stopInfo: JSON.parse(this.stopInfo || 'null'),
+      snapshot, diag: this.stopDiag(snapshot.threads),
+      warning: PARK_WARNING,
+    };
+  }
+
+  /** Pure long-poll: NEVER resumes. Immediate success when the tab is
+   *  already parked; otherwise waits for the next fresh stop. Timeout
+   *  preserves session/intents (typed message). */
+  async cmdWait(req, timeout) {
+    this.requireLive();
+    if (this.paused) return this.waitSnapshot(false);
+    await this.pump(timeout);
+    return this.waitSnapshot(true);
+  }
+
+  captureBounds(req) {
+    const frames = req.frames !== undefined ? Number(req.frames) : 1;
+    const vars = req.vars !== undefined ? Number(req.vars) : 20;
+    const budget = req.pauseBudgetMs !== undefined ? Number(req.pauseBudgetMs) : 2000;
+    if (!Number.isInteger(frames) || frames < 1 || frames > 10) {
+      throw new BridgeErr('capture frames must be between 1 and 10');
+    }
+    if (!Number.isInteger(vars) || vars < 1 || vars > 20) {
+      throw new BridgeErr('capture vars must be between 1 and 20');
+    }
+    if (!Number.isInteger(budget) || budget < 1 || budget > 10000) {
+      throw new BridgeErr('capture pause budget must be between 1 and 10000 ms');
+    }
+    const spec = req.break !== undefined ? req.break : null;
+    if (spec !== null && (typeof spec !== 'string' || !spec)) {
+      throw new BridgeErr('capture --break must look like frag:line');
+    }
+    return { frames, vars, budget, spec };
+  }
+
+  /** Capture snapshot: frames 1..10, frame-0 vars 1..20. */
+  async boundedSnapshot(framesN, varsN) {
+    const frames = ((this.paused && this.paused.frames) || []).slice(0, framesN);
+    const total = ((this.paused && this.paused.frames) || []).length;
+    const out = [];
+    for (let i = 0; i < frames.length; i++) {
+      const f = frames[i];
+      const entry = {
+        index: i, type: '?',
+        method: f.functionName || '(anonymous)',
+        line: (f.location && f.location.lineNumber + 1) || -1,
+      };
+      if (i === 0) {
+        try {
+          const full = await this.frameLocalsIn(frames, 0);
+          entry.locals = full.slice(0, varsN);
+          entry._varsTruncated = full.length > varsN;
+        } catch (_) { entry.locals = []; entry._varsTruncated = false; }
+      }
+      out.push(entry);
+    }
+    const varsTruncated = out.length > 0 ? !!out[0]._varsTruncated : false;
+    if (out.length > 0) delete out[0]._varsTruncated;
+    return {
+      snapshot: {
+        mode: 'session', location: await this.locationJson(),
+        threads: this.threadsJson(), frames: out,
+        output: this.outputTail.slice(-MAX_OUTPUT),
+      },
+      framesTruncated: total > framesN, varsTruncated,
+    };
+  }
+
+  /** Plant one ephemeral frag:line break for a capture. Returns a removal
+   *  token ({kind:'dup'} when the exact line is already armed). Raises
+   *  BEFORE anything parks on invalid/conflicting specs. Never touches
+   *  the global intent, stops.json, or inheritance. Does not survive a
+   *  reload: a navigation between plant and park surfaces as a timeout,
+   *  never a stale resume. */
+  async capturePlant(spec) {
+    const scratch = { breaks: [], logpoints: [], wantExc: false };
+    const bar = spec.indexOf('|');
+    const head = bar < 0 ? spec : spec.slice(0, bar);
+    if (head === 'exc' || head.startsWith('exc:') || head.startsWith('method:')) {
+      throw new BridgeErr(`capture takes line breaks only (got '${spec}')`);
+    }
+    try {
+      parseBreak(spec, scratch);
+    } catch (e) {
+      throw new BridgeErr(e instanceof Usage ? e.message : String((e && e.message) || e));
+    }
+    const b = scratch.breaks[0];
+    const key = `${b.frag}:${b.line}|${b.cond || ''}`;
+    const loc = `${b.frag}:${b.line}`;
+    if (this.breakKeys.has(key)) return { kind: 'dup' };
+    for (const k of this.breakKeys.keys()) {
+      if (k.slice(0, k.lastIndexOf('|')) === loc) {
+        throw new BridgeErr(`conflicting condition for ${b.frag}:${b.line} (already armed): ${spec}`);
+      }
+    }
+    for (const l of this.cfg.logpoints || []) {
+      if (`${l.frag}:${l.line}` === loc) {
+        throw new BridgeErr(`conflicting condition for ${b.frag}:${b.line} (already armed as logpoint): ${spec}`);
+      }
+    }
+    const params = { urlRegex: fragRegex(b.frag), lineNumber: b.line - 1 };
+    if (b.cond) params.condition = b.cond;
+    let res;
+    try {
+      res = await this.cdp.request('Debugger.setBreakpointByUrl', params, 5000);
+    } catch (e) {
+      throw new BridgeErr(`capture break failed to plant: ${(e && e.message) || e}`);
+    }
+    const bpId = res && res.breakpointId;
+    if (!bpId) {
+      throw new BridgeErr(`capture break failed to plant: ${b.frag}:${b.line}`);
+    }
+    // Hit-attribution only (never in stopStates/cfg: `breaks` and
+    // stops.json never see the ephemeral).
+    const rec = { spec: this.dispSpec(b, 'break'), kind: 'break', hits: 0 };
+    this.breakIdToRec.set(bpId, { rec, line: b.line });
+    return { kind: 'planted', bpId };
+  }
+
+  /** Remove a capture ephemeral BEFORE resume. Throws on failure (the
+   *  caller still resumes, then reports removeError). */
+  async captureUnplant(token) {
+    if (!token || token.kind === 'dup') return;
+    if (token.kind !== 'planted') throw new BridgeErr(`bad capture token: ${token.kind}`);
+    try {
+      await this.cdp.request('Debugger.removeBreakpoint', { breakpointId: token.bpId }, 5000);
+    } finally {
+      this.breakIdToRec.delete(token.bpId);
+    }
+  }
+
+  /** One-shot bounded stop. Pre-parked tab: collect WITHOUT resuming.
+   *  Fresh park: collect, REMOVE EPHEMERAL BEFORE RESUME, auto-resume
+   *  within the pause budget (overrun still resumes, then reports). Any
+   *  collection/removal failure still resumes; timeout never resumes
+   *  (nothing parked). No eval, no persisted vars. */
+  async cmdCapture(req, timeout) {
+    const { frames, vars, budget, spec } = this.captureBounds(req);
+    await this.verifyTab();
+    this.requireLive();
+    if (this.paused) {
+      const { snapshot, framesTruncated, varsTruncated } =
+        await this.boundedSnapshot(frames, vars);
+      return {
+        ok: true, stopped: true, target: 'main',
+        targetWasPaused: true, resumed: false,
+        pauseDurationMs: 0, pauseBudgetMs: budget, ephemeralPlanted: false,
+        truncated: { frames: framesTruncated, vars: varsTruncated },
+        snapshot, diag: this.stopDiag(snapshot.threads),
+        warning: PARK_WARNING,
+      };
+    }
+    let token = null;
+    if (spec !== null) token = await this.capturePlant(spec);
+    try {
+      await this.pump(timeout);
+    } catch (e) {
+      // Timeout/exit/reload: nothing parked by us — no resume — but the
+      // ephemeral must not leak.
+      try {
+        await this.captureUnplant(token);
+      } catch (ue) {
+        throw new BridgeErr(`${(e && e.message) || e}; capture ephemeral may still be planted (breaks remove to clear)`);
+      }
+      throw e;
+    }
+    const parkMs = (this.lastDiag && this.lastDiag.target === 'main' && this.lastDiag.atMs) || Date.now();
+    let snapErr = null, removeErr = null, resumeErr = null;
+    let snapshot, framesTruncated = false, varsTruncated = false;
+    try {
+      ({ snapshot, framesTruncated, varsTruncated } =
+        await this.boundedSnapshot(frames, vars));
+    } catch (e) {
+      snapErr = String((e && e.message) || e);
+      snapshot = {
+        mode: 'session', location: await this.locationJson(), threads: [],
+        frames: [], output: this.outputTail.slice(-MAX_OUTPUT),
+      };
+    }
+    // REMOVE EPHEMERAL BEFORE RESUME — even when collection failed.
+    try {
+      await this.captureUnplant(token);
+    } catch (e) { removeErr = String((e && e.message) || e); }
+    // Resume while still marked paused (honest on failure: the park
+    // stands and resumed:false is reported).
+    const saved = this.paused;
+    const savedCount = (saved && saved.frames ? saved.frames.length : 0);
+    let resumed = false;
+    try {
+      if (this.paused) {
+        this.paused = null;
+        this.cachedLocals = [];
+        this.publishState(false);
+        try {
+          await this.cdp.request('Debugger.resume');
+        } catch (e) {
+          if (!this.paused) {
+            this.paused = saved;
+            this.publishState(true);
+          }
+          throw e;
+        }
+      }
+      if (!this.paused) this.awaitingStep = false;
+      resumed = true;
+    } catch (e) { resumeErr = String((e && e.message) || e); }
+    const pauseMs = Date.now() - parkMs;
+    let diag;
+    try {
+      diag = this.stopDiag((snapshot && snapshot.threads) || []);
+    } catch (_) { diag = { target: 'main' }; }
+    diag.pauseDurationMs = pauseMs;
+    diag.targetWasPaused = false;
+    diag.resumed = resumed;
+    const resp = {
+      ok: true, stopped: true, target: 'main',
+      targetWasPaused: false, resumed,
+      pauseDurationMs: pauseMs, pauseBudgetMs: budget,
+      budgetExceeded: pauseMs > budget,
+      ephemeralPlanted: !!(token && token.kind === 'planted'),
+      truncated: { frames: savedCount > frames || framesTruncated, vars: varsTruncated },
+      snapshot, diag, warning: PARK_WARNING,
+    };
+    if (snapErr !== null) resp.snapshotError = snapErr;
+    if (removeErr !== null) resp.removeError = removeErr;
+    if (resumeErr !== null) resp.resumeError = resumeErr;
+    return resp;
   }
 
   async cmdStep(req, timeout) {
@@ -1233,12 +1717,16 @@ class Session {
       if (!this.paused) this.awaitingStep = false;
       throw e;
     }
+    const snapshot = await this.snapshot();
     return {
       ok: true,
       stopped: true,
+      target: 'main',
       changed: JSON.parse(this.lastChanged),
       stopInfo: JSON.parse(this.stopInfo || 'null'),
-      snapshot: await this.snapshot(),
+      snapshot,
+      diag: this.stopDiag(snapshot.threads),
+      warning: PARK_WARNING,
     };
   }
 
@@ -1374,6 +1862,7 @@ class Session {
       }
       const rec = { spec: this.dispSpec(f, 'break'), kind: 'break', hits: 0 };
       this.breakIdToRec.set(bpId, { rec, line: f.line });
+      this.breakRecByKey.set(`${f.frag}:${f.line}|${f.cond || ''}`, rec);
       const locs = res.locations || [];
       const slidLoc = (locs.map((l) => l.lineNumber + 1).find((n) => n !== f.line));
       if (slidLoc !== undefined) {
@@ -1385,6 +1874,10 @@ class Session {
       }
       this.stopStates.push(rec);
       this.cfg.breaks.push({ frag: f.frag, line: f.line, cond: f.cond });
+      this.breakKeys.set(`${f.frag}:${f.line}|${f.cond || ''}`, bpId);
+      if (!this.breakRaws.has(`${f.frag}:${f.line}|${f.cond || ''}`)) {
+        this.breakRaws.set(`${f.frag}:${f.line}|${f.cond || ''}`, f.raw);
+      }
       const entry = { raw: f.raw, spec: rec.spec, kind: 'break', state: rec.state, hits: 0 };
       if (rec.detail) entry.detail = rec.detail;
       added.push(entry);
@@ -1401,23 +1894,225 @@ class Session {
     return resp;
   }
 
+  /** Lexical remove-spec parse (add normalization minus frag existence:
+   *  the script may be gone and removal still works). */
+  lexBreak(raw) {
+    let cond = null;
+    let head = raw;
+    const bar = raw.indexOf('|');
+    if (bar >= 0) {
+      head = raw.slice(0, bar);
+      cond = raw.slice(bar + 1).trim();
+      if (!cond) throw new BridgeErr(`bad break spec: ${JSON.stringify(raw)}`);
+    }
+    if (head === 'exc' || head.startsWith('exc:') || head.startsWith('method:')) {
+      throw new BridgeErr(`breaks remove takes line breaks only (got '${raw}')`);
+    }
+    const colon = head.lastIndexOf(':');
+    if (colon <= 0) throw new BridgeErr(`bad break spec: ${JSON.stringify(raw)}`);
+    const lineno = parseInt(head.slice(colon + 1), 10);
+    if (Number.isNaN(lineno) || lineno < 1) {
+      throw new BridgeErr(`bad break spec: ${JSON.stringify(raw)}`);
+    }
+    return { frag: head.slice(0, colon), line: lineno, cond };
+  }
+
+  breakKeyOf(b) {
+    return `${b.frag}:${b.line}|${b.cond || ''}`;
+  }
+
+  matchStoredBreak(raw) {
+    try {
+      const b = this.lexBreak(raw);
+      const key = this.breakKeyOf(b);
+      if (this.breakRaws.has(key)) return key;
+    } catch (_) { /* fall to stored-raw match */ }
+    for (const [key, stored] of this.breakRaws) {
+      if (stored === raw) return key;
+    }
+    return null;
+  }
+
+  /**
+   * Remove live line breaks by stored identity (running or parked).
+   * Phase 1 matches the whole batch with zero CDP traffic (unmatched specs
+   * land in `missing`, never ok:false); phase 2 drops each confirmed break
+   * via Debugger.removeBreakpoint. `removed[]` echoes the persisted stored
+   * raws. A removed break re-arms a same-line shadowed startup logpoint via
+   * the normal logpoint path (or records pending + warning). Reload never
+   * restores removed breaks (plants come from cfg, which already dropped
+   * them).
+   */
+  async cmdBreaksRemove(req) {
+    await this.verifyTab();
+    if (this.exited) throw new BridgeErr(EXITED_MSG);
+    const raws = req.breaks;
+    if (!Array.isArray(raws) || raws.length === 0) {
+      throw new BridgeErr('breaks remove needs at least one --break');
+    }
+    for (const r of raws) {
+      if (typeof r !== 'string' || !r) throw new BridgeErr(`bad break spec: ${JSON.stringify(r)}`);
+    }
+    const seen = new Set();
+    const matched = [];
+    const missing = [];
+    for (const r of raws) {
+      if (seen.has(r)) continue;
+      seen.add(r);
+      const key = this.matchStoredBreak(r);
+      if (key === null) missing.push(r);
+      else if (!matched.includes(key)) matched.push(key);
+    }
+    if (matched.length === 0) return { ok: true, removed: [], missing, stops: this.stopStates };
+    return this.dropBreakKeys(matched, missing);
+  }
+
+  async cmdBreaksClear() {
+    await this.verifyTab();
+    if (this.exited) throw new BridgeErr(EXITED_MSG);
+    const ordered = [];
+    for (const b of this.cfg.breaks) {
+      const key = this.breakKeyOf(b);
+      if (this.breakRaws.has(key) && !ordered.includes(key)) ordered.push(key);
+    }
+    for (const key of this.breakRaws.keys()) {
+      if (!ordered.includes(key)) ordered.push(key);
+    }
+    if (ordered.length === 0) return { ok: true, removed: [], stops: this.stopStates };
+    return this.dropBreakKeys(ordered, []);
+  }
+
+  async dropBreakKeys(keys, missing) {
+    const removed = [];
+    const failed = [];
+    for (const key of keys) {
+      const bpId = this.breakKeys.get(key);
+      // The live record by canonical key — exact even for rejected plants
+      // (bpId null) whose relative display spec never matches the key.
+      const rec = this.breakRecByKey.get(key)
+        || (bpId && this.breakIdToRec.get(bpId) && this.breakIdToRec.get(bpId).rec)
+        || null;
+      if (bpId) {
+        try {
+          await this.cdp.request('Debugger.removeBreakpoint', { breakpointId: bpId }, 5000);
+        } catch (_) {
+          failed.push({ raw: this.breakRaws.get(key) || '', spec: key, error: 'backend call failed' });
+          continue;
+        }
+        this.breakIdToRec.delete(bpId);
+      }
+      const storedRaw = this.breakRaws.get(key) || '';
+      this.breakKeys.delete(key);
+      this.breakRaws.delete(key);
+      this.breakRecByKey.delete(key);
+      const sep = key.lastIndexOf('|');
+      const loc = sep < 0 ? key : key.slice(0, sep);
+      const cpos = loc.lastIndexOf(':');
+      const kfrag = loc.slice(0, cpos);
+      const kline = parseInt(loc.slice(cpos + 1), 10);
+      const kcond = sep < 0 ? null : (key.slice(sep + 1) || null);
+      const bi = this.cfg.breaks.findIndex((b) => b.frag === kfrag && b.line === kline && (b.cond || null) === kcond);
+      if (bi >= 0) this.cfg.breaks.splice(bi, 1);
+      if (rec) {
+        const ri = this.stopStates.indexOf(rec);
+        if (ri >= 0) this.stopStates.splice(ri, 1);
+      }
+      removed.push({ raw: storedRaw, spec: rec ? rec.spec : loc, kind: 'break', hits: 0 });
+      await this.rearmShadowedLogpoint(kfrag, kline);
+    }
+    if (removed.length === 0) {
+      throw new BridgeErr(`breaks remove failed for ${keys.length} break(s): ` + keys.join(', '));
+    }
+    const resp = { ok: true, removed, stops: this.stopStates };
+    if (missing.length > 0) resp.missing = missing;
+    if (failed.length > 0) {
+      resp.failed = failed;
+      resp.warning = 'partial remove: no change for ' + failed.map((f) => f.raw).filter(Boolean).join(', ');
+    }
+    return resp;
+  }
+
+  /** Re-plant a startup-shadowed logpoint freed by a break removal (the
+   *  break won; no plant exists). Failures record pending + warning —
+   *  never a silent resurrection. */
+  async rearmShadowedLogpoint(kfrag, kline) {
+    const idx = this.shadowedLogs.findIndex((s) => s.frag === kfrag && s.line === kline);
+    if (idx < 0) return;
+    const shadow = this.shadowedLogs[idx];
+    this.shadowedLogs.splice(idx, 1);
+    let res;
+    try {
+      res = await this.cdp.request('Debugger.setBreakpointByUrl', {
+        urlRegex: fragRegex(shadow.frag), lineNumber: shadow.line - 1,
+      }, 5000);
+    } catch (e) {
+      this.stopStates.push({
+        spec: `${shadow.frag}:${shadow.line}`, kind: 'logpoint',
+        state: 'pending', detail: `${shadow.template} (re-arm failed: ${(e && e.message) || e})`, hits: 0,
+      });
+      return;
+    }
+    const bpId = res.breakpointId;
+    if (!bpId) {
+      this.stopStates.push({
+        spec: `${shadow.frag}:${shadow.line}`, kind: 'logpoint',
+        state: 'pending', detail: `${shadow.template} (re-arm rejected)`, hits: 0,
+      });
+      return;
+    }
+    this.logpointIds.set(bpId, shadow.template);
+    const rec = {
+      spec: `${shadow.frag}:${shadow.line}`, kind: 'logpoint',
+      detail: shadow.template, hits: 0,
+    };
+    const locs = res.locations || [];
+    rec.state = locs.length > 0 ? 'verified' : 'pending';
+    if (rec.state === 'pending') rec.detail = `${shadow.template} (no locations yet)`;
+    this.breakIdToRec.set(bpId, { rec, line: shadow.line });
+    this.stopStates.push(rec);
+    this.cfg.logpoints.push({ frag: shadow.frag, line: shadow.line, template: shadow.template });
+  }
+
   async dispatch(req) {
     const cmd = req.cmd;
     let timeout = Number(req.timeout !== undefined ? req.timeout : this.cfg.timeout);
     if (!Number.isFinite(timeout) || timeout <= 0 || timeout > 3600) throw new BridgeErr('timeout must be between 0 and 3600 seconds');
+    // Close is terminal and always accepted, even with a resume
+    // outstanding (the bridge never deadlocks waiting for a handler that
+    // itself awaits a stop).
     if (cmd === 'close') throw new CloseSession();
-    if (cmd === 'context') return await this.cmdContext();
-    if (cmd === 'stack') return await this.cmdStack();
-    if (cmd === 'vars') return await this.cmdVars(req);
-    if (cmd === 'eval') return await this.cmdEval(req);
-    if (cmd === 'step') return await this.cmdStep(req, timeout);
-    if (cmd === 'continue') return await this.cmdContinue(req, timeout);
-    if (cmd === 'reload') return await this.cmdReload(req, timeout);
-    if (cmd === 'threads') return await this.cmdThreads();
-    if (cmd === 'breaks') return await this.cmdBreaks();
-    if (cmd === 'breaksAdd') return await this.cmdBreaksAdd(req);
-    if (cmd === 'logs') return this.cmdLogs(req);
-    throw new BridgeErr(`unknown cmd: ${cmd}`);
+    if (this.closing) throw new BridgeErr('session is closing');
+    // M5 acceptance section: everything below runs synchronously (no
+    // await), so concurrent handlers observe one atomic decision —
+    // immediate busy rejection and resume registration BEFORE any CDP
+    // traffic.
+    const busy = this.busyError(cmd);
+    if (busy) throw new BridgeErr(busy);
+    let resumeTid = null;
+    if (RESUME_CMDS.has(cmd) || WAIT_CMDS.has(cmd) || CAPTURE_CMDS.has(cmd)) {
+      this.outstanding.set('main', cmd);
+      resumeTid = 'main';
+    }
+    try {
+      if (cmd === 'context') return await this.cmdContext();
+      if (cmd === 'stack') return await this.cmdStack();
+      if (cmd === 'vars') return await this.cmdVars(req);
+      if (cmd === 'eval') return await this.cmdEval(req);
+      if (cmd === 'step') return await this.cmdStep(req, timeout);
+      if (cmd === 'continue') return await this.cmdContinue(req, timeout);
+      if (cmd === 'wait') return await this.cmdWait(req, timeout);
+      if (cmd === 'capture') return await this.cmdCapture(req, timeout);
+      if (cmd === 'reload') return await this.cmdReload(req, timeout);
+      if (cmd === 'threads') return await this.cmdThreads();
+      if (cmd === 'breaks') return await this.cmdBreaks();
+      if (cmd === 'breaksAdd') return await this.cmdBreaksAdd(req);
+      if (cmd === 'breaksRemove') return await this.cmdBreaksRemove(req);
+      if (cmd === 'breaksClear') return await this.cmdBreaksClear();
+      if (cmd === 'logs') return this.cmdLogs(req);
+      throw new BridgeErr(`unknown cmd: ${cmd}`);
+    } finally {
+      if (resumeTid !== null) this.clearOutstanding(cmd, resumeTid);
+    }
   }
 
   async cleanup() {
@@ -1433,7 +2128,7 @@ class Session {
 }
 
 function fmtTimeout(t) {
-  return String(t);
+  return `${t}s`;
 }
 
 // ---------------------------------------------------------------- serve
@@ -1441,9 +2136,63 @@ function fmtTimeout(t) {
 // Node emits 'connection' eagerly, even with no listener attached.)
 
 async function serve(st, server, queue) {
+  // M5: connections are handled concurrently (one handler per connection,
+  // at most MAX_ACTIVE_HANDLERS; overflow is an immediate rejection, never
+  // an unbounded spawn). Live reads serve published state while a resume
+  // is outstanding; rivals busy-reject in dispatch. A client disconnect
+  // drops only its own response.
+  async function handleConn(conn) {
+    st.activeConns += 1;
+    try {
+      let req;
+      try {
+        req = await readFrame(conn);
+      } catch (e) {
+        try {
+          await writeFrame(conn, { ok: false, error: String((e && e.message) || e) });
+        } catch (_) { /* client already gone — nothing to answer */ }
+        return;
+      }
+      try {
+        const resp = await st.dispatch(req);
+        if (resp && typeof resp === 'object' && !('target' in resp)) {
+          resp.target = 'main';
+        }
+        try {
+          await writeFrame(conn, resp);
+        } catch (_) { /* client went away mid-command: work already ran */ }
+      } catch (e) {
+        if (e instanceof CloseSession) {
+          // Terminal and accepted despite any outstanding resume: never
+          // wait for a handler that itself awaits a stop — detach now.
+          // The serve loop below gives in-flight handlers a bounded grace
+          // to flush their aborts.
+          try {
+            await writeFrame(conn, { ok: true, closed: true, target: 'main' });
+          } catch (_) { /* client already gone */ }
+          st.closing = true;
+          await st.cleanup().catch(() => {});
+          return;
+        }
+        const msg = e instanceof BridgeErr ? e.message : `internal: ${(e && e.message) || e}`;
+        try {
+          await writeFrame(conn, { ok: false, error: msg, target: 'main' });
+        } catch (_) { /* client already gone */ }
+      }
+    } finally {
+      conn.destroy();
+      st.activeConns -= 1;
+    }
+  }
+
   for (;;) {
     if (!amOwner(st.cfg.dir)) {
       await st.cleanup().catch(() => {});
+      process.exit(0);
+    }
+    if (st.closing) {
+      await sleep(500);
+      await closeServer(server);
       process.exit(0);
     }
     // Idle wait gets a 1s deadline so rm -rf abandonment is noticed
@@ -1456,44 +2205,32 @@ async function serve(st, server, queue) {
         sleep(1000),
       ]);
       queue.waiter = null;
+      if (st.closing) break;
       if (queue.length === 0 && !amOwner(st.cfg.dir)) {
         await st.cleanup().catch(() => {});
         process.exit(0);
       }
     }
+    if (st.closing) continue;
     const conn = queue.shift();
-    try {
-      let req;
+    if (!conn) continue;
+    if (st.activeConns >= MAX_ACTIVE_HANDLERS) {
       try {
-        req = await readFrame(conn);
-      } catch (e) {
-        try {
-          await writeFrame(conn, { ok: false, error: String((e && e.message) || e) });
-        } catch (_) { /* client already gone — nothing to answer */ }
-        continue;
-      }
-      try {
-        await writeFrame(conn, await st.dispatch(req));
-      } catch (e) {
-        if (e instanceof CloseSession) {
-          try {
-            await writeFrame(conn, { ok: true, closed: true });
-          } catch (_) { /* client already gone */ }
-          await st.cleanup();
-          return;
-        }
-        const msg = e instanceof BridgeErr ? e.message : `internal: ${(e && e.message) || e}`;
-        try {
-          await writeFrame(conn, { ok: false, error: msg });
-        } catch (_) { /* client already gone */ }
-      }
-    } finally {
+        await writeFrame(conn, { ok: false, error: 'overloaded: too many active handlers', target: 'main' });
+      } catch (_) { /* client already gone */ }
       conn.destroy();
+      continue;
     }
+    handleConn(conn).catch(() => {});
   }
 }
 
-function writeSessionFile(dir, obj) {
+function writeSessionFile(dir, obj, cfg) {
+  // Main-path session.json writes carry the tab observed identity;
+  // explicit null keeps legacy readers honest.
+  if (obj && typeof obj === 'object' && !('observedTarget' in obj)) {
+    obj = { ...obj, observedTarget: (cfg && cfg.observedTarget) || null };
+  }
   writeFile(path.join(dir, 'session.json'), JSON.stringify(obj));
 }
 
@@ -1541,6 +2278,14 @@ async function main(argv) {
     // 'error' (EPIPE on disconnect) rethrows and crashes the process.
     // framing.readFrame also listens, but cover the pre-read window too.
     conn.on('error', () => {});
+    // M5: the queue itself is bounded — flood overflow is destroyed
+    // immediately (the client retries) instead of piling unbounded work.
+    if (queue.length >= MAX_QUEUED_CONNS) {
+      try {
+        conn.destroy();
+      } catch (_) { /* already gone */ }
+      return;
+    }
     queue.push(conn);
     if (queue.waiter) {
       const w = queue.waiter;
@@ -1563,7 +2308,7 @@ async function main(argv) {
     writeSessionFile(cfg.dir, {
       name: path.basename(cfg.dir), kind: cfg.kind, port, stopped: false,
       lastStop: st.lastStop, updatedAt: Math.floor(Date.now() / 1000),
-    });
+    }, cfg);
     try {
       await serve(st, server, queue);
     } finally {
