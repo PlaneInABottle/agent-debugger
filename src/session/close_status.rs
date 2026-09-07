@@ -385,19 +385,6 @@ mod tests {
         port
     }
 
-    /// A listener that accepts and never answers (blackhole stranger).
-    fn spawn_blackhole() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            for mut conn in listener.incoming().flatten() {
-                std::thread::sleep(Duration::from_secs(30));
-                let _ = conn.shutdown(std::net::Shutdown::Both);
-            }
-        });
-        port
-    }
-
     fn framed(body: &Value) -> Vec<u8> {
         dap::encode_message(body)
     }

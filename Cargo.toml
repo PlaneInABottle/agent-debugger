@@ -2,6 +2,14 @@
 name = "agent-debugger"
 version = "0.2.0"
 edition = "2021"
+description = "Headless, snapshot-first multi-language debugger for AI agents and terminal workflows"
+authors = ["PlaneInABottle <mirza.altay@protonmail.com>"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/PlaneInABottle/agent-debugger"
+homepage = "https://github.com/PlaneInABottle/agent-debugger"
+keywords = ["debugger", "agent", "headless", "dap", "cdp"]
+categories = ["development-tools::debugging", "command-line-utilities"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
