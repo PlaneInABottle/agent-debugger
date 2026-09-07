@@ -642,7 +642,9 @@ const EXITED_MSG = 'target tab has closed — close this session';
 // Routing rule (grep-enforced via scripts/check_browserbridge_owners.sh,
 // wired into scripts/run_gates.sh --unit): production code mutates owner
 // state only through owner methods — never `server.active`/`server.closing`
-// writes and never `_mutationTail` outside SerialChain/ServerState.
+// writes, never a wholesale `this.server`/`this._mutationChain`
+// replacement, never direct `_mutationChain` tail/depth writes, and never
+// `_mutationTail` outside SerialChain/ServerState.
 // Reads of owned counters (active/closing) and chain entry via
 // _mutationRun stay direct.
 

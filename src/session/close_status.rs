@@ -3,7 +3,9 @@ use super::attach::{probe_session_bridge, published_recently, Probe};
 use super::forward::forward_target;
 use super::identity::{layered_identity_or_null, stops_armed};
 use super::locks::{quarantine_verified, stale_startup_mtime, startup_lock_path};
-use super::paths::{check_name, checked_session_dir, session_port, sessions_dir};
+use super::paths::{
+    check_name, checked_session_dir, real_dir_for_delete, session_port, sessions_dir,
+};
 use super::sidecar::{cli_markers_v2, session_lang_opt, SCHEMA_VERSION};
 use crate::client;
 use serde_json::{json, Value};
@@ -99,6 +101,28 @@ pub(crate) fn remove_unpublished_dir(
     if !dir.join("session.json").exists() && startup_lock_path(sessions_root, name).exists() {
         anyhow::bail!("session '{name}' is starting; retry shortly");
     }
+    // Immediate lstat-before-delete (best-effort, not a TOCTOU proof): the
+    // gate above ran before the bridge forward, so a path swapped to a
+    // symlink in between must never be followed by the recursive delete.
+    if !real_dir_for_delete(dir, "cannot remove session")? {
+        anyhow::bail!("cannot remove session: {} does not exist", dir.display());
+    }
+    std::fs::remove_dir_all(dir).map_err(|e| anyhow::anyhow!("cannot remove session: {e}"))?;
+    Ok(())
+}
+
+/// Foreign-probe close seam: the listener is proven not ours, so the dir
+/// is dropped unconfirmed — but only after the same immediate
+/// lstat-before-delete as above (the 65 s close round-trip plus the probe
+/// window passed since entry validation, so a swapped-in symlink must
+/// refuse here, never delete through). Separated from
+/// `remove_unpublished_dir` (no startup-lock recheck: a port was read, so
+/// the session published) so tests exercise this exact deletion without
+/// network waits.
+pub(crate) fn remove_dir_after_foreign_probe(dir: &std::path::Path) -> anyhow::Result<()> {
+    if !real_dir_for_delete(dir, "cannot remove session")? {
+        anyhow::bail!("cannot remove session: {} does not exist", dir.display());
+    }
     std::fs::remove_dir_all(dir).map_err(|e| anyhow::anyhow!("cannot remove session: {e}"))?;
     Ok(())
 }
@@ -138,8 +162,7 @@ pub fn close(name: &str) -> anyhow::Result<Value> {
             // uncertainty.
             match probe_session_bridge(port, Duration::from_secs(2)) {
                 Probe::NotOurs(_) => {
-                    std::fs::remove_dir_all(&dir)
-                        .map_err(|e| anyhow::anyhow!("cannot remove session: {e}"))?;
+                    remove_dir_after_foreign_probe(&dir)?;
                     return Ok(json!({"closed": name, "confirmed": false, "target": "main"}));
                 }
                 Probe::Ours | Probe::Unclear => {}
@@ -539,6 +562,59 @@ mod tests {
         remove_unpublished_dir(&root, name, &dir).expect("published proceeds");
         assert!(!dir.exists(), "published dir removed");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn close_deletion_seams_refuse_symlink_swap() {
+        // Both close deletions, exercised exactly (no close() network
+        // waits: the 65 s close round-trip + probe + 15 s death poll never
+        // run): swap the session dir for a symlink to an outside dir just
+        // before each seam, assert the seam bails and the outside target
+        // stays intact (sentinel present, link itself never followed).
+        let seams: [(
+            &str,
+            fn(&std::path::Path, &str, &std::path::Path) -> anyhow::Result<()>,
+        ); 2] = [
+            ("remove_unpublished_dir", |root, name, dir| {
+                remove_unpublished_dir(root, name, dir)
+            }),
+            ("remove_dir_after_foreign_probe", |_root, _name, dir| {
+                remove_dir_after_foreign_probe(dir)
+            }),
+        ];
+        for (label, delete) in seams {
+            let root = tmpdir(&format!("close-symlink-{label}"));
+            let name = "demo";
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("marker.txt"), "session-data").unwrap();
+            let outside = root.join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("sentinel.txt"), "do-not-touch").unwrap();
+            // Swap the session dir for a symlink just before the deletion.
+            std::fs::remove_dir_all(&dir).unwrap();
+            std::os::unix::fs::symlink(&outside, &dir).unwrap();
+            let err = delete(&root, name, &dir).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("must not be a symlink"),
+                "{label}: {err:#}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(outside.join("sentinel.txt")).unwrap(),
+                "do-not-touch",
+                "{label}: outside target intact"
+            );
+            assert!(
+                std::fs::symlink_metadata(&dir)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false),
+                "{label}: link itself preserved, never followed"
+            );
+            // Drop the planted link itself (never through it), then the root.
+            std::fs::remove_file(&dir).unwrap();
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[test]

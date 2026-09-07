@@ -22,10 +22,11 @@ line numbers (line numbers drift; symbols are grep-stable).
 CLI (src/cli.rs: Stops, *Cmd) ── dispatch ──► src/main.rs ──┬──► src/spawn.rs
      │                                                        │    (Target enum, cmd_spawn,
      │                                                        │     seed_target_identity)
-     │                                                        └──► src/session.rs
-     │                                                             (locks, persistence,
-     │                                                              forward*, status/close,
-     │                                                              seeds, probes)
+     │                                                        └──► src/session/
+     │                                                             (mod.rs facade; locks,
+     │                                                              persistence, forward*,
+     │                                                              status/close, seeds,
+     │                                                              probes)
      │                                                                   │
      │                                          framed Content-Length JSON│ (src/client.rs:
      │                                          MAX_FRAME_BYTES 64 MiB;  │  one request per
@@ -72,7 +73,7 @@ via `include_str!` (`src/bridge.rs`: `PYBRIDGE_SOURCE`, `NODEBRIDGE_SOURCE`,
 and materializes them on first use via `ensure_*` (`ensure_pybridge`,
 `ensure_nodebridge`/`ensure_browserbridge`, `ensure_compiled`,
 `ensure_js_shared`, `ensure_ws`) into `~/.agent-debugger/adapters/`;
-`setup_bridge` in `src/session.rs` spawns that materialized copy. There is no
+`setup_bridge` in `src/session/spawn_lifecycle.rs` spawns that materialized copy. There is no
 separate bridge distribution channel.
 
 ## 2. Ownership table + non-goals
@@ -81,7 +82,7 @@ separate bridge distribution channel.
 |------|---------------|----------------------|----------------|
 | CLI surface | `src/cli.rs`, `src/main.rs` dispatch | flags, `Stops`, subcommand routing to `spawn`/`session` | sidecar bytes, bridge protocol |
 | Spawn/targets | `src/spawn.rs` (`Target`, `cmd_spawn`, `seed_target_identity`, `launch_seed`/`attach_seed`) | bridge argv, `--target-identity` seed (before `--`), `stops.json` intent summary | bridge-owned `session.json`/`error.json` |
-| Session state | `src/session.rs` | locks, atomic sidecar writes, `forward`/`forward_target`, `cmd_breaks_add`/`remove`/`clear`, `cmd_targets`/`cmd_targets_in`, `cmd_context_target`, `cmd_reload`, `spawn_in`, `close`, `status`/`session_entry`, probes, seeds, redaction/caps | DAP/CDP/JDWP wire details |
+| Session state | `src/session/` (`mod.rs` facade over `close_status.rs`, `forward.rs`, `breaks.rs`, `spawn_lifecycle.rs`, `attach.rs`, `locks.rs`, `paths.rs`, `sidecar.rs`, `identity.rs`) | locks, atomic sidecar writes, `forward`/`forward_target`, `cmd_breaks_add`/`remove`/`clear`, `cmd_targets`/`cmd_targets_in`, `cmd_context_target`, `cmd_reload`, `spawn_in`, `close`, `status`/`session_entry`, probes, seeds, redaction/caps | DAP/CDP/JDWP wire details |
 | Transport | `src/client.rs`, `src/dap.rs` | `Content-Length` framing, 64 MiB / 8192 B bounds | session semantics |
 | Failure envelope | `src/output.rs` (`BridgeFailure`) | shape `{target_identity, requested_target}` passthrough | identity content (session's job) |
 | Python bridge | `bridge/py/src/pybridge.py` (single file) | DAP sessions, `dispatch`/`serve`, `publish_state`, child roster (`debugpyAttach`), breakpoint merge | CLI sidecars (`lang.json`/`stops.json`) |
@@ -123,13 +124,13 @@ written atomically (tmp+rename in the same dir — `write_sidecar` /
 
 ## 4. Stateful boundary inventory (symbols, not line numbers)
 
-- **Startup lock** (`src/session.rs`): `startup_lock_path`,
+- **Startup lock** (`src/session/locks.rs`): `startup_lock_path`,
   `acquire_startup_lock` / `release_startup_lock` / `startup_lock_is_mine`,
   `claim_stale_startup_lock`, `stale_startup_mtime`, `startup_close_gate`.
   Rule: created atomically before stale-dir clear, held through the wait loop;
   only a provably stale lock (mtime-bound) is stolen via verified
   detach-and-reconcile — never a live starter's.
-- **Endpoint locks** (`src/session.rs`): `endpoint_locks_dir` /
+- **Endpoint locks** (`src/session/locks.rs`): `endpoint_locks_dir` /
   `endpoint_locks_dir_for`, `endpoint_lock_path`, `acquire_endpoint_lock` /
   `release_endpoint_lock`, `endpoint_lock_session_name`,
   `reclaim_stale_lock` / `detach_to_quarantine` / `lock_snapshot_is_stale`,
@@ -137,7 +138,7 @@ written atomically (tmp+rename in the same dir — `write_sidecar` /
   + legacy scans (endpoint-matched `endpoint-already-attached`, then global
   `unsupported-legacy-live`). Browser never collides (`attach_exclusive`
   covers only `py|node|java`).
-- **Breaks lock** (`src/session.rs`): `breaks_lock_path`,
+- **Breaks lock** (`src/session/locks.rs`): `breaks_lock_path`,
   `acquire_breaks_lock` (`BreaksGuard`, create_new + nonce + stale-steal).
   Serializes concurrent `stops.json` append/remove (see
   `breaks_lock_serializes_concurrent_appends` test).
@@ -146,7 +147,7 @@ written atomically (tmp+rename in the same dir — `write_sidecar` /
   event-queue consumer (the session thread); evaluation Phase A runs OUTSIDE
   the lock, Phase B commits under it. Any future split must preserve exactly
   one ordering per bridge.
-- **Target resolution / local state** (`src/session.rs`): `forward_target`
+- **Target resolution / local state** (`src/session/forward.rs` + `src/session/identity.rs`): `forward_target`
   (most-recent-stopped live target, else main) + `stamp_main`;
   `cmd_targets` / `cmd_targets_in` / `targets_use_local_roster` (java/browser
   stay CLI-side rosters — no bridge `targets` protocol there);
@@ -173,9 +174,9 @@ written atomically (tmp+rename in the same dir — `write_sidecar` /
   `sessionLock`, one event-queue consumer). Terminal `close`: framed
   `{"cmd":"close"}` (all bridges: py `dispatch`, node/browser `dispatch`,
   Java `case "close": throw new CloseSession()`), 65 s queued-close tolerance
-  + 15 s port-death check (`close` in `src/session.rs`), then
+  + 15 s port-death check (`close` in `src/session/close_status.rs`), then
   `remove_dir_all`. `close` has no version gate, ever.
-- **Spawn / close / status / probe** (`src/session.rs` + `src/spawn.rs`):
+- **Spawn / close / status / probe** (`src/session/close_status.rs` + `src/session/spawn_lifecycle.rs` + `src/spawn.rs`):
   `cmd_spawn` → `spawn` → `spawn_in` → `setup_bridge` → wait loop
   (`session.json` + first `context`/`threads` validation; failed setup
   wholesale-clears the dir, no leak); same-name v2 always bails
@@ -250,7 +251,7 @@ Why Python/Node/Browser stay single-file:
   session + `NodeWorker` wrapper + swap mutex + slide/resolve state) and
   `browserbridge.js` (`verifyTab` liveness woven through every command +
   reload interplay).
-- `src/session.rs` co-locates the three lock families, the atomic sidecar
+- `src/session/` co-locates the three lock families, the atomic sidecar
   writes, and the close/status/reclaim paths that must agree on the exact
   same stale/proven-dead definitions. Moving one without the others reopens
   the TOCTOU windows the quarantine + nonce + mtime-bound machinery closed.
@@ -363,16 +364,16 @@ untouched. Zero protocol/sidecar/schema delta; Python/Rust/Node untouched.
 
 ## 7. Test map (boundary → exact files)
 
-| Boundary | Rust unit (`cargo test`, incl. `src/session.rs` tests) | Bridge unit | Live / matrix |
+| Boundary | Rust unit (`cargo test`, incl. `src/session/` tests) | Bridge unit | Live / matrix |
 |----------|--------------------------------------------------------|-------------|---------------|
 | Framing/bounds | `src/dap.rs` tests (8192/header/64 MiB) | `tests/framing.test.js` | — |
 | Setup/error phases | `error.json` phase tests (`transport`/`config`/`runtime`, corrupt message) | `tests/setup_phase.test.js`, `tests/test_pybridge.py` | `tests/test_error_attribution.py` |
 | Target identity (no `observedTarget`) | `owner_*`, `session_entry` asserts (`observedTarget` absent, flat never promoted) | `tests/target_identity.test.js` | `tests/test_live.py` identity cases |
 | Breaks add/remove/clear | `confirmed_*` persistence tests, `breaks_lock_*` | `tests/breaks_add.test.js`, `tests/breaks_remove.test.js`, `tests/m3_fixes.test.js`, `tests/m4_fixes.test.js` | `tests/test_live.py` live add/remove |
-| Concurrency/serve | lock/quarantine unit tests (`reclaim_*`, `detach_*`, endpoint claim) | `tests/breaks_concurrency_matrix.test.js`, `tests/m5_concurrency.test.js`, `tests/test_pybridge.py` (+12 M5), `tests/test_pybridge_owners.py` (M3 narrow-owner tests: registry lifecycle/swap incl. missing-child exit, server pool/close) | `tests/test_breaks_concurrency_matrix.py`, `tests/test_m5_live.py` (6 scenarios) |
-| Close under load | `close` confirm/port-death tests | `tests/close_under_load.test.js` | `tests/test_close_under_load.py` |
+| Concurrency/serve | lock/quarantine unit tests (`reclaim_*`, `detach_*`, endpoint claim) | `tests/breaks_concurrency_matrix.test.js`, `tests/m5_concurrency.test.js`, `tests/test_pybridge.py` (+12 M5), `tests/test_pybridge_owners.py` (M3 narrow-owner tests: registry lifecycle/swap incl. missing-child exit, server pool/close) + `scripts/check_pybridge_owners.sh` incl. `--self-test` (M3 routing: no view/serving/server writes outside owners) | `tests/test_breaks_concurrency_matrix.py`, `tests/test_m5_live.py` (6 scenarios) |
+| Close under load | `close` confirm/port-death tests + `close_deletion_seams_refuse_symlink_swap` (`src/session/close_status.rs` tests: both close deletions refuse a symlink-swapped dir, outside target intact) | `tests/close_under_load.test.js` | `tests/test_close_under_load.py` |
 | Wait/capture/timeout | stop-freshness unit tests | `tests/wait_capture.test.js`, `tests/stoptimeout.test.js` | `tests/test_wait_capture.py`, `tests/test_ux_live.py` (timeout prefix asserts), `tests/test_main_exit_visibility.py` |
-| Workers/targets | `cmd_targets_in` roster tests | `tests/worker_targets.test.js`, `tests/worker_break_records.test.js`, `tests/vars_frame.test.js`, `tests/nodebridge_owners.test.js` (M4 narrow-owner tests: registry lifecycle/swap-restore incl. worker-removed-mid-command, chains, server pool/close), `tests/browserbridge_owners.test.js` (M5.1: single-tab shape, mutation chain, pool/close) | `tests/test_m5_live.py` |
+| Workers/targets | `cmd_targets_in` roster tests | `tests/worker_targets.test.js`, `tests/worker_break_records.test.js`, `tests/vars_frame.test.js`, `tests/nodebridge_owners.test.js` (M4 narrow-owner tests: registry lifecycle/swap-restore incl. worker-removed-mid-command + queued-before-swap exit, chains, server pool/close) + `scripts/check_nodebridge_owners.sh` incl. `--self-test` (M4 routing: no container/clear/length-reset/wholesale writes outside owners), `tests/browserbridge_owners.test.js` (M5.1: single-tab shape, mutation chain, pool/close) + `scripts/check_browserbridge_owners.sh` incl. `--self-test` (M5.1 routing: no server/chain replacement or tail/depth writes outside owners) | `tests/test_m5_live.py` |
 | Java bridge | — | `javac` compile + execution: `bridge/java/src/*.java` + `tests/M4JavaCheck.java`, `M5JavaCheck.java`, `M6JavaCheck.java`, `M7JavaCheck.java`, `BJavaCheck.java`, `CJavaCheck.java` (each executed in-gate; fail-fast `System.exit(1)`) + `scripts/check_java_owners.sh` incl. `--self-test` (M5.2 move/retain/reject gate; retained/setup detection is comment-stripped declaration match) | `tests/test_live.py` java adapter |
 | Review regressions | `cargo test` full | `tests/review_fixes.test.js` | `tests/test_live.py` (4 adapters, isolated `HOME`, installed binary `target/debug/agent-debugger`) |
 | Contract fixtures (frozen strings) | `bridge::tests::contract_fixtures_match_cli_constants` | `tests/contract_fixtures.test.js`, `tests/test_contract_fixtures.py` | — (fixtures only, no live) |
@@ -388,7 +389,7 @@ runners): unit = `cargo test` + `cargo fmt --check` + every
 `tests/test_*.py` except the three live suites (auto-discovered, sorted) +
 `node --test tests/*.test.js` + owner-routing gates
 (`check_nodebridge_owners` + `check_browserbridge_owners` +
-`check_java_owners` incl. `--self-test`) + `javac` bridge/checks + executed
+`check_pybridge_owners` + `check_java_owners`, each incl. `--self-test`) + `javac` bridge/checks + executed
  java checks (B/C/M4-M7); live = `cargo build`
 + `tests/run_live.py` (runs `test_live` + `test_m5_live` + `test_ux_live`
 in one scope), with `TEST_LANG`/`SKIP_BROWSER` filters for live only.
@@ -442,7 +443,7 @@ Evidence triggers (M1/M2 — gates, not schedules):
   green (§7) on the same diff/env.
 
 Rules for any approved refactor: ONE subsystem/language at a time (serial —
-shared files `src/session.rs`, `src/cli.rs`, `src/main.rs`, `SKILL.md`
+shared files `src/session/`, `src/cli.rs`, `src/main.rs`, `SKILL.md`
 forbid parallel edits); mandatory FULL plan + FULL review; NO
 behavior/schema change in the same commit (refactor commits carry zero
 contract delta); rollback = revert the single commit (v2 test dirs are
@@ -490,7 +491,7 @@ proof, after stability work. Nothing here is promised or scheduled.
   `session_entry` / roster unit tests). Live Rust code never reads the flat
   key — `owner_target_identity` reads only `targetIdentity` and collapses
   anything else to all-unavailable. Remaining `observedTarget` strings
-  exist ONLY in: (a) `src/session.rs` unit-test fixtures / absent-key asserts
+  exist ONLY in: (a) `src/session/` unit-test fixtures / absent-key asserts
   / frozen-contract doc comments, which prove flat values are never promoted; (b) clearly-labeled history —
   `docs/debugger-feature-roadmap.md` (ARCHIVED) and
   `docs/schema-v2-cleanup.md` (change record). Any new live-path
@@ -516,7 +517,8 @@ the script is normative:
   suites + `node --test tests/*.test.js` + owner-routing gates
   `scripts/check_nodebridge_owners.sh`,
   `scripts/check_browserbridge_owners.sh`,
-  `scripts/check_java_owners.sh` incl. `--self-test` + `javac` bridge/checks
+  `scripts/check_pybridge_owners.sh`,
+  `scripts/check_java_owners.sh` (each incl. `--self-test`) + `javac` bridge/checks
   + executed Java checks B/C/M4–M7).
 - Live gate: `scripts/run_gates.sh --live` (builds first when the binary is
   missing; `TEST_LANG=py|node|java|browser` + `SKIP_BROWSER=1` filter live

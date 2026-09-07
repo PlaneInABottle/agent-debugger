@@ -10,7 +10,9 @@ use super::locks::{
     acquire_endpoint_lock, acquire_startup_lock, endpoint_lock_session_name,
     endpoint_locks_dir_for, startup_lock_path, still_holds_endpoint, EndpointClaim,
 };
-use super::paths::{check_dir_real, check_name, normalize_attach_host, sessions_dir};
+use super::paths::{
+    check_dir_real, check_name, normalize_attach_host, real_dir_for_delete, sessions_dir,
+};
 use super::sidecar::{cli_markers_v2, write_sidecar_atomic, SpawnSpec, SCHEMA_VERSION};
 use crate::bridge;
 use serde_json::{json, Value};
@@ -449,20 +451,13 @@ pub(crate) fn spawn_in(
     // A leftover dir without session.json is a failed attempt, not a live
     // session: clear it so the name is reusable. A live session is caught
     // by the session.json check above. Re-validate immediately before the
-    // recursive delete: the earlier check_dir_real covered a TOCTOU window
-    // in which a planted symlink (or file) could redirect the clear outside
-    // the sessions root. Only a real directory is removed.
-    match std::fs::symlink_metadata(&dir) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            anyhow::bail!("session path must not be a symlink: {}", dir.display())
-        }
-        Ok(meta) if !meta.file_type().is_dir() => {
-            anyhow::bail!("session path must be a real directory: {}", dir.display())
-        }
-        Ok(_) => std::fs::remove_dir_all(&dir)
-            .map_err(|e| anyhow::anyhow!("cannot clear stale {}: {e}", dir.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => anyhow::bail!("cannot clear stale {}: {e}", dir.display()),
+    // recursive delete via the shared paths helper: the earlier
+    // check_dir_real covered a TOCTOU window in which a planted symlink
+    // (or file) could redirect the clear outside the sessions root. Only
+    // a real directory is removed.
+    if real_dir_for_delete(&dir, "cannot clear stale")? {
+        std::fs::remove_dir_all(&dir)
+            .map_err(|e| anyhow::anyhow!("cannot clear stale {}: {e}", dir.display()))?;
     }
     // Exclusive creation prevents two concurrent starts racing on one name.
     std::fs::create_dir(&dir)

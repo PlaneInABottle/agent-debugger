@@ -1358,6 +1358,11 @@ class Session:
     # below route into Session.targets_reg. Same-object views (targets,
     # target_order, _seen_ids, exited_targets, _attach_pending) exist for
     # established readers; scalars/counters/serving use targets_reg.X.
+    # Routing rule (grep-enforced via scripts/check_pybridge_owners.sh,
+    # wired into scripts/run_gates.sh --unit): production code mutates
+    # owner state only through owner methods — never direct writes through
+    # the views above, never targets_reg.serving / server_state.active /
+    # closing writes, never a wholesale owner replacement.
     # -- multi-target helpers (canonical state: TargetRegistry) --
 
     def live_targets(self):

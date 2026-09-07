@@ -30,7 +30,8 @@
 //!   deps: paths (startup_nonce)
 //! sidecar.rs ── SCHEMA_VERSION/gate/atomic-write/session_lang_opt/SpawnSpec
 //!   deps: none (paths reserved)
-//! paths.rs ── sessions_dir/check_name/check_dir_real/ports + startup_nonce
+//! paths.rs ── sessions_dir/check_name/check_dir_real/real_dir_for_delete/
+//!   ports + startup_nonce
 //!   + host-normalize helpers; deps: none
 //! ```
 //!

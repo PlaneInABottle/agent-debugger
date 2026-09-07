@@ -51,6 +51,31 @@ pub(crate) fn check_dir_real(dir: &std::path::Path) -> anyhow::Result<()> {
     }
 }
 
+/// Immediate lstat-before-delete classification shared by every recursive
+/// session-dir delete (spawn's stale clear, close's unpublished/foreign
+/// deletes): a symlink or non-dir is refused with the canonical
+/// `check_dir_real` text instead of being followed by `remove_dir_all`.
+/// Missing reads as `Ok(false)` (nothing to delete — spawn proceeds to
+/// exclusive create, close reports the vanished dir itself); a real
+/// directory reads as `Ok(true)` (delete immediately). Any other metadata
+/// failure keeps the caller's `context` (each call site preserves its
+/// established error behavior). Best-effort only — not a TOCTOU proof —
+/// so callers invoke this immediately before the delete with nothing
+/// between.
+pub(crate) fn real_dir_for_delete(dir: &std::path::Path, context: &str) -> anyhow::Result<bool> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            anyhow::bail!("session path must not be a symlink: {}", dir.display())
+        }
+        Ok(meta) if !meta.file_type().is_dir() => {
+            anyhow::bail!("session path must be a real directory: {}", dir.display())
+        }
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => anyhow::bail!("{context} {}: {e}", dir.display()),
+    }
+}
+
 pub(crate) fn read_session(name: &str) -> anyhow::Result<Value> {
     let file = checked_session_dir(name)?.join("session.json");
     let raw = std::fs::read_to_string(&file)

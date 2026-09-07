@@ -771,10 +771,13 @@ function slidLine(locs, line) {
 //
 // Routing rule (grep-enforced via scripts/check_nodebridge_owners.sh,
 // wired into scripts/run_gates.sh --unit): production code mutates owner
-// state only through owner methods — never `workers.table.set/delete`,
-// never `workers.pending.set/delete`, never `server.active`/`server.closing`
-// writes outside ServerState. Reads of owned collections (get/has/live
-// lists, closing/active counters) stay direct.
+// state only through owner methods — never `workers.table/pending`
+// set/delete/clear, never `workers.order`/`seenIds`/`exited` mutation
+// (push/add/clear/wholesale replacement/length reset), never
+// `workers.ignored`/`droppedExited` or `server.active`/`server.closing`
+// writes, never a wholesale `this.workers` replacement outside the
+// owners. Reads of owned collections (get/has/live lists,
+// closing/active counters) stay direct.
 
 /** One serialized promise tail: every run() waits for its predecessor, so
  *  sections that borrow shared target fields never overlap. Rejections
@@ -851,6 +854,7 @@ class WorkerRegistry {
   }
 
   isCurrent(id, w) {
+    if (!w) return false;
     return this.table.get(id) === w;
   }
 
@@ -1319,8 +1323,28 @@ class Session {
     if (tid === 'main' || !this.workers.has(tid)) {
       return this._swapRun(fn);
     }
+    const queued = this.workers.get(tid);
     return this._swapRun(async () => {
+      // Deferred-chain revalidation: the call-time has() above ran before
+      // this closure reached the swap chain, so a noteExit in between has
+      // already retired the table entry. Re-read under the chain and fail
+      // with the existing exited/released vocabulary BEFORE any
+      // saveMain/loadWorker — never loadWorker(undefined) (TypeError) and
+      // never partially swap (main context untouched on this path).
       const w = this.workers.get(tid);
+      if (!w || w !== queued) {
+        if (this.workers.findExited(tid)) {
+          throw new BridgeErr(`target ${tid} has exited — close this session`);
+        }
+        if (!w) throw new BridgeErr(`unknown target: ${tid}`);
+        throw new BridgeErr(`target ${tid} has exited — close this session`);
+      }
+      if (w.exited || w.state === 'exited') {
+        throw new BridgeErr(`target ${tid} has exited — close this session`);
+      }
+      if (w.state === 'ignored') {
+        throw new BridgeErr(`target ${tid} was released (over budget)`);
+      }
       const saved = this.saveMain();
       this.loadWorker(w);
       try {

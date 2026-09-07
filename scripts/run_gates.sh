@@ -79,7 +79,7 @@ run_unit() {
   # helper module. New unit files are picked up with no runner edit.
   for t in $(printf '%s\n' tests/test_*.py | LC_ALL=C sort); do
     case "$t" in
-      tests/test_live.py|tests/test_m5_live.py|tests/test_ux_live.py|tests/_live_home.py)
+      tests/test_live.py|tests/test_m5_live.py|tests/test_ux_live.py)
         continue;;
     esac
     python3 "$t" || fail "$t"
@@ -92,11 +92,18 @@ run_unit() {
 
   section "nodebridge owner routing"
   scripts/check_nodebridge_owners.sh || fail "check_nodebridge_owners"
+  scripts/check_nodebridge_owners.sh --self-test || fail "check_nodebridge_owners --self-test"
   passed "nodebridge owner routing"
 
   section "browserbridge owner routing"
   scripts/check_browserbridge_owners.sh || fail "check_browserbridge_owners"
+  scripts/check_browserbridge_owners.sh --self-test || fail "check_browserbridge_owners --self-test"
   passed "browserbridge owner routing"
+
+  section "pybridge owner routing"
+  scripts/check_pybridge_owners.sh || fail "check_pybridge_owners"
+  scripts/check_pybridge_owners.sh --self-test || fail "check_pybridge_owners --self-test"
+  passed "pybridge owner routing"
 
   section "java owner routing (M5.2)"
   scripts/check_java_owners.sh || fail "check_java_owners"

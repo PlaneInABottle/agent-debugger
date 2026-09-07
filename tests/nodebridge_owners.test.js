@@ -213,6 +213,65 @@ test('owners: withTarget on main runs serialized without swapping', async () => 
   assert.equal(st.serving, 'main');
 });
 
+// ---- queued-exit regression: worker retires while withTarget waits --------
+
+test('owners: worker exiting while withTarget is queued fails typed, main untouched', async () => {
+  const st = freshSession(tmpdir('m4-own-queued-exit-'));
+  st.workers.claimId('worker:q');
+  const w = mkWorker('q');
+  w.scripts.set('ws1', 'file:///wq.js');
+  st.workers.track(w);
+  const mainScripts = new Map([['s1', 'file:///main.js']]);
+  st.scripts = mainScripts;
+  st.paused = mainPark();
+  st.serving = 'main';
+  st.sender = null;
+  // Hold the swap chain so the withTarget closure below queues behind it.
+  let releaseSwap;
+  const gate = new Promise((r) => { releaseSwap = r; });
+  const holder = st._swapRun(() => gate);
+  let called = false;
+  const queuedP = st.withTarget('worker:q', async () => {
+    called = true;
+    return 'unreached';
+  });
+  // The worker disappears while queued (call-time has() already passed).
+  st.workers.noteExit('worker:q');
+  releaseSwap();
+  await holder;
+  await assert.rejects(queuedP, (e) => {
+    assert.ok(e instanceof node.BridgeErr, `expected BridgeErr, got ${e && e.constructor && e.constructor.name}: ${(e && e.message) || e}`);
+    assert.match(e.message, /target worker:q has exited/);
+    return true;
+  });
+  assert.equal(called, false);
+  // No partial swap: main context is exactly as parked.
+  assert.deepEqual(st.paused, mainPark());
+  assert.equal(st.scripts, mainScripts);
+  assert.equal(st.serving, 'main');
+  assert.equal(st.sender, null);
+  assert.ok(st.workers.findExited('worker:q'));
+  assert.throws(() => st.resolveTarget({ target: 'worker:q' }), /has exited/);
+  st.workers.assertValid();
+  st._swapChain.assertValid();
+});
+
+test('owners: isCurrent needs a live exact identity, never undefined', () => {
+  const st = freshSession(tmpdir('m4-own-iscurrent-'));
+  st.workers.claimId('worker:k');
+  const w = mkWorker('k');
+  st.workers.track(w);
+  assert.equal(st.workers.isCurrent('worker:k', w), true);
+  assert.equal(st.workers.isCurrent('worker:k', undefined), false);
+  assert.equal(st.workers.isCurrent('worker:k', null), false);
+  assert.equal(st.workers.isCurrent('worker:k', { ...w }), false);
+  assert.equal(st.workers.isCurrent('worker:ghost', undefined), false);
+  st.workers.noteExit('worker:k');
+  assert.equal(st.workers.isCurrent('worker:k', w), false);
+  assert.equal(st.workers.isCurrent('worker:k', undefined), false);
+  st.workers.assertValid();
+});
+
 // ---- SerialChain: order, rejection safety, independence -------------------
 
 test('owners: swap chain serializes and survives rejections', async () => {
