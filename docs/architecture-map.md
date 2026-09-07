@@ -138,10 +138,12 @@ written atomically (tmp+rename in the same dir — `write_sidecar` /
   + legacy scans (endpoint-matched `endpoint-already-attached`, then global
   `unsupported-legacy-live`). Browser never collides (`attach_exclusive`
   covers only `py|node|java`).
-- **Breaks lock** (`src/session/locks.rs`): `breaks_lock_path`,
-  `acquire_breaks_lock` (`BreaksGuard`, create_new + nonce + stale-steal).
-  Serializes concurrent `stops.json` append/remove (see
-  `breaks_lock_serializes_concurrent_appends` test).
+- **Breaks lock** (`src/session/breaks.rs`): `breaks_lock_path`,
+  `acquire_breaks_lock` (`BreaksGuard` owns the open handle with a kernel
+  `File::try_lock` exclusive lock — released on handle close, so a crashed
+  holder never wedges the section and there is no stale protocol; the file
+  persists and is never deleted). Serializes concurrent `stops.json`
+  append/remove (see `breaks_lock_serializes_concurrent_appends` test).
 - **Lock order**: Python `DapConn` documents `_gate -> mu`, never the reverse;
   Java holds all session mutation under the single `sessionLock` with ONE
   event-queue consumer (the session thread); evaluation Phase A runs OUTSIDE

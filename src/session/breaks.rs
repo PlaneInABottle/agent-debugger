@@ -1,6 +1,6 @@
 // See `mod.rs` for the one-way dependency DAG.
 use super::forward::{bridge_failure, normalize_target_for_lang_opt, stamp_main};
-use super::paths::{check_name, checked_session_dir, session_port, startup_nonce};
+use super::paths::{check_name, checked_session_dir, session_port};
 use super::sidecar::{require_schema_v2, session_lang_opt};
 use crate::client;
 use serde_json::Value;
@@ -204,73 +204,95 @@ pub(crate) fn applied_live_err(op: &str, e: anyhow::Error) -> anyhow::Error {
     )
 }
 
-/// Short-held file guard serializing stops.json read-modify-write across
-/// concurrent CLI invocations (same create_new + nonce + stale-steal idiom
-/// as the startup lock, but scoped to the breaks file section only — never
-/// across bridge forwards, which the bridges serialize themselves). Lives
-/// inside the session dir so `close` reaps it; a crashed holder is
-/// recoverable after a seconds-scale bound (the section itself is ms).
+/// Short-held kernel file guard serializing stops.json read-modify-write
+/// across concurrent CLI invocations (separate processes included — never
+/// across bridge forwards, which the bridges serialize themselves).
+/// Exclusion comes from the OS (`File::try_lock`, exclusive): the guard
+/// owns the open handle, and the lock releases when the handle closes —
+/// guard drop or whole-process death alike. A crashed holder therefore
+/// never wedges the section: there is no stale protocol, no mtime bound,
+/// and no steal. The lock file persists in the session dir (`close` reaps
+/// it); nothing is ever written to it and it is never deleted, so every
+/// cooperative writer rendezvous on the same inode and no path
+/// replacement can admit two holders.
 pub(crate) fn breaks_lock_path(dir: &std::path::Path) -> PathBuf {
     dir.join("breaks.lock")
 }
 
-/// A breaks lock is stale only when its mtime is provably older than the
-/// bound. Unreadable clocks fail closed (treat as live) — a retry costs a
-/// wait, a wrongful steal costs a sibling writer its update.
-pub(crate) const BREAKS_LOCK_STALE: Duration = Duration::from_secs(30);
+/// How long a contended claim waits for a live holder before the caller
+/// reports applied-live-but-unpersisted (the existing honest error)
+/// instead of risking a torn intent — never spins forever. The section
+/// itself is milliseconds.
+pub(crate) const BREAKS_LOCK_WAIT: Duration = Duration::from_secs(2);
 
+/// Fixed backoff between `try_lock` polls while a live holder is in the
+/// section: short enough to enter promptly, long enough to avoid hot
+/// spinning. Pacing only — exclusion never depends on it.
+pub(crate) const BREAKS_LOCK_POLL: Duration = Duration::from_millis(5);
+
+/// Owns the open lock-file handle: the kernel exclusive lock is held as
+/// long as this guard lives and releases when the handle closes. The path
+/// is never deleted — persistence is what keeps every writer on the same
+/// inode.
+#[derive(Debug)]
 pub(crate) struct BreaksGuard {
-    path: PathBuf,
-    nonce: String,
+    _file: std::fs::File,
 }
 
-impl Drop for BreaksGuard {
-    fn drop(&mut self) {
-        if std::fs::read_to_string(&self.path)
-            .map(|c| c == self.nonce)
-            .unwrap_or(false)
-        {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
-/// Claim the breaks lock, waiting briefly for a live holder. On failure
-/// the caller reports applied-live-but-unpersisted (the existing honest
-/// error) instead of risking a torn intent — never spins forever.
+/// Claim the breaks lock, waiting briefly for a live holder. `WouldBlock`
+/// polls until the bound; any other lock error, a symlink or non-regular
+/// file, or an unopenable path bails with a persistence error (the caller
+/// reports applied-live-but-unpersisted). Never spins forever, never
+/// deletes or replaces another writer's record.
 pub(crate) fn acquire_breaks_lock(dir: &std::path::Path) -> anyhow::Result<BreaksGuard> {
     let path = breaks_lock_path(dir);
-    let nonce = startup_nonce();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Refuse a planted link or non-file before opening: otherwise the open
+    // below (or `close`'s reaping delete) could be redirected outside the
+    // session dir. Best-effort against a swap between check and open — the
+    // opened handle is re-verified below, same stance as the dir checks.
+    match std::fs::symlink_metadata(&path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            anyhow::bail!("breaks lock must not be a symlink: {}", path.display())
+        }
+        Ok(m) if !m.file_type().is_file() => {
+            anyhow::bail!("breaks lock must be a regular file: {}", path.display())
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => anyhow::bail!("cannot stat breaks lock {}: {e}", path.display()),
+    }
+    // Read+write+create, never truncate or exclusive: the first creator
+    // and every concurrent opener land on one inode; nothing is ever
+    // written to it, so a first-create/open race needs no serialization.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&path)
+        .map_err(|e| anyhow::anyhow!("cannot open breaks lock {}: {e}", path.display()))?;
+    // The opened handle must be a regular file too (closes the swap-a-link
+    // window above short of a swap-back race, accepted as best-effort).
+    if !file
+        .metadata()
+        .map(|m| m.file_type().is_file())
+        .unwrap_or(false)
+    {
+        anyhow::bail!("breaks lock must be a regular file: {}", path.display());
+    }
+    let deadline = Instant::now() + BREAKS_LOCK_WAIT;
     loop {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut f) => {
-                use std::io::Write as _;
-                f.write_all(nonce.as_bytes())
-                    .map_err(|e| anyhow::anyhow!("cannot write breaks lock: {e}"))?;
-                return Ok(BreaksGuard { path, nonce });
+        match file.try_lock() {
+            Ok(()) => return Ok(BreaksGuard { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    anyhow::bail!("breaks lock held by a live writer");
+                }
+                std::thread::sleep(BREAKS_LOCK_POLL);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => anyhow::bail!("cannot create breaks lock: {e}"),
+            Err(std::fs::TryLockError::Error(e)) => {
+                anyhow::bail!("cannot lock breaks lock {}: {e}", path.display())
+            }
         }
-        let stale = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
-            .map(|age| age >= BREAKS_LOCK_STALE)
-            .unwrap_or(false);
-        if stale {
-            let _ = std::fs::remove_file(&path);
-            continue;
-        }
-        if Instant::now() >= deadline {
-            anyhow::bail!("breaks lock held by a live writer");
-        }
-        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -378,7 +400,10 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(dir.join("stops.json")).unwrap())
                 .unwrap();
         assert_eq!(v["breaks"], json!(["a.py:1", "b.py:2|x>1"]));
-        assert!(!dir.join("breaks.lock").exists(), "lock never lingers");
+        // The kernel lock persists (same inode for every writer) and is
+        // unlocked when the guard drops: the file stays, nobody holds it.
+        assert!(dir.join("breaks.lock").exists(), "lock file persists");
+        assert_no_temp_orphans(&dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -402,9 +427,13 @@ mod tests {
 
     #[test]
     fn breaks_lock_serializes_concurrent_appends() {
-        // Eight threads racing the same identical add: the file holds
-        // exactly one copy (lock serializes the read-modify-write so no
-        // stale read can duplicate).
+        // Eight threads racing the same identical add behind a barrier
+        // (deterministic start, only scheduling varies): the file holds
+        // exactly one copy (the kernel lock serializes the
+        // read-modify-write so no stale read can duplicate). The lock
+        // file persists (same inode for every writer) and no temp file
+        // lingers on the success path.
+        use std::sync::Barrier;
         let dir = tmpdir("append-race");
         std::fs::write(
             dir.join("stops.json"),
@@ -412,10 +441,14 @@ mod tests {
                     "sources":[],"timeout":7}"#,
         )
         .unwrap();
+        let barrier = Barrier::new(8);
+        let barrier_r = &barrier;
+        let dir_r = &dir;
         std::thread::scope(|s| {
             for _ in 0..8 {
-                s.spawn(|| {
-                    append_confirmed_breaks_in(&dir, &["a.py:1".to_string()]).unwrap();
+                s.spawn(move || {
+                    barrier_r.wait();
+                    append_confirmed_breaks_in(dir_r, &["a.py:1".to_string()]).unwrap();
                 });
             }
         });
@@ -423,6 +456,8 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(dir.join("stops.json")).unwrap())
                 .unwrap();
         assert_eq!(v["breaks"], json!(["a.py:1"]));
+        assert!(dir.join("breaks.lock").exists(), "lock file persists");
+        assert_no_temp_orphans(&dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -537,5 +572,331 @@ mod tests {
             assert!(msg.contains(op), "{msg}");
             assert!(msg.contains("boom"), "{msg}");
         }
+    }
+
+    /// Success-path temp hygiene: no quarantine or tmp sibling may linger
+    /// (the kernel lock needs no quarantine files; the stops.json tmp is
+    /// consumed by its rename on every success).
+    fn assert_no_temp_orphans(dir: &std::path::Path) {
+        let leftovers: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.starts_with(".q-") || n == "stops.json.tmp"
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "temp files must not linger");
+    }
+
+    #[test]
+    fn kernel_lock_critical_section_never_overlaps() {
+        // Eight threads race behind a barrier, each holding the guard
+        // across a widened window. The kernel exclusive lock admits
+        // exactly one holder at any instant (max active == 1) —
+        // algorithmically, not by timing.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Barrier;
+        let dir = tmpdir("breaks-overlap");
+        let barrier = Barrier::new(8);
+        let active = AtomicUsize::new(0);
+        let max = AtomicUsize::new(0);
+        let barrier_r = &barrier;
+        let active_r = &active;
+        let max_r = &max;
+        let dir_r = &dir;
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(move || {
+                    barrier_r.wait();
+                    let _guard = acquire_breaks_lock(dir_r).unwrap();
+                    let cur = active_r.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_r.fetch_max(cur, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(20));
+                    active_r.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            max.load(Ordering::SeqCst),
+            1,
+            "stops.json transactions must never overlap"
+        );
+        assert!(dir.join("breaks.lock").exists(), "lock file persists");
+        assert_no_temp_orphans(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kernel_lock_unique_appends_lose_none() {
+        // Eight racers behind a barrier, each appending a unique raw:
+        // every transaction serializes, so none of the eight is lost.
+        use std::sync::Barrier;
+        let dir = tmpdir("breaks-unique");
+        std::fs::write(
+            dir.join("stops.json"),
+            r#"{"breaks":[],"logpoints":[],"watches":[],"exits":[],
+                    "sources":[],"timeout":7}"#,
+        )
+        .unwrap();
+        let barrier = Barrier::new(8);
+        let barrier_r = &barrier;
+        let dir_r = &dir;
+        std::thread::scope(|s| {
+            for i in 0..8 {
+                s.spawn(move || {
+                    barrier_r.wait();
+                    append_confirmed_breaks_in(dir_r, &[format!("f{i}.py:1")]).unwrap();
+                });
+            }
+        });
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("stops.json")).unwrap())
+                .unwrap();
+        let mut got: Vec<String> = v["breaks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+            .collect();
+        got.sort();
+        let mut want: Vec<String> = (0..8).map(|i| format!("f{i}.py:1")).collect();
+        want.sort();
+        assert_eq!(got, want, "concurrent unique adds must lose none");
+        assert!(dir.join("breaks.lock").exists(), "lock file persists");
+        assert_no_temp_orphans(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_looking_lock_file_immediately_acquirable() {
+        // No stale protocol exists: a lock file with junk content and an
+        // hour-old mtime acquires immediately, and the content is never
+        // written (no nonce, no metadata).
+        let dir = tmpdir("breaks-stale-looking");
+        let path = breaks_lock_path(&dir);
+        std::fs::write(&path, "crashed-holder-junk").unwrap();
+        let old = std::time::SystemTime::now()
+            .checked_sub(Duration::from_secs(3600))
+            .unwrap_or(std::time::UNIX_EPOCH);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let _guard = acquire_breaks_lock(&dir).expect("must acquire without stale wait");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "lock content is never written"
+        );
+        drop(_guard);
+        assert!(path.exists(), "lock file persists across release");
+        // Still acquirable after release (nothing wedged, nothing deleted).
+        let _guard2 = acquire_breaks_lock(&dir).unwrap();
+        assert_no_temp_orphans(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn held_lock_second_acquisition_busy_and_inode_preserved() {
+        // While one guard holds the file lock, a second open + try_lock
+        // reports busy in milliseconds — and the file is neither deleted
+        // nor replaced (same bytes; same inode on unix).
+        let dir = tmpdir("breaks-busy");
+        let path = breaks_lock_path(&dir);
+        std::fs::write(&path, "sentinel").unwrap();
+        let _holder = acquire_breaks_lock(&dir).unwrap();
+        #[cfg(unix)]
+        let ino_before = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&path).unwrap().ino()
+        };
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(
+            matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "second acquisition must report busy while held"
+        );
+        drop(probe);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "sentinel",
+            "held record must survive"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().ino(),
+                ino_before,
+                "inode must survive contention"
+            );
+        }
+        drop(_holder);
+        // Released: immediately acquirable again.
+        let _guard2 = acquire_breaks_lock(&dir).unwrap();
+        assert_no_temp_orphans(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn second_acquire_times_out_on_live_holder() {
+        // The full bounded wait honors the live-holder bound instead of
+        // stealing: a held lock makes a second claim fail (same thread,
+        // separate handle — exclusion is per-handle, not per-thread).
+        let dir = tmpdir("breaks-timeout");
+        let _holder = acquire_breaks_lock(&dir).unwrap();
+        let start = Instant::now();
+        let err = acquire_breaks_lock(&dir).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("live writer"),
+            "timeout must report a live holder: {err:#}"
+        );
+        assert!(
+            start.elapsed() >= Duration::from_millis(1900),
+            "the 2s bound must be honored"
+        );
+        drop(_holder);
+        let _guard2 = acquire_breaks_lock(&dir).unwrap();
+        assert_no_temp_orphans(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lock_releases_on_drop() {
+        // Dropping the guard closes the handle (automatic unlock) while
+        // the file persists for the next writer.
+        let dir = tmpdir("breaks-drop");
+        let path = breaks_lock_path(&dir);
+        {
+            let _guard = acquire_breaks_lock(&dir).unwrap();
+            assert!(path.exists());
+        }
+        assert!(path.exists(), "drop must not delete the lock file");
+        let _guard2 = acquire_breaks_lock(&dir).expect("must reacquire right after drop");
+        assert_no_temp_orphans(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn crash_style_child_exit_releases_lock() {
+        // Crash-style proof across processes: a child holds the lock and
+        // dies without unlocking (killed); the OS releases the kernel
+        // lock, so the parent acquires afterwards. The child is this same
+        // test binary re-executed with an env flag (exact-test match).
+        const ENV: &str = "AGENT_DEBUGGER_BREAKS_LOCK_CHILD";
+        if let Ok(child_dir) = std::env::var(ENV) {
+            let child_dir = PathBuf::from(child_dir);
+            let _guard = acquire_breaks_lock(&child_dir).expect("child must acquire");
+            std::fs::write(child_dir.join("ready"), "held").unwrap();
+            std::thread::sleep(Duration::from_secs(30));
+            return; // killed first in practice; a normal return drops alike
+        }
+        let dir = tmpdir("breaks-crash-child");
+        let path = breaks_lock_path(&dir);
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(&exe)
+            .arg("--exact")
+            .arg("session::breaks::tests::crash_style_child_exit_releases_lock")
+            .env(ENV, &dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn child holder");
+        let ready = dir.join("ready");
+        let start = Instant::now();
+        while !ready.exists() {
+            if start.elapsed() > Duration::from_secs(10) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child never signaled the held lock");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Cross-process exclusion: the child holds, so the parent sees busy.
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let busy = matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock));
+        drop(probe);
+        // Kill without unlocking, reap, then acquire (killed before every
+        // assertion that can fail, so no orphan holder lingers).
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(busy, "parent must see WouldBlock while the child holds");
+        let _guard =
+            acquire_breaks_lock(&dir).expect("kernel must release the lock on child death");
+        assert!(path.exists(), "lock file persists across the crash");
+        assert_no_temp_orphans(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_breaks_lock_refused_target_untouched() {
+        // A planted symlink at the lock path is refused before opening;
+        // the link stays a link and the target bytes are untouched (no
+        // lock is ever taken through it, nothing is written or deleted).
+        let dir = tmpdir("breaks-symlink");
+        let target = dir.join("target");
+        std::fs::write(&target, "sentinel").unwrap();
+        std::os::unix::fs::symlink(&target, breaks_lock_path(&dir)).unwrap();
+        let err = acquire_breaks_lock(&dir).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("symlink"),
+            "symlink must be refused: {err:#}"
+        );
+        assert!(
+            std::fs::symlink_metadata(breaks_lock_path(&dir))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted link must survive"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "sentinel",
+            "the link target must be untouched"
+        );
+        assert_no_temp_orphans(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nonregular_breaks_lock_refused() {
+        // A directory (or any non-regular file) at the lock path is
+        // refused, never opened or locked, and left in place.
+        let dir = tmpdir("breaks-nonregular");
+        std::fs::create_dir(breaks_lock_path(&dir)).unwrap();
+        let err = acquire_breaks_lock(&dir).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("regular file"),
+            "non-regular must be refused: {err:#}"
+        );
+        assert!(
+            std::fs::symlink_metadata(breaks_lock_path(&dir))
+                .unwrap()
+                .file_type()
+                .is_dir(),
+            "the non-regular entry must survive"
+        );
+        assert_no_temp_orphans(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
