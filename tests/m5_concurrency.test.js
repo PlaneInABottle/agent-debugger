@@ -78,9 +78,8 @@ function mkWorker(sid) {
 
 function addWorker(st, sid) {
   const w = mkWorker(sid);
-  st.workerTable.set(w.id, w);
-  st.workerOrder.push(w.id);
-  st.seenWorkerIds.add(w.id);
+  assert.equal(st.workers.claimId(w.id), true);
+  st.workers.track(w);
   return w;
 }
 

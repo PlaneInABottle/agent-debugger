@@ -80,6 +80,10 @@ run_unit() {
   node --test tests/*.test.js || fail "node --test"
   passed "node --test"
 
+  section "nodebridge owner routing"
+  scripts/check_nodebridge_owners.sh || fail "check_nodebridge_owners"
+  passed "nodebridge owner routing"
+
   section "javac bridge + checks"
   JTMP=$(mktemp -d)
   trap 'rm -rf "$JTMP"' EXIT

@@ -282,6 +282,38 @@ extraction trigger (unchanged bar): a measured defect attributable to the
 boundary + FULL plan/review, never size alone. Zero protocol/sidecar/schema
 delta; Node/Browser/Java untouched (M4/M5).
 
+M4 (implemented, narrow track, Node bridge only): `bridge/node/src/nodebridge.js`
+stays one embedded file (`src/bridge.rs` `NODEBRIDGE_SOURCE`/`ensure_js_shared`
+untouched, `bridge/js/*` untouched) with exactly three retained in-file owners
+constructed by `Session` (still the sole runtime owner + CDP orchestrator):
+`WorkerRegistry` (worker table/creation order/seen-ids/bounded exited history/
+ignored+dropped counters/pending worker replies + `claimId`/`track`/`release`/
+`noteExit`/`evictOldIgnored`/`takePending`/`liveWorkers`/`activeWorkers`;
+`assertValid` enforces table ⊆ order/seen + bounded history), `SerialChain`
+(one serialized promise tail; three instances replace the raw `_swapTail`,
+`_mutationTail`, `_pauseChain` fields + `_lockSwap`/`_chainPause` bodies —
+`_swapRun`/`_mutationRun`/`_chainPause` stay as the named domain entries and
+stable test seams, rejection-safe by construction), and `ServerState`
+(handler pool via `tryAcquire`/`release` + terminal-close single winner via
+`claimClose`; `assertValid` enforces `0 <= active <= MAX_ACTIVE_HANDLERS`).
+Rejected with the same M3 rationale (state IS the swapped context, a wrapper
+only adds bypass — no aliases, no dual writes, enforced by
+`scripts/check_nodebridge_owners.sh` in the `--unit` gate): `BreakpointStore`
+/`StopCoordinator` (breakpoint maps/records + freshness machine stay
+Session-owned sections), resolve relocation (resolveTarget fuses main liveness
++ selection clocks with roster reads), and swap save/load relocation
+(saveMain/loadWorker/storeWorker/loadMain fuse Session main fields). The
+worker-removed-during-withTarget case needed no fix — the `isCurrent` guard +
+unconditional `loadMain` restore already held (regression-locked in
+`tests/nodebridge_owners.test.js`, the Python `_TargetScope` missing-child
+analog). Pre-existing roster shape: `WorkerRegistry.order` retains exited ids
+(`noteExit` removes from the table, not from order; readers guard with
+`has()`/`liveWorkers()`); future bounded-roster trigger is a measured defect
+attributed to order growth/drift — no change now. Test fixtures admit through
+the production API (`claimId`+`track`/`release`, `tryAcquire`), never raw
+collection writes. Zero protocol/sidecar/schema delta; Python/Rust/Browser/Java
+untouched (M3 gate reused, M5 next).
+
 ## 7. Test map (boundary → exact files)
 
 | Boundary | Rust unit (`cargo test`, incl. `src/session.rs` tests) | Bridge unit | Live / matrix |
@@ -293,7 +325,7 @@ delta; Node/Browser/Java untouched (M4/M5).
 | Concurrency/serve | lock/quarantine unit tests (`reclaim_*`, `detach_*`, endpoint claim) | `tests/breaks_concurrency_matrix.test.js`, `tests/m5_concurrency.test.js`, `tests/test_pybridge.py` (+12 M5), `tests/test_pybridge_owners.py` (M3 narrow-owner tests: registry lifecycle/swap incl. missing-child exit, server pool/close) | `tests/test_breaks_concurrency_matrix.py`, `tests/test_m5_live.py` (6 scenarios) |
 | Close under load | `close` confirm/port-death tests | `tests/close_under_load.test.js` | `tests/test_close_under_load.py` |
 | Wait/capture/timeout | stop-freshness unit tests | `tests/wait_capture.test.js`, `tests/stoptimeout.test.js` | `tests/test_wait_capture.py`, `tests/test_ux_live.py` (timeout prefix asserts), `tests/test_main_exit_visibility.py` |
-| Workers/targets | `cmd_targets_in` roster tests | `tests/worker_targets.test.js`, `tests/worker_break_records.test.js`, `tests/vars_frame.test.js` | `tests/test_m5_live.py` |
+| Workers/targets | `cmd_targets_in` roster tests | `tests/worker_targets.test.js`, `tests/worker_break_records.test.js`, `tests/vars_frame.test.js`, `tests/nodebridge_owners.test.js` (M4 narrow-owner tests: registry lifecycle/swap-restore incl. worker-removed-mid-command, chains, server pool/close) | `tests/test_m5_live.py` |
 | Java bridge | — | `javac` compile check: `bridge/java/src/*.java` + `tests/M4JavaCheck.java`, `M5JavaCheck.java`, `M6JavaCheck.java`, `M7JavaCheck.java`, `BJavaCheck.java`, `CJavaCheck.java` (compile only) | `tests/test_live.py` java adapter |
 | Review regressions | `cargo test` full | `tests/review_fixes.test.js` | `tests/test_live.py` (4 adapters, isolated `HOME`, installed binary `target/debug/agent-debugger`) |
 | Contract fixtures (frozen strings) | `bridge::tests::contract_fixtures_match_cli_constants` | `tests/contract_fixtures.test.js`, `tests/test_contract_fixtures.py` | — (fixtures only, no live) |

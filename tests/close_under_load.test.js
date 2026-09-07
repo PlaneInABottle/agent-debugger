@@ -100,7 +100,13 @@ function workerShape(sid) {
 test('node: pool-full ordinary command is overloaded, pool untouched', async () => {
   const dir = tmpdir('c-close-node-');
   const st = nodeSession(dir);
-  st.activeConns = node.MAX_ACTIVE_HANDLERS;
+  // Pool-full fixture through the production admission API (not a raw
+  // counter write): every slot acquired, so handleOverload proves the
+  // pool is untouched by asserting the same count afterwards.
+  for (let i = 0; i < node.MAX_ACTIVE_HANDLERS; i++) {
+    assert.equal(st.server.tryAcquire(node.MAX_ACTIVE_HANDLERS), true);
+  }
+  assert.equal(st.server.tryAcquire(node.MAX_ACTIVE_HANDLERS), false);
   const { server, client, serverConn } = await tcpPair();
   try {
     const p = node.handleOverload(st, serverConn);
@@ -109,8 +115,8 @@ test('node: pool-full ordinary command is overloaded, pool untouched', async () 
     assert.equal(resp.ok, false);
     assert.match(resp.error, /overloaded/);
     assert.equal(resp.target, 'main');
-    assert.equal(st.activeConns, node.MAX_ACTIVE_HANDLERS);
-    assert.equal(st.closing, false);
+    assert.equal(st.server.active, node.MAX_ACTIVE_HANDLERS);
+    assert.equal(st.server.closing, false);
   } finally {
     client.destroy();
     server.close();
@@ -122,16 +128,18 @@ test('node: pool-full exact close ACKs and tears down once', async () => {
   const st = nodeSession(dir);
   let cleanups = 0;
   st.cleanup = async () => { cleanups += 1; };
-  st.activeConns = node.MAX_ACTIVE_HANDLERS;
+  for (let i = 0; i < node.MAX_ACTIVE_HANDLERS; i++) {
+    assert.equal(st.server.tryAcquire(node.MAX_ACTIVE_HANDLERS), true);
+  }
   const { server, client, serverConn } = await tcpPair();
   try {
     const p = node.handleOverload(st, serverConn);
     const resp = await clientRoundtrip(client, { cmd: 'close' });
     await p;
     assert.deepEqual(resp, { ok: true, closed: true, target: 'main' });
-    assert.equal(st.closing, true);
+    assert.equal(st.server.closing, true);
     assert.equal(cleanups, 1);
-    assert.equal(st.activeConns, node.MAX_ACTIVE_HANDLERS);
+    assert.equal(st.server.active, node.MAX_ACTIVE_HANDLERS);
     // A second close still ACKs but never re-runs teardown.
     const second = await tcpPair();
     try {
@@ -153,7 +161,9 @@ test('node: pool-full exact close ACKs and tears down once', async () => {
 test('node: pool-full malformed read just drops the socket', async () => {
   const dir = tmpdir('c-close-node-');
   const st = nodeSession(dir);
-  st.activeConns = node.MAX_ACTIVE_HANDLERS;
+  for (let i = 0; i < node.MAX_ACTIVE_HANDLERS; i++) {
+    assert.equal(st.server.tryAcquire(node.MAX_ACTIVE_HANDLERS), true);
+  }
   const { server, client, serverConn } = await tcpPair();
   try {
     const p = node.handleOverload(st, serverConn);
@@ -161,8 +171,8 @@ test('node: pool-full malformed read just drops the socket', async () => {
     client.end();
     await p;
     assert.equal(serverConn.destroyed, true);
-    assert.equal(st.closing, false);
-    assert.equal(st.activeConns, node.MAX_ACTIVE_HANDLERS);
+    assert.equal(st.server.closing, false);
+    assert.equal(st.server.active, node.MAX_ACTIVE_HANDLERS);
   } finally {
     client.destroy();
     server.close();
@@ -223,8 +233,8 @@ test('node: serve loop overloads 9th ordinary but closes on 10th', async () => {
       })());
     }
     const t0 = Date.now();
-    while (st.activeConns < 8 && Date.now() - t0 < 5000) await sleep(10);
-    assert.equal(st.activeConns, 8);
+    while (st.server.active < 8 && Date.now() - t0 < 5000) await sleep(10);
+    assert.equal(st.server.active, 8);
     const c9 = net.connect(port, '127.0.0.1');
     c9.on('error', () => {});
     const r9 = await clientRoundtrip(c9, { cmd: 'threads' });
@@ -236,7 +246,7 @@ test('node: serve loop overloads 9th ordinary but closes on 10th', async () => {
     const r10 = await clientRoundtrip(c10, { cmd: 'close' });
     c10.destroy();
     assert.deepEqual(r10, { ok: true, closed: true, target: 'main' });
-    assert.equal(st.closing, true);
+    assert.equal(st.server.closing, true);
     assert.equal(cleanups, 1);
     // Stop the loop via abandonment (no process exit inside tests).
     fs.unlinkSync(path.join(dir, 'owner.json'));
@@ -274,6 +284,9 @@ test('node: failing envelope names this request, not the sibling scope', async (
     throw new node.BridgeErr(`unknown target: ${req.target}`);
   };
   const sib = await tcpPair();
+  // Direct handleConn use acquires its ServerState slot first (serve owns
+  // admission in production; the slot releases in handleConn's finally).
+  assert.equal(st.server.tryAcquire(node.MAX_ACTIVE_HANDLERS), true);
   const sibP = node.handleConn(st, sib.serverConn);
   await framing.writeFrame(sib.client, { cmd: 'threads', marker: 'sibling' });
   await enteredP;
@@ -281,6 +294,7 @@ test('node: failing envelope names this request, not the sibling scope', async (
     // Explicit unknown target: envelope names the requested raw string.
     const b1 = await tcpPair();
     try {
+      assert.equal(st.server.tryAcquire(node.MAX_ACTIVE_HANDLERS), true);
       const p1 = node.handleConn(st, b1.serverConn);
       const r1 = await clientRoundtrip(b1.client, { cmd: 'threads', target: 'worker:bogus' });
       await p1;
@@ -295,6 +309,7 @@ test('node: failing envelope names this request, not the sibling scope', async (
     // the sibling's worker:zzz.
     const b2 = await tcpPair();
     try {
+      assert.equal(st.server.tryAcquire(node.MAX_ACTIVE_HANDLERS), true);
       const p2 = node.handleConn(st, b2.serverConn);
       const r2 = await clientRoundtrip(b2.client, { cmd: 'threads' });
       await p2;

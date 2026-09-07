@@ -268,8 +268,8 @@ test('node plantWorkerBreaks: multi-location with one leg home is verified', asy
     awaitingStep: false, exited: false,
     observed: { url: null, type: 'worker', endpoint: null },
   };
-  st.workerTable.set(wid, w);
-  st.workerOrder.push(wid);
+  assert.equal(st.workers.claimId(wid), true);
+  st.workers.track(w);
   // One leg on line 7, one slid away: must read verified (was: slid).
   st.workerSend = async () => ({
     breakpointId: 'bp-multi', locations: [{ lineNumber: 6 }, { lineNumber: 9 }],
@@ -299,14 +299,14 @@ test('node acceptWorker: detach mid-admission stops the stale resume', async () 
     sent.push(method);
     if (method === 'Debugger.setBreakpointByUrl') {
       // Rival detach lands while the plant awaits are in flight.
-      st.noteWorkerExit(w.id);
+      st.workers.noteExit(w.id);
       return { breakpointId: 'bp-x', locations: [] };
     }
     return {};
   };
   await st.acceptWorker({ sessionId: 's9', workerInfo: { url: 'file:///w9.js', type: 'worker' } });
-  assert.ok(!st.workerTable.has('worker:s9'), 'retired entry stays retired');
-  assert.ok(st.exitedWorkers.some((e) => e.id === 'worker:s9' && e.state === 'exited'),
+  assert.ok(!st.workers.table.has('worker:s9'), 'retired entry stays retired');
+  assert.ok(st.workers.exited.some((e) => e.id === 'worker:s9' && e.state === 'exited'),
     'detach history preserved');
   assert.ok(!sent.includes('Debugger.resume'), 'no resume to a dead session');
   assert.ok(!sent.includes('Runtime.runIfWaitingForDebugger'), 'no run gate to a dead session');

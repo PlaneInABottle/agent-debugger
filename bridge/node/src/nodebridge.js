@@ -745,6 +745,290 @@ function slidLine(locs, line) {
   return locs[0].lineNumber + 1;
 }
 
+// ---------------------------------------------------------------- M4 owners
+//
+// Single-file MUST (src/bridge.rs embeds this file via include_str!): the
+// three owners below live in-file. Session stays the sole runtime owner —
+// it constructs exactly one WorkerRegistry, one ServerState, and three
+// SerialChains, and orchestrates CDP transport. Each owner holds its own
+// mutable state plus a cheap assertValid() invariant for tests.
+//
+// Retained (complete production routing, no aliases, no dual writes):
+//   SerialChain    — one serialized promise tail (swap / mutation / pause).
+//   WorkerRegistry — worker table/order/seen/exited/ignored/pending +
+//                    admission/retirement/eviction.
+//   ServerState    — handler-pool occupancy + terminal-close single winner.
+//
+// Rejected (Python M3 lesson applied): BreakpointStore / StopCoordinator.
+// Breakpoint bookkeeping (breakKeys/breakRecByKey/breakIdToRec/stopStates)
+// and the stop/wait/capture freshness machine (paused/stopInfo/track
+// fields, freshBase/selectFreshStop) ARE the swapped worker context — a
+// wrapper would only add bypass. They stay Session-owned sections below.
+// Target resolve (resolveTarget) and the swap save/load quartet stay
+// Session orchestration too: they fuse main liveness (mainDead/exited,
+// mainSeq/lastParkTarget) with roster reads, and splitting them would
+// dual-own the selection clocks.
+//
+// Routing rule (grep-enforced via scripts/check_nodebridge_owners.sh,
+// wired into scripts/run_gates.sh --unit): production code mutates owner
+// state only through owner methods — never `workers.table.set/delete`,
+// never `workers.pending.set/delete`, never `server.active`/`server.closing`
+// writes outside ServerState. Reads of owned collections (get/has/live
+// lists, closing/active counters) stay direct.
+
+/** One serialized promise tail: every run() waits for its predecessor, so
+ *  sections that borrow shared target fields never overlap. Rejections
+ *  never break the chain (the tail swallows a fork for chaining; callers
+ *  still observe their own rejection). NOT reentrant: entry points wrap
+ *  once and inner work never re-enters. */
+class SerialChain {
+  constructor() {
+    this.tail = Promise.resolve();
+    this.depth = 0; // queued + in-flight runs (invariant: integer >= 0)
+  }
+
+  run(fn) {
+    this.depth += 1;
+    const run = this.tail.then(fn);
+    this.tail = run.catch(() => {});
+    return run.then(
+      (v) => { this.depth -= 1; return v; },
+      (e) => { this.depth -= 1; throw e; },
+    );
+  }
+
+  assertValid() {
+    if (!Number.isInteger(this.depth) || this.depth < 0) {
+      throw new Error(`SerialChain invariant: depth=${this.depth}`);
+    }
+  }
+}
+
+/** Canonical owner of worker-target lifecycle + the in-flight CDP replies
+ *  addressed to workers.
+ *
+ *  Holds: worker table (id -> worker, live + ignored), creation order,
+ *  every id ever issued (never reused), bounded exited history (max 16) +
+ *  eviction counter, released (over-budget) lifetime counter, and the
+ *  pending worker replies (`${sessionId}:${cdpId}` -> {resolve,reject}).
+ *
+ *  Per-target park/break fields live on Session (main context) and each
+ *  worker object; Session.saveMain/loadWorker/storeWorker/loadMain
+ *  context-switch them under the swap chain. CDP IO stays Session
+ *  orchestration. Invariant: every table key is in order and seen; exited
+ *  history is bounded; counters never go negative.
+ *
+ *  Pre-existing roster shape (no behavior change): order RETAINS exited
+ *  ids — noteExit removes the entry from the table, not from order, so
+ *  order is a creation log, not a live set. Roster readers guard with
+ *  has()/liveWorkers()/findExited, which is why the invariant is table ⊆
+ *  order and not equality. Future bounded-roster trigger: if order growth
+ *  or order/table drift is ever attributed a measured defect, evict
+ *  retired ids from order inside noteExit (and tighten assertValid to
+ *  order ⊆ table keys ∪ exited ids) — until that trigger fires, the
+ *  retention stays as-is. */
+class WorkerRegistry {
+  constructor() {
+    this.table = new Map(); // id -> worker (live + ignored)
+    this.order = [];        // creation log for roster listing (retains exited ids)
+    this.seenIds = new Set(); // every id ever issued (no reuse)
+    this.exited = [];       // bounded last-known entries (max 16)
+    this.ignored = 0;       // released (over-budget) workers, lifetime
+    this.droppedExited = 0; // exited-history evictions, lifetime
+    this.pending = new Map(); // `${sessionId}:${cdpId}` -> {resolve,reject}
+  }
+
+  static MAX_EXITED_HISTORY = 16;
+  static MAX_IGNORED_RETAINED = 16;
+  static MAX_ACTIVE_WORKERS = 8;
+
+  has(id) {
+    return this.table.has(id);
+  }
+
+  get(id) {
+    return this.table.get(id);
+  }
+
+  isCurrent(id, w) {
+    return this.table.get(id) === w;
+  }
+
+  liveWorkers() {
+    const out = [];
+    for (const id of this.order) {
+      const w = this.table.get(id);
+      if (w && !w.exited) out.push(w);
+    }
+    return out;
+  }
+
+  activeWorkers() {
+    return this.liveWorkers().filter((w) => w.state === 'running' || w.state === 'stopped');
+  }
+
+  findExited(id) {
+    return this.exited.find((e) => e.id === id);
+  }
+
+  /** Claim an id for a fresh worker: false when already seen (ids are
+   *  never reused — the caller must drop the duplicate). */
+  claimId(id) {
+    if (this.seenIds.has(id)) return false;
+    this.seenIds.add(id);
+    return true;
+  }
+
+  /** Live admission (table + order together — never one without the
+   *  other). The id must be claimed first. */
+  track(w) {
+    this.table.set(w.id, w);
+    this.order.push(w.id);
+  }
+
+  /** Over-budget admission: released (never parked, never served), counted
+   *  for life, retained bounded. The caller sets w.state = 'ignored'. */
+  release(w) {
+    this.table.set(w.id, w);
+    this.order.push(w.id);
+    this.ignored += 1;
+    this.evictOldIgnored();
+  }
+
+  /** Move a live worker to the bounded exited history (never reused).
+   *  In-flight replies addressed to it fail now — nobody will answer. */
+  noteExit(tid, failErr = new BridgeErr('worker session ended')) {
+    const w = this.table.get(tid);
+    if (!w) return;
+    this.table.delete(tid);
+    this.failSessionPending(w.sessionId, failErr);
+    w.exited = true;
+    w.state = 'exited';
+    w.paused = null;
+    this.exited.push({
+      id: w.id, kind: 'worker', pid: null,
+      state: 'exited', lastStop: w.lastStop,
+      observed: w.observed,
+      scope: w.targetRaws.size > 0 ? 'target' : 'inherited',
+    });
+    while (this.exited.length > WorkerRegistry.MAX_EXITED_HISTORY) {
+      this.exited.shift();
+      this.droppedExited += 1;
+    }
+  }
+
+  evictOldIgnored() {
+    const ignored = this.order.filter((id) => {
+      const w = this.table.get(id);
+      return w && w.state === 'ignored';
+    });
+    while (ignored.length > WorkerRegistry.MAX_IGNORED_RETAINED) {
+      const old = ignored.shift();
+      this.table.delete(old);
+      const i = this.order.indexOf(old);
+      if (i >= 0) this.order.splice(i, 1);
+    }
+  }
+
+  putPending(key, handlers) {
+    this.pending.set(key, handlers);
+  }
+
+  takePending(key) {
+    const pend = this.pending.get(key);
+    if (pend) this.pending.delete(key);
+    return pend;
+  }
+
+  dropPending(key) {
+    return this.pending.delete(key);
+  }
+
+  failSessionPending(sessionId, err) {
+    for (const key of [...this.pending.keys()]) {
+      if (key.startsWith(`${sessionId}:`)) {
+        const p = this.pending.get(key);
+        this.pending.delete(key);
+        try {
+          p.reject(err);
+        } catch (_) { /* already settled */ }
+      }
+    }
+  }
+
+  assertValid() {
+    for (const id of this.table.keys()) {
+      if (!this.order.includes(id)) throw new Error(`WorkerRegistry invariant: table key ${id} not in order`);
+      if (!this.seenIds.has(id)) throw new Error(`WorkerRegistry invariant: table key ${id} never seen`);
+    }
+    if (this.exited.length > WorkerRegistry.MAX_EXITED_HISTORY) {
+      throw new Error(`WorkerRegistry invariant: exited history ${this.exited.length} over bound`);
+    }
+    if (this.ignored < 0 || this.droppedExited < 0) {
+      throw new Error('WorkerRegistry invariant: negative lifetime counter');
+    }
+  }
+}
+
+/** Canonical owner of serve-level concurrency state: live-handler
+ *  occupancy (bounded by MAX_ACTIVE_HANDLERS) and the terminal-close
+ *  single winner. Session.dispatch/concurrency sections and the
+ *  module-level serve/handleConn/closeFromConn functions mutate only
+ *  through this API. Per-target resume occupancy (`outstanding`) stays
+ *  Session-owned dispatch state — it is orthogonal to the pool/close
+ *  lifecycle and moving it would only churn its many Session-surface
+ *  tests. Invariant: 0 <= active <= limit; closing is boolean. */
+class ServerState {
+  constructor() {
+    this.closing = false; // terminal close accepted (single winner below)
+    this.active = 0;      // live connection handlers (bounded)
+  }
+
+  /** Bounded pool admission for one connection handler: false when the
+   *  pool is full (the caller sends the overload rejection instead). The
+   *  check-and-increment is synchronous — no await between — so
+   *  concurrent serve iterations can never over-admit. */
+  tryAcquire(limit) {
+    if (this.active >= limit) return false;
+    this.active += 1;
+    return true;
+  }
+
+  release() {
+    // Loud on unbalanced use: production pairs every release with a
+    // successful tryAcquire (serve admits, handleConn's finally releases),
+    // so a zero-active release is a bug, never a slow close. Failing here
+    // keeps assertValid(limit) honest instead of masking drift below zero.
+    if (this.active <= 0) {
+      throw new Error('ServerState invariant: release without acquire');
+    }
+    this.active -= 1;
+  }
+
+  /** Terminal-close single winner: exactly one closer runs the teardown
+   *  (the single-threaded check-and-set is atomic — no await between the
+   *  flag read and write). Every close still gets its closed ACK. */
+  claimClose() {
+    if (this.closing) return false;
+    this.closing = true;
+    return true;
+  }
+
+  /** Non-winner close path (Session.cleanup direct use): idempotent. */
+  markClosing() {
+    this.closing = true;
+  }
+
+  assertValid(limit) {
+    if (!Number.isInteger(this.active) || this.active < 0 || this.active > limit) {
+      throw new Error(`ServerState invariant: active=${this.active} outside [0, ${limit}]`);
+    }
+    if (typeof this.closing !== 'boolean') {
+      throw new Error('ServerState invariant: closing not boolean');
+    }
+  }
+}
+
 class Session {
   constructor(cfg) {
     this.cfg = cfg;
@@ -762,7 +1046,7 @@ class Session {
     this.paused = null;     // {frames, stopInfo} of the current stop
     this.awaitingStep = false;
     this.exited = false;
-    this.closing = false;
+    // (terminal-close flag lives on this.server — see ServerState.)
     this.lastTop = null;
     this.lastFunc = null;
     this.lastChanged = '[]';
@@ -783,15 +1067,11 @@ class Session {
     this.sessionPort = 0; // our TCP port (set in main, for republishing)
     this.lastStop = null; // {file,line,method} of the latest stop
     // -- worker targets (M-T/M4): main keeps its own fields above;
-    // workers live in workerTable by opaque id (worker:<sessionId>).
+    // workers live in the WorkerRegistry below by opaque id
+    // (worker:<sessionId>). Selection clocks (stopSeq/mainSeq/
+    // lastParkTarget) stay Session-owned: they fuse main + worker parks.
     this.workersEnabled = !!(cfg && cfg.workers);
-    this.workerTable = new Map(); // id -> worker (live + ignored)
-    this.workerOrder = [];        // creation order for roster listing
-    this.seenWorkerIds = new Set(); // every id ever issued (no reuse)
-    this.exitedWorkers = [];      // bounded last-known entries (max 16)
-    this.ignoredWorkers = 0;      // released (over-budget) workers, lifetime
-    this.droppedWorkerExited = 0; // exited-history evictions, lifetime
-    this.workerPending = new Map(); // `${sessionId}:${cdpId}` -> {resolve,reject}
+    this.workers = new WorkerRegistry();
     this.stopSeq = 0;             // monotonic park clock for auto-select
     this.mainSeq = 0;             // seq of the main park (0 = never parked)
     this.lastParkTarget = 'main'; // which target the last pump parked
@@ -814,10 +1094,12 @@ class Session {
     this.identityHint = '';       // debuggee-first one-liner for timeouts
     // -- M5 concurrency: outstanding resume ops by target (tid -> cmd);
     // live reads bypass everything below and serve published state.
+    // Stays Session-owned dispatch state (see ServerState head note).
     this.outstanding = new Map();
-    this.activeConns = 0;         // live connection handlers (bounded)
-    this._swapTail = null;        // swap/tracking-field mutex chain
-    this._mutationTail = null;    // breaks-mutation mutex chain (all mutations)
+    this.server = new ServerState(); // pool occupancy + close single-winner
+    this._swapChain = new SerialChain(); // swap/tracking-field mutex
+    this._mutationChain = new SerialChain(); // breaks-mutation mutex (all mutations)
+    this._pauseChain = new SerialChain(); // pause-event serialization
     this.mainDead = false;        // main session over; workers may live on
     this.sender = null;           // per-target CDP sender (null = main cdp)
     this.nodeWorkerEnabled = false;
@@ -833,18 +1115,11 @@ class Session {
     return this.cdp.request(method, params, timeoutMs);
   }
 
-  liveWorkers() {
-    const out = [];
-    for (const id of this.workerOrder) {
-      const w = this.workerTable.get(id);
-      if (w && !w.exited) out.push(w);
-    }
-    return out;
-  }
-
-  activeWorkers() {
-    return this.liveWorkers().filter((w) => w.state === 'running' || w.state === 'stopped');
-  }
+  // -- target resolve (Session orchestration over WorkerRegistry reads).
+  // Stays here (not on the registry): explicit validation fuses main
+  // liveness (mainDead/exited) with roster reads, and auto-selection fuses
+  // the main selection clocks (mainSeq/lastParkTarget) with worker parks —
+  // moving either half would dual-own the selection state.
 
   resolveTarget(req) {
     // Acceptance-time auto-selection rides in req._autoTarget (stamped by
@@ -858,9 +1133,9 @@ class Session {
         }
         return 'main';
       }
-      const w = this.workerTable.get(want);
+      const w = this.workers.get(want);
       if (!w) {
-        if (this.exitedWorkers.some((e) => e.id === want)) {
+        if (this.workers.findExited(want)) {
           throw new BridgeErr(`target ${want} has exited — close this session`);
         }
         throw new BridgeErr(`unknown target: ${want}`);
@@ -876,7 +1151,7 @@ class Session {
     let best = 'main';
     let bestSeq = (this.paused && !this.mainDead) ? this.mainSeq : 0;
     if (this.mainDead) bestSeq = -1;
-    for (const w of this.liveWorkers()) {
+    for (const w of this.workers.liveWorkers()) {
       if (w.paused && w.stopSeq > bestSeq) {
         best = w.id;
         bestSeq = w.stopSeq;
@@ -891,47 +1166,22 @@ class Session {
   /** Serialize every section that borrows shared target fields
    *  (withTarget swaps, pause-handler tracking/sender borrowing). Only
    *  bounded CDP round-trips run inside — never pump waits — so resume
-   *  waits on different targets stay parallel. NOT reentrant. */
-  _lockSwap() {
-    let release;
-    const willLock = new Promise((resolve) => {
-      release = resolve;
-    });
-    const waitsFor = this._swapTail || Promise.resolve();
-    this._swapTail = waitsFor.then(() => willLock);
-    return waitsFor.then(() => release);
-  }
-
+   *  waits on different targets stay parallel. Chain-owned (see
+   *  SerialChain); NOT reentrant. */
   async _swapRun(fn) {
-    const release = await this._lockSwap();
-    try {
-      return await fn();
-    } finally {
-      release();
-    }
+    return this._swapChain.run(fn);
   }
 
-  /** Serialize breaks mutations (same promise-chain idiom as _swapRun, own
-   *  tail so swap traffic never waits on a plant): concurrent identical
-   *  adds recheck under the chain, so the second sees the first's state
-   *  (empty-added, no duplicate records); concurrent add×remove/clear on a
-   *  same-file replace converge the same way (no ghost/resurrection).
-   *  Mutation paths never swap shared fields, so this never nests with
-   *  _swapRun in either order. The chain is NOT reentrant: entry points
-   *  wrap once and inner work calls the _Inner/drop forms directly. */
+  /** Serialize breaks mutations (own chain so swap traffic never waits on
+   *  a plant): concurrent identical adds recheck under the chain, so the
+   *  second sees the first's state (empty-added, no duplicate records);
+   *  concurrent add×remove/clear on a same-file replace converge the same
+   *  way (no ghost/resurrection). Mutation paths never swap shared
+   *  fields, so this never nests with _swapRun in either order. The chain
+   *  is NOT reentrant: entry points wrap once and inner work calls the
+   *  _Inner/drop forms directly. */
   async _mutationRun(fn) {
-    let release;
-    const willLock = new Promise((resolve) => {
-      release = resolve;
-    });
-    const waitsFor = this._mutationTail || Promise.resolve();
-    this._mutationTail = waitsFor.then(() => willLock);
-    await waitsFor;
-    try {
-      return await fn();
-    } finally {
-      release();
-    }
+    return this._mutationChain.run(fn);
   }
 
   /** M5 immediate busy rejection: a second resume or mutation on the SAME
@@ -1066,19 +1316,21 @@ class Session {
    *  reentrant); resume pumps run OUTSIDE the scope, so waits stay
    *  parallel across targets. */
   async withTarget(tid, fn) {
-    if (tid === 'main' || !this.workerTable.has(tid)) {
+    if (tid === 'main' || !this.workers.has(tid)) {
       return this._swapRun(fn);
     }
     return this._swapRun(async () => {
-      const w = this.workerTable.get(tid);
+      const w = this.workers.get(tid);
       const saved = this.saveMain();
       this.loadWorker(w);
       try {
         return await fn();
       } finally {
         // The worker may have exited mid-command (table entry moved to
-        // history): only store back while it is still live.
-        if (this.workerTable.get(tid) === w) this.storeWorker(w);
+        // history): only store back while it is still live. Main context
+        // restores unconditionally either way — an exit mid-command must
+        // never strand the swapped fields (regression-covered).
+        if (this.workers.isCurrent(tid, w)) this.storeWorker(w);
         this.loadMain(saved);
       }
     });
@@ -1102,7 +1354,7 @@ class Session {
         scope: 'global',
       };
     }
-    const w = this.workerTable.get(tid);
+    const w = this.workers.get(tid);
     return {
       id: w.id, kind: 'worker', pid: null,
       state: w.state, lastStop: w.lastStop,
@@ -1113,61 +1365,20 @@ class Session {
 
   cmdTargets() {
     const entries = [this.targetEntry('main')];
-    for (const id of this.workerOrder) {
-      if (this.workerTable.has(id)) entries.push(this.targetEntry(id));
+    for (const id of this.workers.order) {
+      if (this.workers.has(id)) entries.push(this.targetEntry(id));
     }
-    for (const e of this.exitedWorkers) entries.push(e);
+    for (const e of this.workers.exited) entries.push(e);
     return this.withStamp({
       ok: true, targets: entries,
       selected: this.resolveTarget({}),
-      ignored: this.ignoredWorkers,
-      droppedExited: this.droppedWorkerExited,
+      ignored: this.workers.ignored,
+      droppedExited: this.workers.droppedExited,
       targetIdentity: this.targetIdentity || null,
     }, 'main');
   }
 
-  noteWorkerExit(tid) {
-    const w = this.workerTable.get(tid);
-    if (!w) return;
-    this.workerTable.delete(tid);
-    for (const key of [...this.workerPending.keys()]) {
-      if (key.startsWith(`${w.sessionId}:`)) {
-        const p = this.workerPending.get(key);
-        this.workerPending.delete(key);
-        try {
-          p.reject(new BridgeErr('worker session ended'));
-        } catch (_) { /* already settled */ }
-      }
-    }
-    w.exited = true;
-    w.state = 'exited';
-    w.paused = null;
-    this.exitedWorkers.push({
-      id: w.id, kind: 'worker', pid: null,
-      state: 'exited', lastStop: w.lastStop,
-      observed: w.observed,
-      scope: w.targetRaws.size > 0 ? 'target' : 'inherited',
-    });
-    while (this.exitedWorkers.length > 16) {
-      this.exitedWorkers.shift();
-      this.droppedWorkerExited += 1;
-    }
-  }
-
-  evictOldIgnored() {
-    const ignored = this.workerOrder.filter((id) => {
-      const w = this.workerTable.get(id);
-      return w && w.state === 'ignored';
-    });
-    while (ignored.length > 16) {
-      const old = ignored.shift();
-      this.workerTable.delete(old);
-      const i = this.workerOrder.indexOf(old);
-      if (i >= 0) this.workerOrder.splice(i, 1);
-    }
-  }
-
-  // -- target lifecycle
+  // -- target lifecycle (admission/retirement owned by WorkerRegistry)
 
   async startTarget() {
     const stderrBuf = [];
@@ -1452,7 +1663,7 @@ class Session {
       // Attach target died (launch deaths surface via child 'close', but
       // attach has no child): mark exit now so pump fails fast and the
       // session file stops lying about being parked.
-      if (!this.closing) {
+      if (!this.server.closing) {
         this.exited = true;
         this.paused = null;
         this.publishState(false);
@@ -1635,11 +1846,11 @@ class Session {
     }
     if (msg.method === 'NodeWorker.detachedFromWorker') {
       const sid = (msg.params || {}).sessionId;
-      // noteWorkerExit retires whatever the table knows — tracked workers
+      // workers.noteExit retires whatever the table knows — tracked workers
       // AND released (ignored) ones, so a kicked worker that runs out is
       // observable as exited rather than stuck as ignored forever.
       // Unknown sessions (never seen, e.g. evicted) stay untracked.
-      if (sid) this.noteWorkerExit(`worker:${sid}`);
+      if (sid) this.workers.noteExit(`worker:${sid}`);
       return;
     }
     if (msg.method === 'NodeWorker.receivedMessageFromWorker') {
@@ -1692,16 +1903,14 @@ class Session {
    *  pump or CLI), so the chain drains instead of hanging head-of-line.
    *  First-park-per-target is preserved: a link parks synchronously in
    *  its own prefix, so a duplicate landing behind it still sees the park.
-   *  Rejections never break the chain (callers still observe them). */
+   *  Chain-owned (see SerialChain); rejections never break the chain
+   *  (callers still observe them). */
   _chainPause(fn) {
-    const prev = this._pauseChain || Promise.resolve();
-    const run = prev.then(fn);
-    this._pauseChain = run.catch(() => {});
-    return run;
+    return this._pauseChain.run(fn);
   }
 
   async onPaused(p) {
-    if (this.closing || this.exited || this.paused) {
+    if (this.server.closing || this.exited || this.paused) {
       // Single target: a second pause cannot arrive while one is held (the
       // target is frozen). If it ever does, hold the first stop; the next
       // resume flushes the rest. The park below is set SYNCHRONOUSLY (before
@@ -1806,11 +2015,11 @@ class Session {
     const message = JSON.stringify({ id, method, params });
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        if (this.workerPending.delete(key)) {
+        if (this.workers.dropPending(key)) {
           reject(new BridgeErr(`CDP ${method} timed out after ${Math.round(timeoutMs / 1000)}s`));
         }
       }, timeoutMs);
-      this.workerPending.set(key, {
+      this.workers.putPending(key, {
         resolve: (result) => {
           clearTimeout(timer);
           resolve(result);
@@ -1822,7 +2031,7 @@ class Session {
       });
       this.cdp.request('NodeWorker.sendMessageToWorker',
         { sessionId: w.sessionId, message }, timeoutMs).catch((e) => {
-        if (this.workerPending.delete(key)) {
+        if (this.workers.dropPending(key)) {
           clearTimeout(timer);
           reject(e);
         }
@@ -1857,9 +2066,8 @@ class Session {
     if (!inner || typeof inner !== 'object') return;
     if (inner.id !== undefined) {
       const key = `${sessionId}:${inner.id}`;
-      const pend = this.workerPending.get(key);
+      const pend = this.workers.takePending(key);
       if (pend) {
-        this.workerPending.delete(key);
         try {
           if (inner.error) {
             pend.reject(new BridgeErr(
@@ -1872,7 +2080,7 @@ class Session {
       }
     }
     if (!inner.method) return;
-    const w = this.workerTable.get(`worker:${sessionId}`);
+    const w = this.workers.get(`worker:${sessionId}`);
     if (!w || w.exited || w.state === 'ignored') {
       // Untracked or released workers never park: keep the app running.
       if (inner.method === 'Debugger.paused') {
@@ -1907,8 +2115,7 @@ class Session {
     const info = p.workerInfo || {};
     if (!sessionId) return;
     const id = `worker:${sessionId}`;
-    if (this.seenWorkerIds.has(id)) return; // ids are never reused
-    this.seenWorkerIds.add(id);
+    if (!this.workers.claimId(id)) return; // ids are never reused
     const w = {
       id, sessionId, workerInfo: info,
       state: 'running', paused: null, stopInfo: null, lastStop: null,
@@ -1930,20 +2137,16 @@ class Session {
         endpoint: this.mainWsUrl || null,
       },
     };
-    if (this.activeWorkers().length >= 8) {
+    if (this.workers.activeWorkers().length >= WorkerRegistry.MAX_ACTIVE_WORKERS) {
       // Over budget: kick and release (never parked, never counted as
       // active). Later pauses auto-kick via the untracked path.
       this.kickWorkerFree(sessionId);
       w.state = 'ignored';
-      this.workerTable.set(id, w);
-      this.workerOrder.push(id);
-      this.ignoredWorkers += 1;
-      this.evictOldIgnored();
+      this.workers.release(w);
       process.stderr.write(`warn: worker ${id} over budget: released\n`);
       return;
     }
-    this.workerTable.set(id, w);
-    this.workerOrder.push(id);
+    this.workers.track(w);
     w.logpoints = (this.cfg.logpoints || []).map((l) => ({ ...l }));
     try {
       // Each worker is its own CDP session: enable its Debugger domain
@@ -1961,13 +2164,13 @@ class Session {
     // Admission recheck: the worker may have detached while the plant
     // awaits ran (detachedFromWorker retires the table entry). A stale
     // admission must neither resume a dead session nor mark itself running.
-    if (this.workerTable.get(id) !== w) return;
+    if (!this.workers.isCurrent(id, w)) return;
     await this.workerSend(w, 'Debugger.resume', {}, 5000).catch(() => {});
     // Belt-and-braces: a worker that reached waitForDebugger before our
     // resume may also need the run gate lifted (main uses
     // Runtime.runIfWaitingForDebugger for the same purpose).
     await this.workerSend(w, 'Runtime.runIfWaitingForDebugger', {}, 5000).catch(() => {});
-    if (this.workerTable.get(id) !== w) return;
+    if (!this.workers.isCurrent(id, w)) return;
     w.state = 'running';
     process.stderr.write(`target: ${id} attached (${info.url || 'worker'})\n`);
   }
@@ -2065,7 +2268,7 @@ class Session {
    *  with an explicit scripts map + sender so concurrent worker events can
    *  never clobber main (or each other): no field swapping across awaits. */
   async onWorkerPaused(w, p) {
-    if (this.closing || this.exited || w.exited || w.paused) {
+    if (this.server.closing || this.exited || w.exited || w.paused) {
       return;
     }
     const sender = (method, params, timeoutMs) =>
@@ -2543,7 +2746,7 @@ class Session {
       }
       // Any target's park satisfies the wait (first stop on any target
       // counts for launch).
-      if (this.paused || this.liveWorkers().some((w) => w.paused)) return 'stopped';
+      if (this.paused || this.workers.liveWorkers().some((w) => w.paused)) return 'stopped';
       if (this.exited) throw new BridgeErr('target exited');
       if (Date.now() > deadline) {
         throw this.stopTimeoutErr(timeout, withWaitContext, startedAt);
@@ -2558,13 +2761,13 @@ class Session {
    *  untouched pre-existing parks keep theirs). */
   freshBase() {
     const workers = new Map();
-    for (const [id, w] of this.workerTable) workers.set(id, w.paused || null);
+    for (const [id, w] of this.workers.table) workers.set(id, w.paused || null);
     return { main: this.paused || null, workers };
   }
 
   isFreshPark(id, base) {
     if (id === 'main') return !!this.paused && this.paused !== base.main;
-    const w = this.workerTable.get(id);
+    const w = this.workers.get(id);
     return !!(w && w.paused && w.paused !== base.workers.get(id));
   }
 
@@ -2578,7 +2781,7 @@ class Session {
     if (explicit) return this.isFreshPark(tid, base) ? tid : null;
     if (this.isFreshPark(this.lastParkTarget, base)) return this.lastParkTarget;
     if (this.isFreshPark('main', base)) return 'main';
-    for (const id of this.workerOrder) {
+    for (const id of this.workers.order) {
       if (this.isFreshPark(id, base)) return id;
     }
     return null;
@@ -2612,14 +2815,14 @@ class Session {
   }
 
   anyWorkerParked() {
-    return this.liveWorkers().some((w) => w.paused);
+    return this.workers.liveWorkers().some((w) => w.paused);
   }
 
   markExited() {
     // Main exit ends every worker too (same process): move the live roster
     // to exited history, then mark the session.
-    for (const w of this.liveWorkers()) {
-      this.noteWorkerExit(w.id);
+    for (const w of this.workers.liveWorkers()) {
+      this.workers.noteExit(w.id);
     }
     this.mainDead = true;
     this.exited = true;
@@ -3151,7 +3354,7 @@ class Session {
       this.breakIdToRec.set(bpId, { rec, line: b.line });
       return { kind: 'main', bpId };
     }
-    const w = this.workerTable.get(tid);
+    const w = this.workers.get(tid);
     if (!w || w.exited) throw new BridgeErr(`target ${tid} has exited — close this session`);
     const combined = new Set([...w.inheritedKeys, ...w.targetRaws.keys()]);
     if (combined.has(key)) return { kind: 'child-dup' };
@@ -3496,7 +3699,7 @@ class Session {
       if (!this.paused) this.awaitingStep = false;
       return;
     }
-    const w = this.workerTable.get(tid);
+    const w = this.workers.get(tid);
     if (w && !w.paused) w.awaitingStep = false;
   }
 
@@ -3556,7 +3759,7 @@ class Session {
         threads: [{ id: 1, name: 'main', status: this.paused ? 'paused' : 'running', frames }],
       };
     }
-    const w = this.workerTable.get(tid);
+    const w = this.workers.get(tid);
     if (!w || w.exited || w.state === 'exited') {
       throw new BridgeErr(`target ${tid} has exited — close this session`);
     }
@@ -3594,8 +3797,8 @@ class Session {
     const selected = this.resolveTarget(req);
     if (this.exited) throw new BridgeErr('target VM has exited — close this session');
     const roster = ['main'];
-    for (const id of this.workerOrder) {
-      const w = this.workerTable.get(id);
+    for (const id of this.workers.order) {
+      const w = this.workers.get(id);
       if (!w || w.exited || w.state === 'ignored' || w.state === 'exited') continue;
       if (w.state !== 'running' && w.state !== 'stopped') continue;
       roster.push(id);
@@ -3636,8 +3839,8 @@ class Session {
     const selected = this.resolveTarget(req);
     if (this.exited) throw new BridgeErr('target VM has exited — close this session');
     const stops = this.stopStates.map((r) => ({ ...r, target: 'main' }));
-    for (const id of this.workerOrder) {
-      const w = this.workerTable.get(id);
+    for (const id of this.workers.order) {
+      const w = this.workers.get(id);
       if (!w || w.exited || w.state === 'ignored') continue;
       for (const r of w.stopStates) stops.push({ ...r, target: id });
     }
@@ -3869,8 +4072,8 @@ class Session {
   async inheritGlobalAdd(fresh) {
     if (fresh.length === 0) return null;
     const warnings = [];
-    for (const id of this.workerOrder) {
-      const w = this.workerTable.get(id);
+    for (const id of this.workers.order) {
+      const w = this.workers.get(id);
       if (!w || w.exited || w.state === 'ignored') continue;
       const { added, failed } = await this.plantWorkerBreaks(w, fresh);
       for (const e of added) {
@@ -3917,7 +4120,7 @@ class Session {
   }
 
   async _addWorkerEphemeralInner(tid, raws) {
-    const w = this.workerTable.get(tid);
+    const w = this.workers.get(tid);
     if (!w || w.exited) throw new BridgeErr(`target ${tid} has exited — close this session`);
     const { parsed } = this.parseLiveBreaks(raws);
     const combined = new Set([...w.inheritedKeys, ...w.targetRaws.keys()]);
@@ -4030,7 +4233,7 @@ class Session {
    *  wrapped transport, touching only that worker's records (inherited
    *  copies and/or ephemeral entries, never the global intent). */
   async dropWorkerKeys(tid, keys, missing) {
-    const w = this.workerTable.get(tid);
+    const w = this.workers.get(tid);
     if (!w || w.exited) throw new BridgeErr(`target ${tid} has exited — close this session`);
     const removed = [];
     const failed = [];
@@ -4105,7 +4308,7 @@ class Session {
     const scope = req && typeof req.target === 'string' ? req.target : null;
     if (scope !== null && scope !== 'main') {
       const tid = this.resolveTarget(req);
-      const w = this.workerTable.get(tid);
+      const w = this.workers.get(tid);
       const raws = req.breaks;
       if (!Array.isArray(raws) || raws.length === 0) {
         throw new BridgeErr('breaks remove needs at least one --break');
@@ -4155,8 +4358,8 @@ class Session {
     // copy while the intent stands would diverge bridge intent, backend,
     // and persistence).
     const childWarnings = [];
-    for (const id of this.workerOrder) {
-      const w = this.workerTable.get(id);
+    for (const id of this.workers.order) {
+      const w = this.workers.get(id);
       if (!w || w.exited || w.state === 'ignored') continue;
       const doomed = confirmed.filter((k) => w.inheritedKeys.has(k));
       if (doomed.length === 0) continue;
@@ -4180,7 +4383,7 @@ class Session {
     const scope = req && typeof req.target === 'string' ? req.target : null;
     if (scope !== null && scope !== 'main') {
       const tid = this.resolveTarget(req);
-      const w = this.workerTable.get(tid);
+      const w = this.workers.get(tid);
       const ordered = [...w.targetRaws.keys()];
       if (ordered.length === 0) {
         return this.withStamp({ ok: true, removed: [], stops: w.stopStates }, tid);
@@ -4202,8 +4405,8 @@ class Session {
       // and its copies).
       const confirmedSet = new Set(confirmedMain);
       const childWarnings = [];
-      for (const id of this.workerOrder) {
-        const w = this.workerTable.get(id);
+      for (const id of this.workers.order) {
+        const w = this.workers.get(id);
         if (!w || w.exited || w.state === 'ignored') continue;
         // Admitted keys, but inherited copies only for confirmed main
         // removals (ephemeral records always reset; a failed file keeps
@@ -4351,7 +4554,7 @@ class Session {
     // outstanding (the bridge never deadlocks waiting for a handler that
     // itself awaits a stop).
     if (cmd === 'close') throw new CloseSession();
-    if (this.closing) throw new BridgeErr('session is closing');
+    if (this.server.closing) throw new BridgeErr('session is closing');
     // M5 acceptance section: everything below runs synchronously (no
     // await), so concurrent handlers observe one atomic decision —
     // deterministic targetless selection, immediate busy rejection, and
@@ -4404,7 +4607,7 @@ class Session {
   }
 
   async cleanup() {
-    this.closing = true;
+    this.server.markClosing();
     if (this.cdp && !this.cdp.closed) {
       if (this.cfg.kind === 'launch') {
         // Launched target dies with the session (mirrors terminateDebuggee).
@@ -4446,7 +4649,7 @@ async function serve(st, server, queue) {
       return; // exit never returns; bound stubbed/embedded use instead
       // of spinning cleanup+exit forever.
     }
-    if (st.closing) {
+    if (st.server.closing) {
       // Bounded grace for in-flight handlers to flush their aborts, then
       // unconditional exit — responses were already flushed.
       await sleep(500);
@@ -4463,7 +4666,7 @@ async function serve(st, server, queue) {
         sleep(1000),
       ]);
       queue.waiter = null;
-      if (st.closing) break;
+      if (st.server.closing) break;
       if (queue.length === 0 && !amOwner(st.cfg.dir)) {
         await st.cleanup().catch(() => {});
         process.exit(0);
@@ -4471,10 +4674,13 @@ async function serve(st, server, queue) {
         // of spinning cleanup+exit forever.
       }
     }
-    if (st.closing) continue;
+    if (st.server.closing) continue;
     const conn = queue.shift();
     if (!conn) continue;
-    if (st.activeConns >= MAX_ACTIVE_HANDLERS) {
+    // Pool admission is one synchronous ServerState decision (no await
+    // between check and count), so concurrent iterations never over-admit.
+    // handleConn assumes the slot: it releases, never acquires.
+    if (!st.server.tryAcquire(MAX_ACTIVE_HANDLERS)) {
       await handleOverload(st, conn);
       continue;
     }
@@ -4508,9 +4714,9 @@ async function handleOverload(st, conn) {
   conn.destroy();
 }
 
-/** Serve one CLI connection: exactly one request and one response. */
+/** Serve one CLI connection: exactly one request and one response. The
+ *  caller (serve) holds one acquired ServerState slot for this handler. */
 async function handleConn(st, conn) {
-  st.activeConns += 1;
   try {
     let req;
     try {
@@ -4551,7 +4757,7 @@ async function handleConn(st, conn) {
     }
   } finally {
     conn.destroy();
-    st.activeConns -= 1;
+    st.server.release();
   }
 }
 
@@ -4574,15 +4780,11 @@ function errorTargetFor(st, req) {
 
 /** Terminal close handling for one connection, outside the handler pool:
  *  every close gets the closed ACK; exactly one winner runs the teardown
- *  (the single-threaded check-and-set is atomic — no await between the
- *  flag read and write). The pool counter is untouched (the overload path
- *  never counted). */
+ *  (ServerState.claimClose — the single-threaded check-and-set is atomic,
+ *  no await between the flag read and write). The pool counter is
+ *  untouched (the overload path never counted). */
 async function closeFromConn(st, conn) {
-  let mine = false;
-  if (!st.closing) {
-    st.closing = true;
-    mine = true;
-  }
+  const mine = st.server.claimClose();
   try {
     await writeFrame(conn, { ok: true, closed: true, target: 'main' });
   } catch (_) { /* client already gone */ }
