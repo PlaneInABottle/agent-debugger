@@ -272,298 +272,9 @@ class BridgeSession {
     // non-matching hit auto-resumes inside the bridge (zero LLM roundtrips).
     // Read-only allowlist for calls inside conditions (a mutating call run on
     // every loop iteration would corrupt state silently).
+    // Frame identity builders live in BridgeEval (M5.2).
 
-    /** Frame identity for change comparison: declaring type + method +
-     *  signature. Same-named overloads (or same-named methods in
-     *  different types) must never compare silently. Pure string
-     *  function for unit tests; the JDI extraction below degrades to
-     *  "?" when metadata is unreadable. */
-    static String frameIdentity(String type, String method, String sig) {
-        String t = type != null ? type : "?";
-        String m = method != null ? method : "?";
-        String id = t + "#" + m;
-        if (sig != null) id += sig;
-        return id;
-    }
-
-    /** Best-effort identity of a live frame ("?" when unreadable). */
-    static String frameIdentityOf(StackFrame f) {
-        try {
-            Location loc = f.location();
-            String t = loc.declaringType().name();
-            com.sun.jdi.Method mm = loc.method();
-            return frameIdentity(t, mm != null ? mm.name() : null,
-                    mm != null ? mm.signature() : null);
-        } catch (Exception ignored) {
-            return "?";
-        }
-    }
-
-    static void trackChanges(SessionState st) {
-        // Display-independent change tracking (MAX_VARS display cap and
-        // its "…" sentinel never feed this path — visibleVariables are
-        // scanned up to CHANGE_TRACK_MAX=256 with shallow top-level
-        // previews (formatTrackingValue: no field walk, no element
-        // fetch, never invoke target code).
-        //
-        // Contract (uniform on all adapters): changed holds sorted
-        // value-changes + new names on complete scans; removed holds
-        // sorted missing names on complete scans only (never asserted
-        // under incomplete tracking); changedComplete is true only when
-        // both previous and current scans are exhaustive with the same
-        // frame identity and no tracking error; changeTracking carries
-        // {complete,scanned,total,truncated,reason?} with reason in
-        // first-snapshot|function-changed|truncated|tracking-error. Empty
-        // changed with complete=false is UNKNOWN, not no-change. First
-        // baseline / function change stores changed=[] + complete=false
-        // (no previous snapshot means no change comparison — never report
-        // all locals as changed). Incomplete/error reports only value
-        // changes over the name intersection; added/removed suppressed. A
-        // baseline stored while incomplete can never make the NEXT
-        // comparison complete; after a complete current baseline lands,
-        // the following stop can become complete. Never throws: failures
-        // degrade to an empty baseline with a class-only stderr warning
-        // (no variable data/secrets), so the park always completes.
-        Map<String, String> cur = new LinkedHashMap<>();
-        Integer total = null;
-        boolean truncated = false;
-        String scanReason = null;
-        String func = "?";
-        boolean fetchOk = true;
-        try {
-            List<StackFrame> frames = BridgeSnapshot.safeFrames(st.thread);
-            if (!frames.isEmpty()) {
-                StackFrame f = frames.get(0);
-                func = frameIdentityOf(f);
-                try {
-                    List<LocalVariable> vars = f.visibleVariables();
-                    Map<LocalVariable, Value> vals = f.getValues(vars);
-                    java.util.TreeMap<String, String> sorted = new java.util.TreeMap<>();
-                    for (Map.Entry<LocalVariable, Value> ve : vals.entrySet()) {
-                        String name;
-                        try {
-                            name = ve.getKey().name();
-                        } catch (Exception ignored) {
-                            continue;
-                        }
-                        if (name == null) continue;
-                        String v;
-                        try {
-                            v = BridgeSnapshot.formatTrackingValue(ve.getValue());
-                        } catch (Throwable t) {
-                            v = "?";
-                        }
-                        sorted.put(name, v);
-                    }
-                    total = sorted.size();
-                    truncated = total > JdiBridge.CHANGE_TRACK_MAX;
-                    scanReason = truncated ? "truncated" : null;
-                    int n = 0;
-                    for (Map.Entry<String, String> e : sorted.entrySet()) {
-                        if (n >= JdiBridge.CHANGE_TRACK_MAX) break;
-                        cur.put(e.getKey(), e.getValue());
-                        n++;
-                    }
-                } catch (AbsentInformationException aie) {
-                    fetchOk = false;
-                    scanReason = "tracking-error";
-                }
-            } else {
-                fetchOk = false;
-                scanReason = "tracking-error";
-            }
-        } catch (Throwable t) {
-            // No explicit warning here: compareTrack below stores with
-            // warn=true, which writes exactly one class-only line.
-            fetchOk = false;
-            cur = new LinkedHashMap<>();
-            scanReason = "tracking-error";
-        }
-        boolean curComplete = fetchOk && scanReason == null;
-        try {
-            compareTrack(st, cur, func, total, truncated, scanReason, curComplete);
-        } catch (Throwable t) {
-            try {
-                System.err.println("warn: change tracking degraded ("
-                        + t.getClass().getSimpleName() + ")");
-            } catch (Exception ignored) {}
-            st.lastTop = new LinkedHashMap<>();
-            st.lastChanged = "[]";
-            st.lastRemoved = "[]";
-            st.lastChangedComplete = false;
-            st.lastTrackComplete = false;
-            st.lastTrackReason = "tracking-error";
-            st.lastTrackWarn = "change tracking incomplete (tracking-error); "
-                    + "changed lists only certain value changes";
-            st.lastChangeTracking = "{\"complete\":false,\"scanned\":0,"
-                    + "\"total\":" + jsonTotal(total) + ",\"truncated\":" + truncated
-                    + ",\"reason\":\"tracking-error\"}";
-        }
-    }
-
-    /** Class-only tracking warning (never variable data/secrets). */
-    static String trackWarn(String reason) {
-        try {
-            System.err.println("warn: change tracking degraded (" + reason + ")");
-        } catch (Exception ignored) {}
-        return "change tracking incomplete (" + reason
-                + "); changed lists only certain value changes";
-    }
-
-    /** Render a tracking total: a failed scan is unknown (null, never 0). */
-    static String jsonTotal(Integer total) {
-        return total == null ? "null" : String.valueOf(total);
-    }
-
-    static void storeTrack(SessionState st, Map<String, String> cur,
-            String func, List<String> changed, List<String> removed,
-            boolean complete, int scanned, Integer total, boolean truncated,
-            String reason, boolean curComplete, String scanReason,
-            boolean warn) {
-        st.lastTop = cur != null ? cur : new LinkedHashMap<>();
-        st.lastFunc = func;
-        st.lastChanged = jsonStrings(changed);
-        st.lastRemoved = jsonStrings(removed);
-        st.lastChangedComplete = complete;
-        st.lastTrackComplete = curComplete;
-        st.lastTrackReason = scanReason != null ? scanReason
-                : (curComplete ? null : reason);
-        // Incomplete branches always pass warn=true, so exactly one
-        // class-only warning is written here; complete scans stay quiet.
-        st.lastTrackWarn = warn ? trackWarn(reason) : null;
-        StringBuilder sb = new StringBuilder("{\"complete\":").append(complete)
-                .append(",\"scanned\":").append(scanned)
-                .append(",\"total\":").append(jsonTotal(total))
-                .append(",\"truncated\":").append(truncated);
-        if (reason != null && !complete) {
-            sb.append(",\"reason\":").append(JdiBridge.quote(reason));
-        }
-        st.lastChangeTracking = sb.append('}').toString();
-    }
-
-    static String jsonStrings(List<String> names) {
-        StringBuilder sb = new StringBuilder("[");
-        boolean first = true;
-        if (names != null) {
-            for (String name : names) {
-                if (!first) sb.append(',');
-                first = false;
-                sb.append(JdiBridge.quote(name));
-            }
-        }
-        return sb.append(']').toString();
-    }
-
-    static void compareTrack(SessionState st, Map<String, String> cur,
-            String func, Integer total, boolean truncated, String scanReason,
-            boolean curComplete) {
-        int scanned = total == null ? 0
-                : Math.min(total, JdiBridge.CHANGE_TRACK_MAX);
-        Map<String, String> last = st.lastTop;
-        boolean prevComplete = st.lastTrackComplete;
-        String prevReason = st.lastTrackReason != null ? st.lastTrackReason
-                : "truncated";
-        if (last == null) {
-            // No previous snapshot means no change comparison. A problem
-            // with the CURRENT scan (truncated/error) dominates the
-            // reason — it describes the stored baseline the next stop
-            // compares against; first-snapshot only when the current scan
-            // is itself exhaustive.
-            String reason = scanReason != null ? scanReason
-                    : (curComplete ? "first-snapshot" : "tracking-error");
-            storeTrack(st, cur, func, new ArrayList<>(), new ArrayList<>(),
-                    false, scanned, total, truncated, reason,
-                    curComplete, scanReason, true);
-            return;
-        }
-        if (st.lastFunc == null || !st.lastFunc.equals(func)) {
-            String reason = scanReason != null ? scanReason
-                    : (curComplete ? "function-changed" : "tracking-error");
-            storeTrack(st, cur, func, new ArrayList<>(), new ArrayList<>(),
-                    false, scanned, total, truncated, reason,
-                    curComplete, scanReason, true);
-            return;
-        }
-        if (!prevComplete || !curComplete) {
-            List<String> changed = new ArrayList<>();
-            try {
-                for (Map.Entry<String, String> e : cur.entrySet()) {
-                    String old = last.get(e.getKey());
-                    if (old != null && !e.getValue().equals(old)) {
-                        changed.add(e.getKey());
-                    }
-                }
-                java.util.Collections.sort(changed);
-            } catch (Exception ignored) {
-                changed = new ArrayList<>();
-            }
-            String reason = !curComplete
-                    ? (scanReason != null ? scanReason : "tracking-error")
-                    : (prevReason != null ? prevReason : "truncated");
-            storeTrack(st, cur, func, changed, new ArrayList<>(),
-                    false, scanned, total, truncated, reason,
-                    curComplete, scanReason, true);
-            return;
-        }
-        List<String> changed = new ArrayList<>();
-        List<String> removed = new ArrayList<>();
-        try {
-            for (Map.Entry<String, String> e : cur.entrySet()) {
-                String old = last.get(e.getKey());
-                if (old == null || !e.getValue().equals(old)) {
-                    changed.add(e.getKey());
-                }
-            }
-            for (String name : last.keySet()) {
-                if (!cur.containsKey(name)) removed.add(name);
-            }
-            java.util.Collections.sort(changed);
-            java.util.Collections.sort(removed);
-        } catch (Exception e) {
-            storeTrack(st, cur, func, new ArrayList<>(), new ArrayList<>(),
-                    false, scanned, total, truncated, "tracking-error",
-                    false, "tracking-error", true);
-            return;
-        }
-        storeTrack(st, cur, func, changed, removed,
-                true, scanned, total, truncated, null, true, null, false);
-    }
-
-    static void degradeTrack(SessionState st, String clsName, Integer total) {
-        List<StackFrame> frames = BridgeSnapshot.safeFrames(st.thread);
-        String func = "?";
-        if (!frames.isEmpty()) {
-            func = frameIdentityOf(frames.get(0));
-        }
-        storeTrack(st, new LinkedHashMap<>(), func,
-                new ArrayList<>(), new ArrayList<>(),
-                false, 0, total, false, "tracking-error",
-                false, "tracking-error", false);
-        // Single class-only warning (storeTrack stayed silent by design),
-        // matching the response's trackingWarning.
-        st.lastTrackWarn = trackWarn(clsName != null ? clsName : "tracking-error");
-    }
-
-    /** Additive change-tracking response fragment (uniform contract):
-     *  `"changed":…,"removed":…,"changedComplete":…,"changeTracking":…`
-     *  plus `"trackingWarning":…` only when incomplete. The stored strings
-     *  are bridge-rendered JSON, so this never throws. */
-    static String changeFieldsJson(SessionState st) {
-        StringBuilder sb = new StringBuilder("\"changed\":");
-        sb.append(st.lastChanged != null ? st.lastChanged : "[]");
-        sb.append(",\"removed\":");
-        sb.append(st.lastRemoved != null ? st.lastRemoved : "[]");
-        sb.append(",\"changedComplete\":").append(st.lastChangedComplete);
-        sb.append(",\"changeTracking\":");
-        sb.append(st.lastChangeTracking != null ? st.lastChangeTracking
-                : "{\"complete\":false,\"scanned\":0,\"total\":null,"
-                + "\"truncated\":false}");
-        if (st.lastTrackWarn != null && !st.lastChangedComplete) {
-            sb.append(",\"trackingWarning\":")
-                    .append(JdiBridge.quote(st.lastTrackWarn));
-        }
-        return sb.toString();
-    }
+    // Tracking + text helpers live in BridgeSnapshot/BridgeProto (M5.2).
 
     /**
      * Wait for the next stop (breakpoint or step end). Updates st.thread /
@@ -652,8 +363,8 @@ class BridgeSession {
                     if (parked != null) return parked;
                 }
                 String ctx = withContext
-                        ? waitContextJson(st, timeoutMs, waitStartMs, expectedBreak) : null;
-                throw new StopTimeout(timeoutText(st, timeoutMs), ctx);
+                        ? BridgeSnapshot.waitContextJson(st, timeoutMs, waitStartMs, expectedBreak) : null;
+                throw new StopTimeout(BridgeSnapshot.timeoutText(st, timeoutMs), ctx);
             }
             EventSet set;
             try {
@@ -709,7 +420,7 @@ class BridgeSession {
                     st.thread = bp.thread();
                     st.location = bp.location();
                     st.stopInfo = null; // plain stop supersedes any previous reason
-                    trackChanges(st);
+                    BridgeSnapshot.trackChanges(st);
                     stop = parkSnapshot(st, vm);
                 } else if (event instanceof com.sun.jdi.event.StepEvent) {
                     com.sun.jdi.event.StepEvent se = (com.sun.jdi.event.StepEvent) event;
@@ -718,7 +429,7 @@ class BridgeSession {
                     st.thread = se.thread();
                     st.location = se.location();
                     st.stopInfo = null;
-                    trackChanges(st);
+                    BridgeSnapshot.trackChanges(st);
                     stop = parkSnapshot(st, vm);
                 } else if (event instanceof com.sun.jdi.event.ExceptionEvent) {
                     com.sun.jdi.event.ExceptionEvent ee = (com.sun.jdi.event.ExceptionEvent) event;
@@ -731,7 +442,7 @@ class BridgeSession {
                     st.thread = ee.thread();
                     st.location = ee.location();
                     st.stopInfo = BridgeEval.exceptionInfo(ee);
-                    trackChanges(st);
+                    BridgeSnapshot.trackChanges(st);
                     stop = parkSnapshot(st, vm);
                 } else if (event instanceof com.sun.jdi.event.ModificationWatchpointEvent) {
                     com.sun.jdi.event.ModificationWatchpointEvent we =
@@ -742,7 +453,7 @@ class BridgeSession {
                     st.location = we.location();
                     parkReason = "watch";
                     st.stopInfo = BridgeEval.watchInfo(we.field(), "write", we.valueToBe());
-                    trackChanges(st);
+                    BridgeSnapshot.trackChanges(st);
                     stop = parkSnapshot(st, vm);
                 } else if (event instanceof com.sun.jdi.event.AccessWatchpointEvent) {
                     com.sun.jdi.event.AccessWatchpointEvent we =
@@ -753,7 +464,7 @@ class BridgeSession {
                     st.location = we.location();
                     parkReason = "watch";
                     st.stopInfo = BridgeEval.watchInfo(we.field(), "read", we.valueCurrent());
-                    trackChanges(st);
+                    BridgeSnapshot.trackChanges(st);
                     stop = parkSnapshot(st, vm);
                 } else if (event instanceof com.sun.jdi.event.MethodExitEvent) {
                     com.sun.jdi.event.MethodExitEvent me = (com.sun.jdi.event.MethodExitEvent) event;
@@ -764,7 +475,7 @@ class BridgeSession {
                     st.thread = me.thread();
                     st.location = me.location();
                     st.stopInfo = BridgeEval.exitInfo(me);
-                    trackChanges(st);
+                    BridgeSnapshot.trackChanges(st);
                     stop = parkSnapshot(st, vm);
                 } else if (event instanceof ClassPrepareEvent) {
                     ClassPrepareEvent cp = (ClassPrepareEvent) event;
@@ -928,29 +639,7 @@ class BridgeSession {
         }
     }
 
-    /** Timeout message with the compact identity hint (debuggee-first,
-     *  names the target, never claims root cause). */
-    static String timeoutText(SessionState st, long timeoutMs) {
-        String msg = "timeout: no stop within " + (timeoutMs / 1000) + "s";
-        String hint = (st != null && st.cfg != null && st.cfg.identityHint != null
-                && !st.cfg.identityHint.isEmpty()) ? st.cfg.identityHint
-                : (st != null && st.cfg != null ? st.cfg.seedHint : null);
-        if (hint != null && !hint.isEmpty()) {
-            msg += "; " + hint;
-        }
-        return msg;
-    }
-
-    /** Additive capture stage on a pre-rendered wait-context JSON: inserts
-     *  `"captureStage":"<stage>","ephemeralPlanted":<bool>` before the
-     *  final `}`. Best-effort (returns the input when it is not an
-     *  object); never endpoint diagnosis, never "unreachable code". */
-    static String withCaptureStage(String ctxJson, String stage, boolean planted) {
-        if (ctxJson == null || !ctxJson.endsWith("}")) return ctxJson;
-        return ctxJson.substring(0, ctxJson.length() - 1)
-                + ",\"captureStage\":" + JdiBridge.quote(stage)
-                + ",\"ephemeralPlanted\":" + planted + "}";
-    }
+    // Timeout/capture text helpers live in BridgeSnapshot (M5.2).
 
     /** Stage a short-lived-target exit during a capture wait as the
      *  truthful armed-wait error (null when e is not an exit).
@@ -967,59 +656,8 @@ class BridgeSession {
         String msg = "target exited before capture hit"
                 + (spec != null ? " (" + spec + ")" : "")
                 + ": " + e.getMessage();
-        return new BridgeException(msg, captureExitContextJson(
+        return new BridgeException(msg, BridgeSnapshot.captureExitContextJson(
                 st, "armed-wait", wasPlanted, spec, waitStartMs));
-    }
-
-    /** Pre-rendered capture exit/stale-session context: wait timers
-     *  (seconds since epoch / ms waited, same units as the timeout
-     *  context), trigger unknown, the truthful stage, and the layered
-     *  identity. waitStartMs is the pump/entry start; session-gone and
-     *  before-armed pass the entry time (waitedMs ~0 — no wait occurred). */
-    static String captureExitContextJson(SessionState st, String stage,
-            boolean planted, String expectedBreak, long waitStartMs) {
-        long nowMs = System.currentTimeMillis();
-        StringBuilder sb = new StringBuilder("{\"waitStartedAt\":");
-        sb.append(waitStartMs / 1000)
-                .append(",\"waitedMs\":").append(Math.max(0, nowMs - waitStartMs));
-        sb.append(",\"triggerStatus\":\"unknown\"");
-        sb.append(",\"captureStage\":").append(JdiBridge.quote(stage));
-        sb.append(",\"ephemeralPlanted\":").append(planted);
-        if (expectedBreak != null) {
-            sb.append(",\"expectedBreak\":").append(JdiBridge.quote(expectedBreak));
-        }
-        String ident = (st != null && st.cfg != null && st.cfg.targetIdentityJson != null)
-                ? st.cfg.targetIdentityJson : "null";
-        sb.append(",\"targetIdentity\":").append(ident);
-        sb.append(",\"note\":").append(JdiBridge.quote(
-                "external trigger execution is not observed by the debugger; "
-                + "this timeout means no stop was observed, "
-                + "not that the code is unreachable"));
-        return sb.append('}').toString();
-    }
-
-    /** Honest timeout context (pre-rendered JSON): the debugger never
-     *  observes the external trigger, so triggerStatus is always unknown;
-     *  success paths never fabricate sent/failed. expectedBreak rides only
-     *  when the capture planted one. The layered targetIdentity is the
-     *  redacted + capped handshake copy (never rebuilt per command). */
-    static String waitContextJson(SessionState st, long timeoutMs, long waitStartMs,
-            String expectedBreak) {
-        long waitedMs = Math.max(0, System.currentTimeMillis() - waitStartMs);
-        StringBuilder sb = new StringBuilder("{\"waitStartedAt\":");
-        sb.append(waitStartMs / 1000).append(",\"waitedMs\":").append(waitedMs)
-                .append(",\"triggerStatus\":\"unknown\"");
-        if (expectedBreak != null) {
-            sb.append(",\"expectedBreak\":").append(JdiBridge.quote(expectedBreak));
-        }
-        String ident = (st != null && st.cfg != null && st.cfg.targetIdentityJson != null)
-                ? st.cfg.targetIdentityJson : "null";
-        sb.append(",\"targetIdentity\":").append(ident);
-        sb.append(",\"note\":").append(JdiBridge.quote(
-                "external trigger execution is not observed by the debugger; "
-                + "this timeout means no stop was observed, "
-                + "not that the code is unreachable"));
-        return sb.append('}').toString();
     }
 
     // -- layered target identity (M-ID): {debuggee, endpoint,
@@ -1029,78 +667,9 @@ class BridgeSession {
     // the OS-observed listener owner; attach pids stay honestly unavailable
     // (JDI SocketAttach exposes none). No target-code eval anywhere.
 
-    static final int IDENT_FIELD_CAP = 512;
     static final int IDENT_TOTAL_CAP = 4096;
 
-    static String truncField(String s) {
-        if (s == null) return null;
-        if (s.length() <= IDENT_FIELD_CAP) return s;
-        return s.substring(0, IDENT_FIELD_CAP)
-                + "… (+" + (s.length() - IDENT_FIELD_CAP) + " more chars)";
-    }
-
-    /** First `"key": <int|null>` match in a flat JSON object, or null. */
-    static Long jsonLong(String raw, String key) {
-        if (raw == null) return null;
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
-                "\"" + java.util.regex.Pattern.quote(key) + "\"\\s*:\\s*(-?\\d+)")
-                .matcher(raw);
-        if (!m.find()) return null;
-        try {
-            return Long.parseLong(m.group(1));
-        } catch (NumberFormatException e) {
-            return null;
-        }
-    }
-
-    /** First `"key": "<string>"` match (no nesting inside), or null. */
-    static String jsonString(String raw, String key) {
-        if (raw == null) return null;
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
-                "\"" + java.util.regex.Pattern.quote(key) + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
-                .matcher(raw);
-        if (!m.find()) return null;
-        try {
-            // Unescape only what the CLI writer emits (quote/backslash).
-            return m.group(1).replace("\\\\", "\\").replace("\\\"", "\"");
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    /** First `"key": [<flat strings>|null]` match, verbatim (the CLI already
-     *  redacted + capped it), or null. Elements hold no nested arrays, so a
-     *  string-aware bracket scan suffices. */
-    static String jsonStringArray(String raw, String key) {
-        if (raw == null) return null;
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
-                "\"" + java.util.regex.Pattern.quote(key) + "\"\\s*:\\s*\\[").matcher(raw);
-        if (!m.find()) return null;
-        int i = m.end();
-        boolean inStr = false;
-        boolean esc = false;
-        while (i < raw.length()) {
-            char c = raw.charAt(i);
-            if (inStr) {
-                if (esc) esc = false;
-                else if (c == '\\') esc = true;
-                else if (c == '"') inStr = false;
-            } else if (c == '"') {
-                inStr = true;
-            } else if (c == ']') {
-                return raw.substring(m.end() - 1, i + 1);
-            } else if (c == '{' || c == '}') {
-                return null; // not a flat string array
-            }
-            i++;
-        }
-        return null;
-    }
-
-    static String unavailableEntry(String field, String reason) {
-        return "{\"field\":" + JdiBridge.quote(field)
-                + ",\"reason\":" + JdiBridge.quote(reason) + "}";
-    }
+    // Request/identity text builders live in BridgeProto (M5.2).
 
     /** Build the layered identity once the VM handle exists (handshake, both
      *  kinds). Never throws: every unknown reads as structured unavailable,
@@ -1121,12 +690,12 @@ class BridgeSession {
     static String seedHint(String seed) {
         if (seed == null) return "";
         try {
-            String exe = jsonString(seed, "executable");
-            String cwd = jsonString(seed, "cwd");
+            String exe = BridgeProto.jsonString(seed, "executable");
+            String cwd = BridgeProto.jsonString(seed, "cwd");
             java.util.List<String> parts = new java.util.ArrayList<>();
             java.util.regex.Matcher m = java.util.regex.Pattern.compile(
                     "\"((?:[^\"\\\\]|\\\\.)*)\"").matcher(
-                    jsonStringArray(seed, "argv") == null ? "" : jsonStringArray(seed, "argv"));
+                    BridgeProto.jsonStringArray(seed, "argv") == null ? "" : BridgeProto.jsonStringArray(seed, "argv"));
             while (m.find() && parts.size() < 3) {
                 parts.add(m.group(1));
             }
@@ -1145,8 +714,8 @@ class BridgeSession {
     static void buildTargetIdentityInner(SessionState st) {
         long now = System.currentTimeMillis() / 1000;
         String seed = st.cfg.targetIdentitySeedJson;
-        Long ownerPid = jsonLong(seed, "ownerPid");
-        String ownerSource = jsonString(seed, "source");
+        Long ownerPid = BridgeProto.jsonLong(seed, "ownerPid");
+        String ownerSource = BridgeProto.jsonString(seed, "source");
         // -- debuggee: JDI VM properties confirm it (safe metadata calls,
         // never target eval). Attach exposes no pid; launch adds the child
         // pid only when this runtime offers it (host JDK 9+; guarded).
@@ -1172,12 +741,12 @@ class BridgeSession {
             }
         }
         if (vmName != null) {
-            dg.append(",\"name\":").append(JdiBridge.quote(truncField(vmName)));
+            dg.append(",\"name\":").append(JdiBridge.quote(BridgeProto.truncField(vmName)));
         } else {
             dg.append(",\"name\":null");
         }
         if (vmVersion != null) {
-            dg.append(",\"version\":").append(JdiBridge.quote(truncField(vmVersion)));
+            dg.append(",\"version\":").append(JdiBridge.quote(BridgeProto.truncField(vmVersion)));
         }
         if (launchPid != null) {
             dg.append(",\"pid\":").append(launchPid);
@@ -1193,17 +762,17 @@ class BridgeSession {
         dg.append(",\"observedAt\":").append(now).append(",\"unavailable\":[");
         boolean needComma = false;
         if (vmName == null) {
-            dg.append(unavailableEntry("name", "JDI VM properties not readable"));
+            dg.append(BridgeProto.unavailableEntry("name", "JDI VM properties not readable"));
             needComma = true;
         }
         if (launchPid == null && !"attach".equals(st.cfg.sessionKind)) {
             if (needComma) dg.append(',');
-            dg.append(unavailableEntry("pid", "launch pid not available from this runtime"));
+            dg.append(BridgeProto.unavailableEntry("pid", "launch pid not available from this runtime"));
             needComma = true;
         }
         if ("attach".equals(st.cfg.sessionKind)) {
             if (needComma) dg.append(',');
-            dg.append(unavailableEntry("pid", "JDI SocketAttach exposes no pid"));
+            dg.append(BridgeProto.unavailableEntry("pid", "JDI SocketAttach exposes no pid"));
         }
         dg.append("]}");
         // -- endpoint: the JDWP listener the CLI attached to (attach) or the
@@ -1213,23 +782,23 @@ class BridgeSession {
         StringBuilder ep = new StringBuilder("{\"host\":")
                 .append(JdiBridge.quote(st.cfg.host))
                 .append(",\"port\":").append(st.cfg.port);
-        String ownerArgv = jsonStringArray(seed, "argv");
-        String ownerExe = jsonString(seed, "executable");
-        String ownerCwd = jsonString(seed, "cwd");
+        String ownerArgv = BridgeProto.jsonStringArray(seed, "argv");
+        String ownerExe = BridgeProto.jsonString(seed, "executable");
+        String ownerCwd = BridgeProto.jsonString(seed, "cwd");
         if (ownerPid != null) ep.append(",\"ownerPid\":").append(ownerPid);
         if (ownerExe != null) {
-            ep.append(",\"executable\":").append(JdiBridge.quote(truncField(ownerExe)));
+            ep.append(",\"executable\":").append(JdiBridge.quote(BridgeProto.truncField(ownerExe)));
         }
         if (ownerArgv != null) ep.append(",\"argv\":").append(ownerArgv);
         if (ownerCwd != null) {
-            ep.append(",\"cwd\":").append(JdiBridge.quote(truncField(ownerCwd)));
+            ep.append(",\"cwd\":").append(JdiBridge.quote(BridgeProto.truncField(ownerCwd)));
         }
         ep.append(",\"role\":").append(JdiBridge.quote(
                 "attach".equals(st.cfg.sessionKind)
                         ? "listener-owner (the target JVM holds its own JDWP port)"
                         : "launcher-observed (the target JVM holds its own JDWP port)"));
         if (ownerSource != null) {
-            ep.append(",\"source\":").append(JdiBridge.quote(truncField(ownerSource)));
+            ep.append(",\"source\":").append(JdiBridge.quote(BridgeProto.truncField(ownerSource)));
         } else {
             ep.append(",\"source\":null");
         }
@@ -1237,7 +806,7 @@ class BridgeSession {
                 .append(JdiBridge.quote(ownerPid != null ? "os-corroborated" : "unavailable"))
                 .append(",\"observedAt\":").append(now).append(",\"unavailable\":[");
         if (ownerPid == null) {
-            ep.append(unavailableEntry("ownerPid", "no independent pid source"));
+            ep.append(BridgeProto.unavailableEntry("ownerPid", "no independent pid source"));
         }
         ep.append("]}");
         // -- adapter: JDWP runs in-process — no separate adapter by design.
@@ -1254,22 +823,22 @@ class BridgeSession {
                     .append(",\"port\":").append(st.cfg.port);
             if (ownerPid != null) ep.append(",\"ownerPid\":").append(ownerPid);
             if (ownerExe != null) {
-                ep.append(",\"executable\":").append(JdiBridge.quote(truncField(ownerExe)));
+                ep.append(",\"executable\":").append(JdiBridge.quote(BridgeProto.truncField(ownerExe)));
             }
             if (ownerCwd != null) {
-                ep.append(",\"cwd\":").append(JdiBridge.quote(truncField(ownerCwd)));
+                ep.append(",\"cwd\":").append(JdiBridge.quote(BridgeProto.truncField(ownerCwd)));
             }
             ep.append(",\"role\":").append(JdiBridge.quote("listener-owner"))
                     .append(",\"source\":")
                     .append(ownerSource == null ? "null"
-                            : JdiBridge.quote(truncField(ownerSource)))
+                            : JdiBridge.quote(BridgeProto.truncField(ownerSource)))
                     .append(",\"confidence\":")
                     .append(JdiBridge.quote(ownerPid != null ? "os-corroborated" : "unavailable"))
                     .append(",\"observedAt\":").append(now).append(",\"unavailable\":[");
             if (ownerPid == null) {
-                ep.append(unavailableEntry("ownerPid", "no independent pid source")).append(',');
+                ep.append(BridgeProto.unavailableEntry("ownerPid", "no independent pid source")).append(',');
             }
-            ep.append(unavailableEntry("argv", "dropped: over budget")).append("]}");
+            ep.append(BridgeProto.unavailableEntry("argv", "dropped: over budget")).append("]}");
             ident = "{\"debuggee\":" + dg + ",\"endpoint\":" + ep + ",\"adapter\":" + ad + "}";
         }
         st.cfg.targetIdentityJson = ident;
@@ -1375,9 +944,7 @@ class BridgeSession {
      *  Socket IO never holds sessionLock; dispatch/cases take it for
      *  bounded sections only. A client disconnect drops only its own
      *  response — target-side work still publishes. */
-    static String overloadedJson() {
-        return "{\"ok\":false,\"error\":\"overloaded: too many active handlers\",\"target\":\"main\"}";
-    }
+    // overloadedJson lives in BridgeProto (M5.2).
 
     /** Pool-full bypass: one bounded frame read under the existing framing
      *  limits/deadlines (never an unbounded wait). An exact `close` gets
@@ -1406,7 +973,7 @@ class BridgeSession {
             return;
         }
         try {
-            BridgeProto.writeFrame(sock.getOutputStream(), overloadedJson());
+            BridgeProto.writeFrame(sock.getOutputStream(), BridgeProto.overloadedJson());
         } catch (Exception ignored) {}
         try { sock.close(); } catch (Exception ignored) {}
     }
@@ -1642,25 +1209,7 @@ class BridgeSession {
                 + ",\"phase\":" + JdiBridge.quote(phaseOfError(t)) + "}";
     }
 
-    /** M5 immediate busy rejection (single target main): a second resume
-     *  (continue/step), any breakpoint mutation, or an eval (exclusive: it
-     *  can mutate) while one is outstanding never silently queues. Live
-     *  reads and context/vars/stack never busy-reject (the latter fail fast
-     *  via requireStopped once the resume publishes running). Caller holds
-     *  sessionLock. */
-    static String busyError(SessionState st, String cmd) {
-        if (st.outstanding == null) return null;
-        // wait never resumes but still occupies the slot (a rival resume
-        // would steal the stop it long-polls for); capture resumes at the
-        // end, so it occupies the slot throughout.
-        if (cmd.equals("continue") || cmd.equals("step")
-                || cmd.equals("wait") || cmd.equals("capture")
-                || cmd.equals("breaksAdd") || cmd.equals("breaksRemove")
-                || cmd.equals("breaksClear") || cmd.equals("eval")) {
-            return "busy: " + st.outstanding + " outstanding for main";
-        }
-        return null;
-    }
+    // busyError lives in BridgeProto (M5.2; caller holds sessionLock).
 
     static String dispatch(SessionState st, String reqJson) throws Exception {
         // cmd first (depth-aware): breaksAdd carries a JSON array the flat
@@ -1674,7 +1223,7 @@ class BridgeSession {
             if (st.closing && !cmd.equals("close")) {
                 throw new BridgeException("session is closing");
             }
-            String busy = busyError(st, cmd);
+            String busy = BridgeProto.busyError(st, cmd);
             if (busy != null) throw new BridgeException(busy);
             if (cmd.equals("continue") || cmd.equals("step")
                     || cmd.equals("wait") || cmd.equals("capture")) {
@@ -1832,7 +1381,7 @@ class BridgeSession {
                 // pump (the serve loop skips its idle pump while outstanding).
                 String snap = awaitStop(st, timeout);
                 synchronized (st.sessionLock) {
-                    return "{\"ok\":true,\"stopped\":true," + changeFieldsJson(st) + ",\"stopInfo\":" + stopInfoJson(st) + ",\"snapshot\":" + snap
+                    return "{\"ok\":true,\"stopped\":true," + BridgeSnapshot.changeFieldsJson(st) + ",\"stopInfo\":" + stopInfoJson(st) + ",\"snapshot\":" + snap
                             + ",\"diag\":" + stopDiagJson(st)
                             + ",\"warning\":" + JdiBridge.quote(PARK_WARNING)
                             + ",\"target\":\"main\"}";
@@ -1873,7 +1422,7 @@ class BridgeSession {
                 try {
                     String snap = awaitStop(st, timeout);
                     synchronized (st.sessionLock) {
-                        return "{\"ok\":true,\"stopped\":true," + changeFieldsJson(st) + ",\"stopInfo\":" + stopInfoJson(st) + ",\"snapshot\":" + snap
+                        return "{\"ok\":true,\"stopped\":true," + BridgeSnapshot.changeFieldsJson(st) + ",\"stopInfo\":" + stopInfoJson(st) + ",\"snapshot\":" + snap
                                 + ",\"diag\":" + stopDiagJson(st)
                                 + ",\"warning\":" + JdiBridge.quote(PARK_WARNING)
                                 + ",\"target\":\"main\"}";
@@ -1945,7 +1494,7 @@ class BridgeSession {
                             && e.getMessage().toLowerCase().contains("exit")
                             && e.waitContextJson == null) {
                         synchronized (st.sessionLock) {
-                            e.waitContextJson = captureExitContextJson(
+                            e.waitContextJson = BridgeSnapshot.captureExitContextJson(
                                     st, "session-gone", false, specOut[0],
                                     System.currentTimeMillis());
                         }
@@ -2007,7 +1556,7 @@ class BridgeSession {
                             throw new BridgeException(
                                     "capture target exited before ephemeral "
                                     + "breakpoint was armed: " + e.getMessage(),
-                                    captureExitContextJson(st, "before-armed",
+                                    BridgeSnapshot.captureExitContextJson(st, "before-armed",
                                             false, specOut[0],
                                             System.currentTimeMillis()));
                         }
@@ -2050,7 +1599,7 @@ class BridgeSession {
                         // (plant confirmed, or the idempotent already-armed
                         // case) and the stop simply never arrived — never
                         // an endpoint verdict, never "unreachable".
-                        ((BridgeException) e).waitContextJson = withCaptureStage(
+                        ((BridgeException) e).waitContextJson = BridgeSnapshot.withCaptureStage(
                                 ((BridgeException) e).waitContextJson,
                                 "armed-wait-timeout", wasPlanted);
                         throw e;
@@ -2232,7 +1781,7 @@ class BridgeSession {
 
     static String waitJson(SessionState st, String snap, boolean waited) {
         return "{\"ok\":true,\"stopped\":true,\"waited\":" + waited
-                + "," + changeFieldsJson(st)
+                + "," + BridgeSnapshot.changeFieldsJson(st)
                 + ",\"stopInfo\":" + stopInfoJson(st)
                 + ",\"snapshot\":" + snap
                 + ",\"diag\":" + stopDiagJson(st)

@@ -314,6 +314,50 @@ the production API (`claimId`+`track`/`release`, `tryAcquire`), never raw
 collection writes. Zero protocol/sidecar/schema delta; Python/Rust/Browser/Java
 untouched (M3 gate reused, M5 next).
 
+M5 (implemented, narrow track, Browser + Java): `bridge/browser/src/browserbridge.js`
+stays one embedded file (`src/bridge.rs` `BROWSERBRIDGE_SOURCE`/`ensure_js_shared`
+untouched, `bridge/js/*` untouched) with exactly two retained in-file owners
+constructed by `Session` (still the sole runtime owner of the single tab +
+CDP orchestrator): `SerialChain` (one serialized promise tail replacing the
+raw `_mutationTail` field + `_mutationRun` body — `_mutationRun` stays as the
+named domain entry and stable test seam, rejection-safe by construction;
+there is deliberately NO swap chain and NO pause chain: one tab per session,
+no worker table, pauses park-or-drop synchronously in `onPaused`) and
+`ServerState` (handler pool via `tryAcquire`/`release` + terminal-close
+single winner via `claimClose`/`markClosing`; `assertValid` enforces
+`0 <= active <= MAX_ACTIVE_HANDLERS`). Rejected with the same M3/M4 rationale
+(state IS the single-tab context, a wrapper only adds bypass — no aliases, no
+dual writes, enforced by `scripts/check_browserbridge_owners.sh` in the
+`--unit` gate): `BreakpointStore`/`StopCoordinator`/`WorkerRegistry`
+(breakpoint maps/records + stop/wait/capture machine + `outstanding` resume
+slot stay Session-owned sections), and any Browser/Node shared abstraction
+beyond framing/CDP-conn. `verifyTab`-per-command liveness, reload interplay,
+and CDP orchestration stay Session methods (they fuse tab identity with
+transport reads). Test fixtures admit through the production API
+(`tryAcquire`, `_mutationRun`, `claimClose`), never raw field writes.
+`bridge/java/src/` keeps ALL mutable session state in `BridgeSession` under
+the single `sessionLock` + one event-queue consumer; M5.2 thins it only with
+`st`-parameterized helpers moved to existing support classes under the
+per-method callgraph gate (all production entries inside `BridgeSession.java`
+under `sessionLock`, or pure/read-only with identical call sites/threads; no
+`synchronized`/lock/thread/socket in moved bodies, enforced by
+`scripts/check_java_owners.sh`): `BridgeSnapshot` owns the tracking group
+(`trackChanges`/`storeTrack`/`compareTrack`/`degradeTrack`/`changeFieldsJson`/
+`trackWarn`/`jsonTotal`/`jsonStrings`) + the read-only text group
+(`timeoutText`/`withCaptureStage`/`captureExitContextJson`/`waitContextJson`),
+`BridgeProto` owns the pure builders (`truncField`+`IDENT_FIELD_CAP`/
+`jsonLong`/`jsonString`/`jsonStringArray`/`unavailableEntry`/`busyError`/
+`overloadedJson`), `BridgeEval` owns `frameIdentity`/`frameIdentityOf`.
+Retained in `BridgeSession` regardless: `sessionLock` discipline, `serveLoop`,
+`dispatch`/`dispatchInner`, all `awaitStop*`, `parkedRecheck`/`notePark`,
+`plantPending`/`armWatch`/`armBreakpoints`/`setMethods`, `handleOne`,
+`closeFromConn`/`cleanup`, `buildTargetIdentity*`/`seedHint`. Rejected as one
+atomic unit: the setup-phase text group (`setupErrorText`/`setupPhaseOf`/
+`phaseOfError`/`setupErrorJson`) — `setupErrorJson` has a production caller
+outside `BridgeSession` (`BridgeCli.java`), so the group stays. No new
+top-level class/file, `src/bridge.rs` `JAVA_SOURCES`/`JAVA_CLASSES`
+untouched. Zero protocol/sidecar/schema delta; Python/Rust/Node untouched.
+
 ## 7. Test map (boundary → exact files)
 
 | Boundary | Rust unit (`cargo test`, incl. `src/session.rs` tests) | Bridge unit | Live / matrix |
@@ -325,8 +369,8 @@ untouched (M3 gate reused, M5 next).
 | Concurrency/serve | lock/quarantine unit tests (`reclaim_*`, `detach_*`, endpoint claim) | `tests/breaks_concurrency_matrix.test.js`, `tests/m5_concurrency.test.js`, `tests/test_pybridge.py` (+12 M5), `tests/test_pybridge_owners.py` (M3 narrow-owner tests: registry lifecycle/swap incl. missing-child exit, server pool/close) | `tests/test_breaks_concurrency_matrix.py`, `tests/test_m5_live.py` (6 scenarios) |
 | Close under load | `close` confirm/port-death tests | `tests/close_under_load.test.js` | `tests/test_close_under_load.py` |
 | Wait/capture/timeout | stop-freshness unit tests | `tests/wait_capture.test.js`, `tests/stoptimeout.test.js` | `tests/test_wait_capture.py`, `tests/test_ux_live.py` (timeout prefix asserts), `tests/test_main_exit_visibility.py` |
-| Workers/targets | `cmd_targets_in` roster tests | `tests/worker_targets.test.js`, `tests/worker_break_records.test.js`, `tests/vars_frame.test.js`, `tests/nodebridge_owners.test.js` (M4 narrow-owner tests: registry lifecycle/swap-restore incl. worker-removed-mid-command, chains, server pool/close) | `tests/test_m5_live.py` |
-| Java bridge | — | `javac` compile check: `bridge/java/src/*.java` + `tests/M4JavaCheck.java`, `M5JavaCheck.java`, `M6JavaCheck.java`, `M7JavaCheck.java`, `BJavaCheck.java`, `CJavaCheck.java` (compile only) | `tests/test_live.py` java adapter |
+| Workers/targets | `cmd_targets_in` roster tests | `tests/worker_targets.test.js`, `tests/worker_break_records.test.js`, `tests/vars_frame.test.js`, `tests/nodebridge_owners.test.js` (M4 narrow-owner tests: registry lifecycle/swap-restore incl. worker-removed-mid-command, chains, server pool/close), `tests/browserbridge_owners.test.js` (M5.1: single-tab shape, mutation chain, pool/close) | `tests/test_m5_live.py` |
+| Java bridge | — | `javac` compile + execution: `bridge/java/src/*.java` + `tests/M4JavaCheck.java`, `M5JavaCheck.java`, `M6JavaCheck.java`, `M7JavaCheck.java`, `BJavaCheck.java`, `CJavaCheck.java` (each executed in-gate; fail-fast `System.exit(1)`) + `scripts/check_java_owners.sh` incl. `--self-test` (M5.2 move/retain/reject gate; retained/setup detection is comment-stripped declaration match) | `tests/test_live.py` java adapter |
 | Review regressions | `cargo test` full | `tests/review_fixes.test.js` | `tests/test_live.py` (4 adapters, isolated `HOME`, installed binary `target/debug/agent-debugger`) |
 | Contract fixtures (frozen strings) | `bridge::tests::contract_fixtures_match_cli_constants` | `tests/contract_fixtures.test.js`, `tests/test_contract_fixtures.py` | — (fixtures only, no live) |
 | Provisioning (daemon-free) | `bridge::tests` (stale rewrite, shared-JS no-short-circuit, `NODE_PATH`, venv paths, `JAVA_CLASSES` markers) | — | `tests/_live_home.py` setup (symlink real venv/node_modules, never install) + `tests/test_live_home.py` |
@@ -339,7 +383,10 @@ canonical runner `scripts/run_gates.sh` (the command list below is
 informative — the script is normative; do not copy this prose into new
 runners): unit = `cargo test` + `cargo fmt --check` + every
 `tests/test_*.py` except the three live suites (auto-discovered, sorted) +
-`node --test tests/*.test.js` + `javac` bridge/checks; live = `cargo build`
+`node --test tests/*.test.js` + owner-routing gates
+(`check_nodebridge_owners` + `check_browserbridge_owners` +
+`check_java_owners` incl. `--self-test`) + `javac` bridge/checks + executed
+java checks (B/C/M4-M7); live = `cargo build`
 + `tests/test_live.py` + `tests/test_m5_live.py` + `tests/test_ux_live.py`,
 with `TEST_LANG`/`SKIP_BROWSER` filters for live only.
 

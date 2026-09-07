@@ -603,5 +603,31 @@ class BridgeEval {
         return out[0];
     }
 
+    // ---- M5.2: frame identity builders (moved verbatim from
+    // BridgeSession; pure/JDI-read only, no sessionLock acquired, no
+    // thread, no socket — every production caller already runs under the
+    // caller-held sessionLock inside trackChanges/degradeTrack).
+    static String frameIdentity(String type, String method, String sig) {
+        String t = type != null ? type : "?";
+        String m = method != null ? method : "?";
+        String id = t + "#" + m;
+        if (sig != null) id += sig;
+        return id;
+    }
+
+    /** Best-effort identity of a live frame ("?" when unreadable). */
+    static String frameIdentityOf(StackFrame f) {
+        try {
+            Location loc = f.location();
+            String t = loc.declaringType().name();
+            com.sun.jdi.Method mm = loc.method();
+            return frameIdentity(t, mm != null ? mm.name() : null,
+                    mm != null ? mm.signature() : null);
+        } catch (Exception ignored) {
+            return "?";
+        }
+    }
+    // ---- end M5.2 ----
+
     /** Decode a JSON string literal (quotes included) to raw text. */
 }

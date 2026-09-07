@@ -613,6 +613,139 @@ function sleep(ms) {
 
 const EXITED_MSG = 'target tab has closed — close this session';
 
+// ---------------------------------------------------------------- M5 owners
+//
+// Single-file MUST (src/bridge.rs embeds this file via include_str!): the
+// two owners below live in-file. Session stays the sole runtime owner —
+// it constructs exactly one SerialChain and one ServerState, owns the
+// single tab, and orchestrates CDP transport. Each owner holds its own
+// mutable state plus a cheap assertValid() invariant for tests.
+//
+// Retained (complete production routing, no aliases, no dual writes):
+//   SerialChain — one serialized promise tail for breaks mutations
+//                    (add/remove/clear converge, no ghost/resurrection).
+//                    There is no swap chain and no pause chain here:
+//                    single tab, no worker table (unlike nodebridge), and
+//                    pauses are synchronous-park-or-drop in onPaused.
+//   ServerState — handler-pool occupancy + terminal-close single winner.
+//
+// Rejected (Python M3 / Node M4 lesson applied): BreakpointStore /
+// StopCoordinator / WorkerRegistry. Breakpoint bookkeeping
+// (breakKeys/breakRecByKey/breakIdToRec/stopStates/shadowedLogs) and the
+// stop/wait/capture machine (paused/stopInfo/track fields, outstanding
+// resume slot, waitContext/timeoutText) ARE the single-tab context — a
+// wrapper would only add bypass. They stay Session-owned sections below.
+// verifyTab-per-command liveness, reload interplay, and CDP orchestration
+// stay Session methods too: they fuse tab identity with transport reads,
+// and splitting them would dual-own the tab lifecycle.
+//
+// Routing rule (grep-enforced via scripts/check_browserbridge_owners.sh,
+// wired into scripts/run_gates.sh --unit): production code mutates owner
+// state only through owner methods — never `server.active`/`server.closing`
+// writes and never `_mutationTail` outside SerialChain/ServerState.
+// Reads of owned counters (active/closing) and chain entry via
+// _mutationRun stay direct.
+
+/** One serialized promise tail: every run() waits for its predecessor, so
+ *  breaks mutations that borrow shared tab fields never overlap.
+ *  Rejections never break the chain (the tail swallows a fork for
+ *  chaining; callers still observe their own rejection). NOT reentrant:
+ *  entry points wrap once and inner work never re-enters. */
+class SerialChain {
+  constructor() {
+    this.tail = Promise.resolve();
+    this.depth = 0; // queued + in-flight runs (invariant: integer >= 0)
+  }
+
+  run(fn) {
+    this.depth += 1;
+    const run = this.tail.then(fn);
+    this.tail = run.catch(() => {});
+    return run.then(
+      (v) => { this.depth -= 1; return v; },
+      (e) => { this.depth -= 1; throw e; },
+    );
+  }
+
+  assertValid() {
+    if (!Number.isInteger(this.depth) || this.depth < 0) {
+      throw new Error(`SerialChain invariant: depth=${this.depth}`);
+    }
+  }
+}
+
+/** Canonical owner of serve-level concurrency state: live-handler
+ *  occupancy (bounded by MAX_ACTIVE_HANDLERS) and the terminal-close
+ *  single winner. Session.dispatch/concurrency sections and the
+ *  module-level serve/handleConn/closeFromConn functions mutate only
+ *  through this API. The single-tab resume occupancy (`outstanding`) stays
+ *  Session-owned dispatch state — it is orthogonal to the pool/close
+ *  lifecycle and moving it would only churn its many Session-surface
+ *  tests. Invariant: 0 <= active <= limit; closing is boolean. */
+class ServerState {
+  constructor() {
+    this.closing = false; // terminal close accepted (single winner below)
+    this.active = 0;      // live connection handlers (bounded)
+  }
+
+  /** Bounded pool admission for one connection handler: false when the
+   *  pool is full (the caller sends the overload rejection instead). The
+   *  check-and-increment is synchronous — no await between — so
+   *  concurrent serve iterations can never over-admit. */
+  tryAcquire(limit) {
+    if (this.active >= limit) return false;
+    this.active += 1;
+    return true;
+  }
+
+  release() {
+    // Loud on unbalanced use: production pairs every release with a
+    // successful tryAcquire (serve admits, handleConn's finally releases),
+    // so a zero-active release is a bug, never a slow close. Failing here
+    // keeps assertValid(limit) honest instead of masking drift below zero.
+    if (this.active <= 0) {
+      throw new Error('ServerState invariant: release without acquire');
+    }
+    this.active -= 1;
+  }
+
+  /** Terminal-close single winner: exactly one closer runs the teardown
+   *  (the single-threaded check-and-set is atomic — no await between the
+   *  flag read and write). Every close still gets its closed ACK. */
+  claimClose() {
+    if (this.closing) return false;
+    this.closing = true;
+    return true;
+  }
+
+  /** Non-winner close path (Session.cleanup direct use): idempotent. */
+  markClosing() {
+    this.closing = true;
+  }
+
+  assertValid(limit) {
+    if (!Number.isInteger(this.active) || this.active < 0 || this.active > limit) {
+      throw new Error(`ServerState invariant: active=${this.active} outside [0, ${limit}]`);
+    }
+    if (typeof this.closing !== 'boolean') {
+      throw new Error('ServerState invariant: closing not boolean');
+    }
+  }
+}
+
+/** Session: sole mutable owner of the single-tab bridge runtime.
+ *
+ *  Owns (Session-owned sections, never extracted — see the M5 owners head
+ *  note): the breakpoint store + transaction (breakKeys/breakRecByKey/
+ *  breakIdToRec/breakRaws/stopStates/shadowedLogs; validate-whole-batch
+ *  then arm-per-item, confirmed echo), the stop/wait/capture machine
+ *  (paused/stopInfo/track fields, outstanding resume slot, waitContext/
+ *  timeoutText, notePark/stopDiag/capture bounds), and CDP orchestration
+ *  (handshake/verifyTab-per-command/reload interplay/cdp transport).
+ *  verifyTab liveness is woven through every command and reload re-triggers
+ *  load-path code — both stay here, never in an owner. Invariant: exactly
+ *  one tab per session (tid is always 'main'); pool/close state lives on
+ *  this.server, breaks serialization on this._mutationChain. */
 class Session {
   constructor(cfg) {
     this.cfg = cfg;
@@ -632,7 +765,7 @@ class Session {
     this.paused = null;     // {frames, stopInfo} of the current stop
     this.awaitingStep = false;
     this.exited = false;
-    this.closing = false;
+    // (terminal-close flag lives on this.server — see ServerState.)
     this.lastTop = null;
     this.lastFunc = null;
     this.lastChanged = '[]';
@@ -664,8 +797,8 @@ class Session {
     // -- M5 concurrency: the single outstanding resume op (tid is always
     // 'main': one tab per session); live reads bypass it entirely.
     this.outstanding = new Map(); // tid -> resume cmd in flight
-    this.activeConns = 0;         // live connection handlers (bounded)
-    this._mutationTail = null;    // breaks-mutation mutex chain (all mutations)
+    this.server = new ServerState(); // pool occupancy + close single-winner
+    this._mutationChain = new SerialChain(); // breaks-mutation mutex (all mutations)
     // -- layered target identity (M-ID): the attached tab (debuggee,
     // protocol-confirmed) plus the debugger listener (endpoint). Built at
     // handshake; published redacted + capped in session.json.
@@ -727,7 +860,7 @@ class Session {
     // Tab close kills the socket -> session exit (liveness beyond that is
     // verifyTab's job against /json/list).
     this.cdp = new CdpConn(ws, () => {
-      if (!this.closing) {
+      if (!this.server.closing) {
         this.exited = true;
         this.paused = null;
         this.publishState(false);
@@ -756,6 +889,10 @@ class Session {
     return s;
   }
 
+  // -- Session-owned breakpoint store + transaction (never extracted:
+  // a BreakpointStore wrapper would only add bypass around the single-tab
+  // context — see the M5 owners head note). Validates the whole batch
+  // first, then arms per item; `removed[]` echoes persisted stored raws.
   async armBreakpoints() {
     // Startup fold (same contract as nodebridge + live `breaks add`): an
     // exact same frag/line/cond repeat is idempotent (kept once); the same
@@ -864,7 +1001,11 @@ class Session {
     }
   }
 
-  /** Re-resolve our tab against the live target list (B0 contract). */
+  /** Re-resolve our tab against the live target list (B0 contract).
+   *  Session-owned and non-extractable: every command calls it first (a
+   *  dead tab's records would lie), and reload interplay (navigation drops
+   *  CDP breakpoints; a reload between plant and park is a timeout, never
+   *  a stale resume) fuses liveness with transport reads. */
   async verifyTab() {
     let targets;
     try {
@@ -1054,8 +1195,12 @@ class Session {
     }
   }
 
+  // -- Session-owned stop/wait/capture machine (never extracted: a
+  // StopCoordinator wrapper would only add bypass around the single-tab
+  // park/track/outstanding context — see the M5 owners head note).
+  // Freshness gate + frozen timeout prefix + waitContext live here.
   async onPaused(p) {
-    if (this.closing || this.exited || this.paused) {
+    if (this.server.closing || this.exited || this.paused) {
       // Single target: a second pause cannot arrive while one is held (the
       // page is frozen). If it ever does, hold the first stop; the next
       // resume flushes the rest. The park below is set SYNCHRONOUSLY
@@ -2384,20 +2529,10 @@ class Session {
    *  first's state (empty-added, no duplicate records); concurrent
    *  add×remove/clear converge the same way (no ghost/resurrection).
    *  The chain is NOT reentrant: entry points wrap once and inner work
-   *  calls the _Inner/drop forms directly. */
+   *  calls the _Inner/drop forms directly. Stable domain entry and test
+   *  seam over the owned _mutationChain (never called reentrantly). */
   async _mutationRun(fn) {
-    let release;
-    const willLock = new Promise((resolve) => {
-      release = resolve;
-    });
-    const waitsFor = this._mutationTail || Promise.resolve();
-    this._mutationTail = waitsFor.then(() => willLock);
-    await waitsFor;
-    try {
-      return await fn();
-    } finally {
-      release();
-    }
+    return this._mutationChain.run(fn);
   }
 
   async cmdBreaksAdd(req) {
@@ -2714,7 +2849,7 @@ class Session {
     // outstanding (the bridge never deadlocks waiting for a handler that
     // itself awaits a stop).
     if (cmd === 'close') throw new CloseSession();
-    if (this.closing) throw new BridgeErr('session is closing');
+    if (this.server.closing) throw new BridgeErr('session is closing');
     // M5 acceptance section: everything below runs synchronously (no
     // await), so concurrent handlers observe one atomic decision —
     // immediate busy rejection and resume registration BEFORE any CDP
@@ -2749,7 +2884,7 @@ class Session {
   }
 
   async cleanup() {
-    this.closing = true;
+    this.server.markClosing();
     // Attach semantics: detach only, the tab keeps running.
     if (this.cdp && !this.cdp.closed) {
       try {
@@ -2782,7 +2917,7 @@ async function serve(st, server, queue) {
       return; // exit never returns; bound stubbed/embedded use instead
       // of spinning cleanup+exit forever.
     }
-    if (st.closing) {
+    if (st.server.closing) {
       await sleep(500);
       await closeServer(server);
       process.exit(0);
@@ -2797,7 +2932,7 @@ async function serve(st, server, queue) {
         sleep(1000),
       ]);
       queue.waiter = null;
-      if (st.closing) break;
+      if (st.server.closing) break;
       if (queue.length === 0 && !amOwner(st.cfg.dir)) {
         await st.cleanup().catch(() => {});
         process.exit(0);
@@ -2805,10 +2940,13 @@ async function serve(st, server, queue) {
         // of spinning cleanup+exit forever.
       }
     }
-    if (st.closing) continue;
+    if (st.server.closing) continue;
     const conn = queue.shift();
     if (!conn) continue;
-    if (st.activeConns >= MAX_ACTIVE_HANDLERS) {
+    // Pool admission is one synchronous ServerState decision (no await
+    // between check and count), so concurrent iterations never over-admit.
+    // handleConn assumes the slot: it releases, never acquires.
+    if (!st.server.tryAcquire(MAX_ACTIVE_HANDLERS)) {
       await handleOverload(st, conn);
       continue;
     }
@@ -2842,9 +2980,9 @@ async function handleOverload(st, conn) {
   conn.destroy();
 }
 
-/** Serve one CLI connection: exactly one request and one response. */
+/** Serve one CLI connection: exactly one request and one response. The
+ *  caller (serve) holds one acquired ServerState slot for this handler. */
 async function handleConn(st, conn) {
-  st.activeConns += 1;
   try {
     let req;
     try {
@@ -2883,21 +3021,17 @@ async function handleConn(st, conn) {
     }
   } finally {
     conn.destroy();
-    st.activeConns -= 1;
+    st.server.release();
   }
 }
 
 /** Terminal close handling for one connection, outside the handler pool:
  *  every close gets the closed ACK; exactly one winner runs the teardown
- *  (the single-threaded check-and-set is atomic — no await between the
- *  flag read and write). The pool counter is untouched (the overload path
- *  never counted). */
+ *  (ServerState.claimClose — the single-threaded check-and-set is atomic,
+ *  no await between the flag read and write). The pool counter is
+ *  untouched (the overload path never counted). */
 async function closeFromConn(st, conn) {
-  let mine = false;
-  if (!st.closing) {
-    st.closing = true;
-    mine = true;
-  }
+  const mine = st.server.claimClose();
   try {
     await writeFrame(conn, { ok: true, closed: true, target: 'main' });
   } catch (_) { /* client already gone */ }

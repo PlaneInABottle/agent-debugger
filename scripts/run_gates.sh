@@ -11,7 +11,8 @@
 #     --unit     fast gates only (no daemons, no browsers): cargo test +
 #                cargo fmt + every tests/test_*.py except the three live
 #                suites (auto-discovered, sorted — new unit files need no
-#                runner edit) + node --test + javac bridge/checks
+#                runner edit) + node --test + javac bridge/checks + executed
+#                java checks (B/C/M4-M7, fail fast with their own outputs)
 #     --live     daemon-backed live suites only (needs cargo build first;
 #                the script builds when the binary is missing)
 #
@@ -84,6 +85,15 @@ run_unit() {
   scripts/check_nodebridge_owners.sh || fail "check_nodebridge_owners"
   passed "nodebridge owner routing"
 
+  section "browserbridge owner routing"
+  scripts/check_browserbridge_owners.sh || fail "check_browserbridge_owners"
+  passed "browserbridge owner routing"
+
+  section "java owner routing (M5.2)"
+  scripts/check_java_owners.sh || fail "check_java_owners"
+  scripts/check_java_owners.sh --self-test || fail "check_java_owners --self-test"
+  passed "java owner routing"
+
   section "javac bridge + checks"
   JTMP=$(mktemp -d)
   trap 'rm -rf "$JTMP"' EXIT
@@ -92,9 +102,18 @@ run_unit() {
     tests/BJavaCheck.java tests/CJavaCheck.java \
     tests/M4JavaCheck.java tests/M5JavaCheck.java \
     tests/M6JavaCheck.java tests/M7JavaCheck.java || fail "javac checks"
+  passed "javac"
+
+  section "java checks (execute B/C/M4-M7)"
+  # Compiled checks are fail-fast by construction (each prints its own
+  # ok-lines and System.exit(1) on any failure), so the gate just runs
+  # every check class against the freshly compiled bridge above.
+  for c in BJavaCheck CJavaCheck M4JavaCheck M5JavaCheck M6JavaCheck M7JavaCheck; do
+    java -cp "$JTMP/classes:$JTMP/checks" "$c" || fail "java $c"
+  done
   rm -rf "$JTMP"
   trap - EXIT
-  passed "javac"
+  passed "java checks"
 }
 
 run_live() {

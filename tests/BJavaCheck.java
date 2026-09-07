@@ -158,7 +158,7 @@ public class BJavaCheck {
         // 2. Overloaded names its target (accept-loop helper; the loop
         // itself only admits it past the handler bound).
         {
-            String resp = BridgeSession.overloadedJson();
+            String resp = BridgeProto.overloadedJson();
             check(resp.contains("overloaded"), "overloaded rejects: " + resp);
             checkTarget(resp, "overloaded");
         }

@@ -334,7 +334,13 @@ test('browser: pool-full ordinary is overloaded; exact close ACKs once', async (
   const st = browserSession(dir);
   let cleanups = 0;
   st.cleanup = async () => { cleanups += 1; };
-  st.activeConns = browser.MAX_ACTIVE_HANDLERS;
+  // Pool-full fixture through the production admission API (not a raw
+  // counter write): every slot acquired, so handleOverload proves the
+  // pool is untouched by asserting the same count afterwards.
+  for (let i = 0; i < browser.MAX_ACTIVE_HANDLERS; i++) {
+    assert.equal(st.server.tryAcquire(browser.MAX_ACTIVE_HANDLERS), true);
+  }
+  assert.equal(st.server.tryAcquire(browser.MAX_ACTIVE_HANDLERS), false);
   const o = await tcpPair();
   try {
     const p = browser.handleOverload(st, o.serverConn);
@@ -342,7 +348,7 @@ test('browser: pool-full ordinary is overloaded; exact close ACKs once', async (
     await p;
     assert.equal(resp.ok, false);
     assert.match(resp.error, /overloaded/);
-    assert.equal(st.closing, false);
+    assert.equal(st.server.closing, false);
   } finally {
     o.client.destroy();
     o.server.close();
@@ -353,9 +359,9 @@ test('browser: pool-full ordinary is overloaded; exact close ACKs once', async (
     const resp = await clientRoundtrip(c.client, { cmd: 'close' });
     await p;
     assert.deepEqual(resp, { ok: true, closed: true, target: 'main' });
-    assert.equal(st.closing, true);
+    assert.equal(st.server.closing, true);
     assert.equal(cleanups, 1);
-    assert.equal(st.activeConns, browser.MAX_ACTIVE_HANDLERS);
+    assert.equal(st.server.active, browser.MAX_ACTIVE_HANDLERS);
   } finally {
     c.client.destroy();
     c.server.close();

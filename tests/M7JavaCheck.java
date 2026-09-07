@@ -65,18 +65,18 @@ public class M7JavaCheck {
                 + "\"argv\":[\"java\",\"-Dtoken=[redacted]\",\"Foo\"],"
                 + "\"cwd\":\"/srv\",\"source\":\"os-proc\"},"
                 + "\"adapter\":{\"confidence\":\"unavailable\"}}";
-        check(BridgeSession.jsonLong(seed, "ownerPid") == 15298L, "ownerPid extracted");
-        check("os-proc".equals(BridgeSession.jsonString(seed, "source")), "source extracted");
-        check("/usr/bin/java".equals(BridgeSession.jsonString(seed, "executable")), "exe extracted");
-        check("/srv".equals(BridgeSession.jsonString(seed, "cwd")), "cwd extracted");
-        String argv = BridgeSession.jsonStringArray(seed, "argv");
+        check(BridgeProto.jsonLong(seed, "ownerPid") == 15298L, "ownerPid extracted");
+        check("os-proc".equals(BridgeProto.jsonString(seed, "source")), "source extracted");
+        check("/usr/bin/java".equals(BridgeProto.jsonString(seed, "executable")), "exe extracted");
+        check("/srv".equals(BridgeProto.jsonString(seed, "cwd")), "cwd extracted");
+        String argv = BridgeProto.jsonStringArray(seed, "argv");
         check(argv != null && argv.startsWith("[") && argv.contains("Foo"), "argv array verbatim");
-        check(BridgeSession.jsonLong(seed, "missing") == null, "missing long is null");
-        check(BridgeSession.jsonString(seed, "missing") == null, "missing string is null");
-        check(BridgeSession.jsonStringArray(seed, "missing") == null, "missing array is null");
-        check(BridgeSession.jsonLong("not json", "ownerPid") == null, "malformed long is null");
-        check(BridgeSession.jsonStringArray("{\"argv\":null}", "argv") == null, "null array is null");
-        check(BridgeSession.jsonStringArray("{\"argv\":{}}", "argv") == null, "object array is null");
+        check(BridgeProto.jsonLong(seed, "missing") == null, "missing long is null");
+        check(BridgeProto.jsonString(seed, "missing") == null, "missing string is null");
+        check(BridgeProto.jsonStringArray(seed, "missing") == null, "missing array is null");
+        check(BridgeProto.jsonLong("not json", "ownerPid") == null, "malformed long is null");
+        check(BridgeProto.jsonStringArray("{\"argv\":null}", "argv") == null, "null array is null");
+        check(BridgeProto.jsonStringArray("{\"argv\":{}}", "argv") == null, "object array is null");
         // -- seed-derived hint: debuggee-first, never a spawn failure.
         check(BridgeSession.seedHint(null).equals(""), "null seed hints empty");
         String sh = BridgeSession.seedHint(seed);
@@ -87,11 +87,11 @@ public class M7JavaCheck {
         // -- caps.
         StringBuilder big = new StringBuilder();
         for (int i = 0; i < 900; i++) big.append('x');
-        String capped = BridgeSession.truncField(big.toString());
+        String capped = BridgeProto.truncField(big.toString());
         check(capped.length() <= 512 + 30 && capped.contains("more chars"), "field cap marks");
-        check(BridgeSession.truncField(null) == null, "null cap stays null");
+        check(BridgeProto.truncField(null) == null, "null cap stays null");
         // -- unavailable entries quote safely.
-        String un = BridgeSession.unavailableEntry("pid", "no \"source\" here");
+        String un = BridgeProto.unavailableEntry("pid", "no \"source\" here");
         check(un.contains("\"field\":\"pid\"") && !un.contains("\"source\" here"),
                 "unavailable entry escapes");
 
@@ -122,12 +122,12 @@ public class M7JavaCheck {
                 "missing observation degrades, never fabricates");
 
         // -- timeout text keeps the frozen prefix with the hint appended.
-        String msg = BridgeSession.timeoutText(st, 2000);
+        String msg = BridgeSnapshot.timeoutText(st, 2000);
         check(msg.startsWith("timeout: no stop within 2s"), "frozen prefix intact, got: " + msg);
         check(msg.contains("target identity: java Foo"), "hint appended, got: " + msg);
 
         // -- waitContext JSON: unknown trigger, canonical order, honest note.
-        String ctx = BridgeSession.waitContextJson(st, 2000, 1735689600000L, null);
+        String ctx = BridgeSnapshot.waitContextJson(st, 2000, 1735689600000L, null);
         check(ctx.contains("\"triggerStatus\":\"unknown\""), "trigger unknown");
         check(!ctx.contains("expectedBreak"), "wait plants no expectedBreak");
         check(ctx.contains("\"waitStartedAt\":1735689600"), "wait start stamped");
@@ -135,7 +135,7 @@ public class M7JavaCheck {
         check(ctx.contains("not observed") && ctx.contains("not that the code is unreachable"),
                 "honest note, no root-cause claim");
         check(ctx.contains("\"targetIdentity\":"), "identity rides along");
-        String ctx2 = BridgeSession.waitContextJson(st, 2000, 1735689600000L, "com.Foo:54");
+        String ctx2 = BridgeSnapshot.waitContextJson(st, 2000, 1735689600000L, "com.Foo:54");
         check(ctx2.contains("\"expectedBreak\":\"com.Foo:54\""), "capture expectedBreak rides");
         int trigPos = ctx2.indexOf("triggerStatus");
         int expPos = ctx2.indexOf("expectedBreak");
@@ -191,7 +191,7 @@ public class M7JavaCheck {
                 "explicit runtime marker reads runtime");
         check(BridgeSession.phaseOfError(new RuntimeException("boom")).equals("runtime"),
                 "unexpected reads runtime");
-        check(BridgeSession.withCaptureStage(
+        check(BridgeSnapshot.withCaptureStage(
                 "{\"triggerStatus\":\"unknown\"}", "armed-wait", true).contains(
                 "\"captureStage\":\"armed-wait\""),
                 "capture stage rides additively");
@@ -314,7 +314,7 @@ public class M7JavaCheck {
         // waitStartedAt/waitedMs (timeout-context units), the truthful
         // stage, the planted flag, and the honest trigger-unknown note.
         long entryMs = 1735689600000L;
-        String exitCtx = BridgeSession.captureExitContextJson(
+        String exitCtx = BridgeSnapshot.captureExitContextJson(
                 st, "armed-wait", true, "com.Foo:54", entryMs);
         check(exitCtx.contains("\"captureStage\":\"armed-wait\""), "exit stage armed-wait");
         check(exitCtx.contains("\"ephemeralPlanted\":true"), "exit planted rides");
@@ -323,7 +323,7 @@ public class M7JavaCheck {
         check(exitCtx.contains("\"waitedMs\":"), "exit waited ms stamped");
         check(exitCtx.contains("\"triggerStatus\":\"unknown\""), "exit trigger unknown");
         check(exitCtx.contains("not observed"), "exit honest note");
-        String goneCtx = BridgeSession.captureExitContextJson(
+        String goneCtx = BridgeSnapshot.captureExitContextJson(
                 st, "session-gone", false, null, entryMs);
         check(goneCtx.contains("\"captureStage\":\"session-gone\"")
                 && goneCtx.contains("\"ephemeralPlanted\":false")
@@ -367,7 +367,7 @@ public class M7JavaCheck {
         java.util.Map<String, String> base25 = new java.util.LinkedHashMap<>();
         for (int i = 0; i < 25; i++) base25.put("v" + i, String.valueOf(i));
         SessionState tc = state("launch");
-        BridgeSession.compareTrack(tc, new java.util.LinkedHashMap<>(base25),
+        BridgeSnapshot.compareTrack(tc, new java.util.LinkedHashMap<>(base25),
                 "com.Foo#run", 25, false, null, true);
         check("[]".equals(tc.lastChanged)
                 && !tc.lastChangedComplete
@@ -379,7 +379,7 @@ public class M7JavaCheck {
         next.put("v24", "changed");
         next.put("fresh", "1");
         next.remove("v0");
-        BridgeSession.compareTrack(tc, next, "com.Foo#run", 25, false, null, true);
+        BridgeSnapshot.compareTrack(tc, next, "com.Foo#run", 25, false, null, true);
         check(tc.lastChanged.contains("\"v24\"") && tc.lastChanged.contains("\"fresh\"")
                 && tc.lastRemoved.contains("\"v0\"") && tc.lastChangedComplete
                 && !tc.lastChangeTracking.contains("reason"),
@@ -387,12 +387,12 @@ public class M7JavaCheck {
                 + " / " + tc.lastRemoved);
         check(tc.lastTrackWarn == null, "complete scan quiet");
         // No-op stop: complete with empty changed (real no-change).
-        BridgeSession.compareTrack(tc, new java.util.LinkedHashMap<>(next),
+        BridgeSnapshot.compareTrack(tc, new java.util.LinkedHashMap<>(next),
                 "com.Foo#run", 25, false, null, true);
         check("[]".equals(tc.lastChanged) && "[]".equals(tc.lastRemoved)
                 && tc.lastChangedComplete, "no-op complete empty");
         // Function change resets to unknown.
-        BridgeSession.compareTrack(tc, new java.util.LinkedHashMap<>(next),
+        BridgeSnapshot.compareTrack(tc, new java.util.LinkedHashMap<>(next),
                 "com.Foo#other", 25, false, null, true);
         check("[]".equals(tc.lastChanged) && !tc.lastChangedComplete
                 && tc.lastChangeTracking.contains("\"reason\":\"function-changed\""),
@@ -402,7 +402,7 @@ public class M7JavaCheck {
         java.util.Map<String, String> trackBig = new java.util.LinkedHashMap<>();
         for (int i = 0; i < 300; i++) trackBig.put("w" + i, "0");
         SessionState tt = state("launch");
-        BridgeSession.compareTrack(tt, new java.util.LinkedHashMap<>(trackBig),
+        BridgeSnapshot.compareTrack(tt, new java.util.LinkedHashMap<>(trackBig),
                 "com.Foo#run", 301, true, "truncated", false);
         check(!tt.lastChangedComplete
                 && tt.lastChangeTracking.contains("\"reason\":\"truncated\"")
@@ -413,7 +413,7 @@ public class M7JavaCheck {
         big2.put("w1", "1");
         big2.put("added", "x");
         big2.remove("w2");
-        BridgeSession.compareTrack(tt, big2, "com.Foo#run", 301, true,
+        BridgeSnapshot.compareTrack(tt, big2, "com.Foo#run", 301, true,
                 "truncated", false);
         check(tt.lastChanged.contains("\"w1\"")
                 && !tt.lastChanged.contains("\"added\"")
@@ -425,7 +425,7 @@ public class M7JavaCheck {
         SessionState te = state("launch");
         te.thread = null;
         try {
-            BridgeSession.trackChanges(te);
+            BridgeSnapshot.trackChanges(te);
             check("[]".equals(te.lastChanged) && !te.lastChangedComplete
                     && te.lastChangeTracking.contains("\"reason\":\"tracking-error\"")
                     && te.lastChangeTracking.contains("\"total\":null")
@@ -436,11 +436,21 @@ public class M7JavaCheck {
         }
         // Response fragment shape: changed/removed/changedComplete/
         // changeTracking (+warning only when incomplete).
-        String frag = BridgeSession.changeFieldsJson(tc);
+        String frag = BridgeSnapshot.changeFieldsJson(tc);
         check(frag.contains("\"changed\":") && frag.contains("\"removed\":")
                 && frag.contains("\"changedComplete\":")
                 && frag.contains("\"changeTracking\":"),
                 "change fragment shape, got: " + frag);
+        // Byte-exact fragment after the function-change reset above
+        // (proves the moved renderer emits identical bytes).
+        check(("\"changed\":[],\"removed\":[],\"changedComplete\":false,"
+                + "\"changeTracking\":{\"complete\":false,\"scanned\":25,"
+                + "\"total\":25,\"truncated\":false,"
+                + "\"reason\":\"function-changed\"},"
+                + "\"trackingWarning\":\"change tracking incomplete "
+                + "(function-changed); changed lists only certain value "
+                + "changes\"").equals(frag),
+                "change fragment bytes, got: " + frag);
         // -- formatTrackingValue: shallow top-level preview, 200-cap, no
         // field walk / element fetch / invocation (proxies explode on any
         // such call, proving the contract without a VM).
@@ -483,15 +493,15 @@ public class M7JavaCheck {
         // -- frameIdentity: type+method+signature (overloads differ), nulls
         // degrade to "?", never null.
         check("com.Foo#run()V".equals(
-                BridgeSession.frameIdentity("com.Foo", "run", "()V")),
+                BridgeEval.frameIdentity("com.Foo", "run", "()V")),
                 "identity with signature");
         check("com.Foo#run".equals(
-                BridgeSession.frameIdentity("com.Foo", "run", null)),
+                BridgeEval.frameIdentity("com.Foo", "run", null)),
                 "identity without signature");
-        check(!BridgeSession.frameIdentity("com.Foo", "run", "()V").equals(
-                BridgeSession.frameIdentity("com.Foo", "run", "(I)V")),
+        check(!BridgeEval.frameIdentity("com.Foo", "run", "()V").equals(
+                BridgeEval.frameIdentity("com.Foo", "run", "(I)V")),
                 "identity distinguishes overloads");
-        check("?#?".equals(BridgeSession.frameIdentity(null, null, null)),
+        check("?#?".equals(BridgeEval.frameIdentity(null, null, null)),
                 "identity nulls degrade");
         // -- degradeTrack: unknown total (null), exactly one class-only
         // stderr warning, and the warning matches the response fragment.
@@ -501,7 +511,7 @@ public class M7JavaCheck {
         java.io.ByteArrayOutputStream errBuf = new java.io.ByteArrayOutputStream();
         System.setErr(new java.io.PrintStream(errBuf));
         try {
-            BridgeSession.degradeTrack(dg, "IllegalStateException", null);
+            BridgeSnapshot.degradeTrack(dg, "IllegalStateException", null);
         } finally {
             System.setErr(keepErr);
         }
@@ -516,9 +526,66 @@ public class M7JavaCheck {
                 "degrade total null, got: " + dg.lastChangeTracking);
         check(dg.lastTrackWarn != null
                 && dg.lastTrackWarn.contains("IllegalStateException")
-                && BridgeSession.changeFieldsJson(dg).contains(
+                && BridgeSnapshot.changeFieldsJson(dg).contains(
                         JdiBridge.quote(dg.lastTrackWarn)),
                 "degrade warn matches response");
+        // -- M5.2 lock contract: the moved stateful helpers (compareTrack/
+        // changeFieldsJson) execute under the caller-held sessionLock,
+        // exactly like the awaitStopInner Phase-B and dispatchInner
+        // production sections. Two threads hammer one shared state with
+        // every call wrapped in synchronized (sessionLock); holdsLock
+        // asserts the test honors the contract it proves, and the final
+        // fragment is well-formed from exactly one writer (never torn).
+        final SessionState lk = state("launch");
+        final java.util.Map<String, String> snapA = new java.util.LinkedHashMap<>();
+        snapA.put("k", "1");
+        final java.util.Map<String, String> snapB = new java.util.LinkedHashMap<>();
+        snapB.put("k", "2");
+        final java.util.concurrent.atomic.AtomicReference<Throwable> lockErr =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        Runnable hammer = () -> {
+            try {
+                for (int i = 0; i < 50; i++) {
+                    java.util.Map<String, String> cur =
+                            (i % 2 == 0) ? snapA : snapB;
+                    synchronized (lk.sessionLock) {
+                        if (!Thread.holdsLock(lk.sessionLock)) {
+                            throw new AssertionError("lock not held");
+                        }
+                        BridgeSnapshot.compareTrack(lk,
+                                new java.util.LinkedHashMap<>(cur),
+                                "com.Foo#run", 1, false, null, true);
+                        String f = BridgeSnapshot.changeFieldsJson(lk);
+                        if (!f.contains("\"changeTracking\":{")) {
+                            throw new AssertionError("torn fragment: " + f);
+                        }
+                    }
+                }
+            } catch (Throwable th) {
+                lockErr.compareAndSet(null, th);
+            }
+        };
+        Thread t1 = new Thread(hammer);
+        Thread t2 = new Thread(hammer);
+        t1.start();
+        t2.start();
+        try {
+            t1.join(30000);
+            t2.join(30000);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            check(false, "lock hammer interrupted");
+        }
+        check(lockErr.get() == null,
+                "lock hammer clean: " + lockErr.get());
+        check(!t1.isAlive() && !t2.isAlive(), "lock hammer joined");
+        final String[] finalFrag = new String[1];
+        synchronized (lk.sessionLock) {
+            finalFrag[0] = BridgeSnapshot.changeFieldsJson(lk);
+        }
+        check(finalFrag[0].contains("\"changeTracking\":{\"complete\":true,")
+                && (finalFrag[0].contains("\"k\"") || finalFrag[0].contains("\"changed\":[]")),
+                "lock hammer final fragment coherent, got: " + finalFrag[0]);
 
         if (failures > 0) {
             System.out.println("M7JavaCheck: " + failures + " FAILURES");

@@ -283,6 +283,118 @@ class BridgeProto {
         return parseJsonString(quoted, 0, end);
     }
 
+    // ---- M5.2: request/identity text builders (moved verbatim from
+    // BridgeSession; no new top-level class). All pure (string/JSON in,
+    // string out) except busyError, which reads st.outstanding — its sole
+    // production caller holds the caller-held st.sessionLock (dispatch
+    // acceptance section). No moved body contains synchronized, lock
+    // acquisition, thread spawn, or socket IO (grep-enforced via
+    // scripts/check_java_owners.sh). The setup-phase text group
+    // (setupErrorText/setupPhaseOf/phaseOfError/setupErrorJson) was
+    // REJECTED for the move: setupErrorJson has a production caller
+    // outside BridgeSession (BridgeCli), so the atomic-group rule keeps
+    // the whole group in BridgeSession.
+
+    static final int IDENT_FIELD_CAP = 512;
+
+    /** Pure field cap (same `… (+N more chars)` idiom as every adapter). */
+    static String truncField(String s) {
+        if (s == null) return null;
+        if (s.length() <= IDENT_FIELD_CAP) return s;
+        return s.substring(0, IDENT_FIELD_CAP)
+                + "… (+" + (s.length() - IDENT_FIELD_CAP) + " more chars)";
+    }
+
+    /** First `"key": <int|null>` match in a flat JSON object, or null. Pure. */
+    static Long jsonLong(String raw, String key) {
+        if (raw == null) return null;
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "\"" + java.util.regex.Pattern.quote(key) + "\"\\s*:\\s*(-?\\d+)")
+                .matcher(raw);
+        if (!m.find()) return null;
+        try {
+            return Long.parseLong(m.group(1));
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /** First `"key": "<string>"` match (no nesting inside), or null. Pure. */
+    static String jsonString(String raw, String key) {
+        if (raw == null) return null;
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "\"" + java.util.regex.Pattern.quote(key) + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
+                .matcher(raw);
+        if (!m.find()) return null;
+        try {
+            // Unescape only what the CLI writer emits (quote/backslash).
+            return m.group(1).replace("\\\\", "\\").replace("\\\"", "\"");
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** First `"key": [<flat strings>|null]` match, verbatim (the CLI already
+     *  redacted + capped it), or null. Elements hold no nested arrays, so a
+     *  string-aware bracket scan suffices. Pure. */
+    static String jsonStringArray(String raw, String key) {
+        if (raw == null) return null;
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "\"" + java.util.regex.Pattern.quote(key) + "\"\\s*:\\s*\\[").matcher(raw);
+        if (!m.find()) return null;
+        int i = m.end();
+        boolean inStr = false;
+        boolean esc = false;
+        while (i < raw.length()) {
+            char c = raw.charAt(i);
+            if (inStr) {
+                if (esc) esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"') inStr = false;
+            } else if (c == '"') {
+                inStr = true;
+            } else if (c == ']') {
+                return raw.substring(m.end() - 1, i + 1);
+            } else if (c == '{' || c == '}') {
+                return null; // not a flat string array
+            }
+            i++;
+        }
+        return null;
+    }
+
+    /** Pure unavailable-entry fragment. */
+    static String unavailableEntry(String field, String reason) {
+        return "{\"field\":" + JdiBridge.quote(field)
+                + ",\"reason\":" + JdiBridge.quote(reason) + "}";
+    }
+
+    /** M5 immediate busy rejection (single target main): a second resume
+     *  (continue/step), any breakpoint mutation, or an eval (exclusive: it
+     *  can mutate) while one is outstanding never silently queues. Live
+     *  reads and context/vars/stack never busy-reject (the latter fail fast
+     *  via requireStopped once the resume publishes running). Caller holds
+     *  sessionLock (sole production caller: the dispatch acceptance section). */
+    static String busyError(SessionState st, String cmd) {
+        if (st.outstanding == null) return null;
+        // wait never resumes but still occupies the slot (a rival resume
+        // would steal the stop it long-polls for); capture resumes at the
+        // end, so it occupies the slot throughout.
+        if (cmd.equals("continue") || cmd.equals("step")
+                || cmd.equals("wait") || cmd.equals("capture")
+                || cmd.equals("breaksAdd") || cmd.equals("breaksRemove")
+                || cmd.equals("breaksClear") || cmd.equals("eval")) {
+            return "busy: " + st.outstanding + " outstanding for main";
+        }
+        return null;
+    }
+
+    /** Pool-full rejection fragment. Pure. */
+    static String overloadedJson() {
+        return "{\"ok\":false,\"error\":\"overloaded: too many active handlers\",\"target\":\"main\"}";
+    }
+    // ---- end M5.2 ----
+
     // ---- helpers ----
 }
 class StreamGobbler extends Thread {
