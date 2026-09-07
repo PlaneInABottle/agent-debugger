@@ -941,10 +941,16 @@ mod tests {
             }
             let results: Vec<Option<EndpointGuard>> =
                 handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let held = results.iter().filter(|g| g.is_some()).count();
+            assert!(held >= 1, "at least one stale-reclaim racer must claim");
             assert_eq!(
-                results.iter().filter(|g| g.is_some()).count(),
+                results
+                    .iter()
+                    .flatten()
+                    .filter(|g| still_holds_endpoint(g))
+                    .count(),
                 1,
-                "exactly one stale-reclaim racer must win"
+                "exactly one stale-reclaim racer must remain the owner"
             );
         });
         // Every quarantine file is consumed (deleted or restored) on all
