@@ -1,10 +1,12 @@
-# Architecture Map (M0 — durable, documentation only)
+# Architecture Map (durable, documentation only)
 
-Status: APPROVED guidance for future contributors. No production refactor is
-authorized by this document. Planner + mandatory FULL analyzer review already
-approved: **no production refactor now** — long files are not alone a defect,
-and stateful split risk exceeds value. User priority is world-class
-quality/stability first.
+Status: APPROVED guidance for future contributors. The maintainability
+program (`docs/maintainability-refactor.plan.md`) is COMPLETE pending final
+global review/gate: Rust session is `src/session/` (9 one-way modules),
+Python/Node/Browser carry explicit in-file owners, Java thins only via
+`st`-parameterized helpers under caller-held `sessionLock`. No production
+refactor is authorized by this document beyond that program. User priority
+remains world-class quality/stability first, features second.
 
 Canonical live contract: `docs/current-contract.md` (schema v2).
 Change record: `docs/schema-v2-cleanup.md`.
@@ -231,11 +233,12 @@ written atomically (tmp+rename in the same dir — `write_sidecar` /
    ≤64 MiB (`MAX_FRAME_BYTES`); one request per connection (no multiplex,
    no request-id — v1-out).
 
-## 6. Provisioning constraints + why big files are NOT split for size
+## 6. Provisioning constraints + completed ownership program
 
-Measured sizes (informational, not defects): `src/session.rs` ~6.6k lines,
-`bridge/py/src/pybridge.py` ~5.6k, `bridge/node/src/nodebridge.js` ~4.8k,
-`bridge/browser/src/browserbridge.js` ~3.0k, `bridge/java/src/` ~5.4k across
+Measured sizes (informational, not defects): `src/session/` ~6.0k lines
+across `mod.rs` + 9 modules, `bridge/py/src/pybridge.py` ~5.9k,
+`bridge/node/src/nodebridge.js` ~5.0k,
+`bridge/browser/src/browserbridge.js` ~3.2k, `bridge/java/src/` across
 8 files, `bridge/js/*` ~0.2k.
 
 Why Python/Node/Browser stay single-file:
@@ -386,9 +389,17 @@ runners): unit = `cargo test` + `cargo fmt --check` + every
 `node --test tests/*.test.js` + owner-routing gates
 (`check_nodebridge_owners` + `check_browserbridge_owners` +
 `check_java_owners` incl. `--self-test`) + `javac` bridge/checks + executed
-java checks (B/C/M4-M7); live = `cargo build`
-+ `tests/test_live.py` + `tests/test_m5_live.py` + `tests/test_ux_live.py`,
-with `TEST_LANG`/`SKIP_BROWSER` filters for live only.
+ java checks (B/C/M4-M7); live = `cargo build`
++ `tests/run_live.py` (runs `test_live` + `test_m5_live` + `test_ux_live`
+in one scope), with `TEST_LANG`/`SKIP_BROWSER` filters for live only.
+Live nonzero policy (enforced programmatically in `tests/run_live.py` via
+`tests/_live_home.py` `check_live_nonzero` on unittest objects, never log
+parsing): every required language must execute ≥1 test — default full
+requires py+node+java given the doctor prerequisites plus browser unless
+`SKIP_BROWSER=1`; an explicit `TEST_LANG` requires each named language;
+the scope must execute ≥1 test overall. An all-skipped scope (e.g. missing
+adapter deps) fails instead of passing silently; isolated single-test
+skips still pass while another test of that language executes.
 
 Shared test architecture (M2): `tests/contract/*.json` is the single source
 for frozen cross-language strings (consumed by
@@ -406,6 +417,11 @@ unit tests in `tests/test_live_home.py`; live failures print artifact paths
 `bridge.log` tail, never target env.
 
 ## 8. Refactor policy (triggers, not permission)
+
+The M1/M2 evidence triggers below were CONSUMED by the completed
+maintainability program (Rust 9-module DAG per M1; in-file owners per
+M3–M5; shared fixtures/runner per M2). They stay as the bar for any
+FUTURE stateful move — size alone is never a justification.
 
 Pure vs stateful, strictly:
 
@@ -435,6 +451,11 @@ public contract, migration, security boundary, or irreversible-data change,
 it is Tier-misclassified: return BLOCKED, do not implement.
 
 ## 9. Deferred feature roadmap (stability prerequisite; NO commitment)
+
+Current prioritized list: `docs/feature-roadmap.md` (P1 caught-exception
+configuration, P1 Node bounded refs/deep inspect, P2 justMyCode control,
+P2 richer watches parity, P3 advanced features). The summary below is
+informative — the roadmap file is normative for scope.
 
 The current subset is intentional scope discipline, not backlog neglect:
 every item below crosses a stateful boundary (§4) or a security boundary
@@ -481,6 +502,34 @@ proof, after stability work. Nothing here is promised or scheduled.
   `normalize_attach_host` or explicitly `unavailable` with reason.
 - **No target-process environment collection.** Identity/redaction/caps operate on
   argv/cwd/executable/port only; the CLI never harvests or persists the target
-  process's environment (its own operational `HOME`/`NODE_PATH`/cwd/temp reads
-  aside, see §5.6). Any proposal to collect target env (or persist raw command
-  lines) is rejected at review.
+   process's environment (its own operational `HOME`/`NODE_PATH`/cwd/temp reads
+   aside, see §5.6). Any proposal to collect target env (or persist raw command
+   lines) is rejected at review.
+
+## 11. Contributor workflow (canonical gates)
+
+Run gates via the canonical runner — the command list in §7 is informative,
+the script is normative:
+
+- Fast unit gate (no daemons/browsers): `scripts/run_gates.sh --unit`
+  (`cargo test` + `cargo fmt --check` + Python unit minus the three live
+  suites + `node --test tests/*.test.js` + owner-routing gates
+  `scripts/check_nodebridge_owners.sh`,
+  `scripts/check_browserbridge_owners.sh`,
+  `scripts/check_java_owners.sh` incl. `--self-test` + `javac` bridge/checks
+  + executed Java checks B/C/M4–M7).
+- Live gate: `scripts/run_gates.sh --live` (builds first when the binary is
+  missing; `TEST_LANG=py|node|java|browser` + `SKIP_BROWSER=1` filter live
+  only; JS unit always runs in full). Live entry is `tests/run_live.py`
+  (all three live suites, one scope) with the §7 nonzero policy: default
+  full requires py+node+java plus browser unless `SKIP_BROWSER=1`;
+  without chrome, set `SKIP_BROWSER=1` explicitly — otherwise the gate
+  fails instead of passing all-skipped.
+- Full release-like gate (default, no args): unit + live.
+
+Rules: one subsystem/language per commit; zero contract delta per refactor
+commit (`docs/current-contract.md` byte-identical); serial edits to shared
+files (`src/session/*`, `src/cli.rs`, `src/main.rs`, `SKILL.md`); rollback =
+revert the single commit. `docs/current-contract.md` needs no gate beyond
+"no diff"; `skills/agent-debugger/SKILL.md` first-run note is untouched
+unless provisioning changes.

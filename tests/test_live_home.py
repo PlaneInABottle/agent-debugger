@@ -106,5 +106,148 @@ class LiveHomeHelperTests(unittest.TestCase):
         self.assertIn("ghost", buf.getvalue())
 
 
+class _StubResult:
+    """Minimal unittest-result double (check_live_nonzero reads .skipped
+    only — no console parsing anywhere)."""
+
+    def __init__(self, skipped=()):
+        self.skipped = list(skipped)
+
+
+def _tid(mod="tests.test_live", cls="LiveTests", meth="test_01_py_a"):
+    return f"{mod}.{cls}.{meth}"
+
+
+class LiveNonzeroPolicyTests(unittest.TestCase):
+    def test_selected_langs_defaults_and_filters(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TEST_LANG", None)
+            os.environ.pop("SKIP_BROWSER", None)
+            self.assertEqual(_live_home.selected_live_langs(),
+                             ("py", "node", "java", "browser"))
+        with mock.patch.dict(os.environ, {"SKIP_BROWSER": "1"}):
+            os.environ.pop("TEST_LANG", None)
+            self.assertEqual(_live_home.selected_live_langs(),
+                             ("py", "node", "java"))
+        with mock.patch.dict(os.environ, {"TEST_LANG": "py"}):
+            os.environ.pop("SKIP_BROWSER", None)
+            self.assertEqual(_live_home.selected_live_langs(), ("py",))
+        with mock.patch.dict(os.environ, {"TEST_LANG": "node,java"}):
+            self.assertEqual(_live_home.selected_live_langs(),
+                             ("java", "node"))
+
+    def test_lang_of_test_id(self):
+        self.assertEqual(
+            _live_home.lang_of_test_id(_tid(meth="test_32_py_wait")), "py")
+        self.assertEqual(
+            _live_home.lang_of_test_id(_tid(meth="test_33_node_x")), "node")
+        self.assertEqual(
+            _live_home.lang_of_test_id(_tid(meth="test_04_browser_y")),
+            "browser")
+        self.assertIsNone(
+            _live_home.lang_of_test_id(_tid(meth="test_01_parallel")))
+        # Class-level placeholder carries no language token (shared).
+        self.assertIsNone(_live_home.lang_of_test_id(
+            "setUpClass (tests.test_live.LiveTests)"))
+
+    def test_fake_all_skip_fails(self):
+        # Every selected test skipped (e.g. missing adapter deps): the
+        # gate must fail, naming the starved language.
+        selected = [_tid(meth="test_01_py_a"), _tid(meth="test_02_py_b")]
+        skipped = [(tid, "existing dependency required: /x/venv")
+                   for tid in selected]
+        ok, message, summary = _live_home.check_live_nonzero(
+            selected, _StubResult(skipped), required=("py",))
+        self.assertFalse(ok)
+        self.assertIn("py", message)
+        self.assertEqual(summary["executed"], 0)
+        self.assertEqual(summary["skipped"], 2)
+
+    def test_mixed_skip_and_pass_satisfies_language(self):
+        # One browser test unavailable while another executes: normal
+        # isolated skip, gate stays green.
+        selected = [_tid(meth="test_04_browser_a"),
+                    _tid(meth="test_22_browser_b")]
+        skipped = [(selected[0], "Chrome unavailable")]
+        ok, _message, summary = _live_home.check_live_nonzero(
+            selected, _StubResult(skipped), required=("browser",))
+        self.assertTrue(ok)
+        self.assertEqual(summary["executed"], 1)
+        self.assertEqual(summary["skipped"], 1)
+        self.assertEqual(
+            summary["per_lang"]["browser"],
+            {"selected": 2, "skipped": 1, "executed": 1})
+
+    def test_class_level_adapter_skip_covers_whole_class(self):
+        # setup_home raising SkipTest reports one placeholder for the
+        # class; it must starve every language selected in that class.
+        selected = [_tid(meth="test_01_py_a"),
+                    _tid(meth="test_19_node_b"),
+                    _tid(meth="test_03_shared")]
+        skipped = [("setUpClass (tests.test_live.LiveTests)",
+                    "existing dependency required: /x/venv")]
+        ok, _message, summary = _live_home.check_live_nonzero(
+            selected, _StubResult(skipped), required=("py", "node"))
+        self.assertFalse(ok)
+        self.assertEqual(summary["executed"], 0)
+        self.assertEqual(summary["per_lang"]["py"]["executed"], 0)
+        self.assertEqual(summary["per_lang"]["node"]["executed"], 0)
+
+    def test_shared_tests_never_satisfy_a_language(self):
+        selected = [_tid(meth="test_01_parallel")]
+        ok, _message, _summary = _live_home.check_live_nonzero(
+            selected, _StubResult(), required=("py",))
+        self.assertFalse(ok)
+
+    def test_zero_selected_scope_fails(self):
+        ok, message, summary = _live_home.check_live_nonzero(
+            [], _StubResult(), required=("py",))
+        self.assertFalse(ok)
+        self.assertIn("zero tests", message)
+        self.assertEqual(summary["selected"], 0)
+
+    def test_real_run_mixed_suite_passes_programmatically(self):
+        # End-to-end on real unittest objects (no output parsing): one
+        # pass + one skip executes exactly one test for the language.
+        class Demo(unittest.TestCase):
+            def check_py_pass(self):
+                pass
+
+            def check_py_skip(self):
+                raise unittest.SkipTest("Chrome unavailable")
+
+        suite = unittest.TestSuite(
+            [Demo("check_py_pass"), Demo("check_py_skip")])
+        # Collect before run: TestSuite.run replaces entries with None.
+        ids = [t.id() for t in _live_home.iter_suite_tests(suite)]
+        result = unittest.TestResult()
+        suite.run(result)
+        self.assertEqual(len(ids), 2)
+        ok, _message, summary = _live_home.check_live_nonzero(
+            ids, result, required=("py",))
+        self.assertTrue(ok)
+        self.assertEqual(summary["executed"], 1)
+        self.assertEqual(summary["skipped"], 1)
+
+    def test_real_run_class_skip_fails_programmatically(self):
+        class DemoCls(unittest.TestCase):
+            @classmethod
+            def setUpClass(cls):
+                raise unittest.SkipTest(
+                    "existing dependency required: /x/venv")
+
+            def check_py_a(self):
+                pass
+
+        suite = unittest.TestSuite([DemoCls("check_py_a")])
+        ids = [t.id() for t in _live_home.iter_suite_tests(suite)]
+        result = unittest.TestResult()
+        suite.run(result)
+        ok, _message, summary = _live_home.check_live_nonzero(
+            ids, result, required=("py",))
+        self.assertFalse(ok)
+        self.assertEqual(summary["executed"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

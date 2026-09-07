@@ -22,6 +22,15 @@
 #   SKIP_BROWSER=1                        drop live chrome tests
 # JS unit tests always run in full (stubbed transports, no chrome needed).
 #
+# Live nonzero policy (tests/_live_home.py check_live_nonzero, enforced by
+# tests/run_live.py): every required language (default full = py+node+java
+# given the doctor prerequisites, plus browser unless SKIP_BROWSER=1; or
+# every explicit TEST_LANG entry) must execute at least one test, and the
+# scope must execute at least one overall. An all-skipped scope (e.g.
+# missing adapter dependencies) fails instead of passing silently.
+# Isolated single-test skips (e.g. one browser test without chrome) still
+# pass while another test of that language executes.
+#
 # Summaries print per-section elapsed time; test counts come from each
 # harness's own output. No secrets or log dumps on failure: rerun the
 # named file directly to inspect.
@@ -123,12 +132,8 @@ run_live() {
     passed "cargo build"
   fi
   section "live (TEST_LANG=${TEST_LANG:-all} SKIP_BROWSER=${SKIP_BROWSER:-0})"
-  python3 tests/test_live.py || fail "tests/test_live.py"
-  passed "tests/test_live.py"
-  python3 tests/test_m5_live.py || fail "tests/test_m5_live.py"
-  passed "tests/test_m5_live.py"
-  python3 tests/test_ux_live.py || fail "tests/test_ux_live.py"
-  passed "tests/test_ux_live.py"
+  python3 tests/run_live.py || fail "tests/run_live.py (test_live + test_m5_live + test_ux_live)"
+  passed "live"
 }
 
 if [ "$mode" = "unit" ] || [ "$mode" = "full" ]; then run_unit; fi

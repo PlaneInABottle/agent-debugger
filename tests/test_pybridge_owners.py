@@ -10,6 +10,8 @@ test_wait_capture.py and the concurrency matrices — no wrapper tests.
 """
 import importlib.util
 import socket
+import subprocess
+import sys
 import threading
 import unittest
 from pathlib import Path
@@ -132,6 +134,49 @@ class TargetSwapTests(unittest.TestCase):
         self.assertNotIn("child:61", st.targets)
         self.assertEqual(st.exited_targets[-1]["id"], "child:61")
 
+    def test_set_serving_accepts_main_or_registered(self):
+        st = make_session()
+        make_child(st, "child:5", 5)
+        st.targets_reg.set_serving("child:5")
+        self.assertEqual(st.targets_reg.serving, "child:5")
+        self.assertTrue(st.targets_reg.assert_valid())
+        st.targets_reg.reset_serving()
+        self.assertEqual(st.targets_reg.serving, "main")
+        st.targets_reg.set_serving("main")
+        self.assertEqual(st.targets_reg.serving, "main")
+
+    def test_set_serving_rejects_unknown_with_existing_error(self):
+        # Unknown ids keep the existing resolve_inner vocabulary and are
+        # rejected before any write: serving stays main.
+        st = make_session()
+        with self.assertRaisesRegex(bridge.BridgeErr, "unknown target: nope"):
+            st.targets_reg.set_serving("nope")
+        self.assertEqual(st.targets_reg.serving, "main")
+        self.assertTrue(st.targets_reg.assert_valid())
+
+    def test_reset_serving_unconditional_after_mid_scope_removal(self):
+        # Reset must not require the child to still be registered (the
+        # missing-child exit path removes it mid-command).
+        st = make_session()
+        make_child(st, "child:7", 7)
+        st.targets_reg.set_serving("child:7")
+        st._note_exit("child:7")
+        st.targets_reg.reset_serving()
+        self.assertEqual(st.targets_reg.serving, "main")
+        self.assertTrue(st.targets_reg.assert_valid())
+
+    def test_scope_entry_unknown_tid_raises_before_swap(self):
+        # Entry with an unknown id raises the existing KeyError (never a
+        # silent serve), leaves serving on main, and releases the gate.
+        # The bare-dump churn path depends on skipping exactly this.
+        st = make_session()
+        with self.assertRaises(KeyError):
+            with st._TargetScope(st, "child:ghost"):
+                pass
+        self.assertEqual(st.targets_reg.serving, "main")
+        self.assertTrue(st._gate.acquire(blocking=False))
+        st._gate.release()
+
 
 class ServerStateTests(unittest.TestCase):
     def test_pool_bound_and_release(self):
@@ -149,8 +194,30 @@ class ServerStateTests(unittest.TestCase):
 
     def test_release_below_zero_rejected(self):
         st = make_session()
-        with self.assertRaises(AssertionError):
+        with self.assertRaisesRegex(
+                AssertionError, "release without acquire"):
             st.server_state.release()
+
+    def test_release_below_zero_rejected_under_O(self):
+        # Asserts are stripped by `python -O`; release must stay loud via
+        # an unconditional if/raise (Node/Browser parity). The production
+        # module is reloaded under -O in a subprocess seam.
+        code = (
+            "import importlib.util;"
+            f"spec = importlib.util.spec_from_file_location("
+            f"'pybridge_O', {str(ROOT / 'bridge/py/src/pybridge.py')!r});"
+            "bridge = importlib.util.module_from_spec(spec);"
+            "spec.loader.exec_module(bridge);"
+            "st = bridge.Session(bridge.Config());"
+            "st.server_state.release();"
+            "print('NO_RAISE')"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-O", "-c", code],
+            capture_output=True, text=True, timeout=120)
+        self.assertNotIn("NO_RAISE", proc.stdout)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("AssertionError", proc.stderr)
 
     def test_over_admit_rejected_by_invariant(self):
         st = make_session()

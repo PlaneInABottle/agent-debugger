@@ -1054,6 +1054,31 @@ class TargetRegistry:
     def release_helper(self):
         self.helpers_released += 1
 
+    # -- in-flight serving target (caller holds _gate; _TargetScope is the
+    # sole production writer) --
+
+    def set_serving(self, tid):
+        """Mark the in-flight command target (caller holds _gate).
+
+        Bounded: tid must be "main" or a registered table key. Unknown ids
+        keep the existing BridgeErr vocabulary and are normally rejected by
+        resolve_inner before any scope is entered; _TargetScope additionally
+        looks the child up first, so scope entry itself keeps raising the
+        existing KeyError (the bare-dump churn path skips exactly that).
+        This guard is the backstop so a direct write can never park serving
+        on a ghost."""
+        if tid != "main" and tid not in self.table:
+            raise BridgeErr(f"unknown target: {tid}")
+        self.serving = tid
+
+    def reset_serving(self):
+        """Restore main after a command (caller holds _gate).
+
+        Unconditional by design: a child removed mid-scope (its exit
+        already snapshotted history) must still reset main without
+        requiring the child to still be registered."""
+        self.serving = "main"
+
     # -- deferred child admission (caller holds _gate except the blocking
     # private handshake between claim and commit, which touches only the
     # private DapConn) --
@@ -1188,8 +1213,16 @@ class ServerState:
         return True
 
     def release(self):
-        """Drop one handler; never negative (close-cleanup-once backstop)."""
-        assert self.active > 0, "handler count would go negative"
+        """Drop one handler; never negative (close-cleanup-once backstop).
+
+        Loud on unbalanced use like the Node/Browser owners: production
+        pairs every release with a successful try_admit (serve admits,
+        _handle_one's finally releases), so a zero-active release is a
+        bug, never a slow close. Unconditional if/raise (never a bare
+        assert: -O strips asserts and would mask drift below zero)."""
+        if self.active <= 0:
+            raise AssertionError(
+                "ServerState invariant: release without acquire")
         self.active -= 1
 
     def claim_close(self):
@@ -1377,10 +1410,21 @@ class Session:
         def __enter__(self):
             st = self.session
             st._gate.acquire()
-            st.targets_reg.serving = self.tid
-            if self.tid != "main":
-                self._child = st.targets[self.tid]
-                st._swap_fields(st, self._child)
+            try:
+                if self.tid != "main":
+                    # Unknown ids raise the existing KeyError before any
+                    # serving write (the bare-dump churn path relies on
+                    # skipping exactly this); set_serving below is the
+                    # bounded backstop and cannot fail after the lookup
+                    # (both under the held _gate).
+                    self._child = st.targets[self.tid]
+                    st.targets_reg.set_serving(self.tid)
+                    st._swap_fields(st, self._child)
+                else:
+                    st.targets_reg.set_serving("main")
+            except Exception:
+                st._gate.release()
+                raise
             return self
 
         def __exit__(self, *exc):
@@ -1388,7 +1432,9 @@ class Session:
             try:
                 if self._child is not None:
                     st._swap_fields(st, self._child)
-                st.targets_reg.serving = "main"
+                # Unconditional: a mid-scope removed child still resets
+                # main (its removal stands, never resurrected).
+                st.targets_reg.reset_serving()
             finally:
                 st._gate.release()
             return False

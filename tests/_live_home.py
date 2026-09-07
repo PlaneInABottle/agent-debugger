@@ -83,6 +83,149 @@ def load_tests(loader, tests, ignore):
     return suite
 
 
+# Live nonzero policy (final-review hardening): the live gate must never
+# pass all-skipped. Missing adapter dependencies surface as skips
+# (setup_home raises SkipTest; single tests skip when chrome/node is
+# absent), so a bare `unittest` exit 0 proves nothing when every test
+# skipped. The canonical live entry (tests/run_live.py, wired into
+# scripts/run_gates.sh --live) enforces this programmatically on unittest
+# objects — never by parsing locale-dependent console output:
+#
+# - default full (no TEST_LANG): py + node + java are required given the
+#   doctor prerequisites (venv debugpy, node, javac); browser is required
+#   unless SKIP_BROWSER=1 explicitly opts out;
+# - explicit TEST_LANG=...: every requested language must execute at
+#   least one test (shared cross-cutting tests never satisfy a language);
+# - the selected scope as a whole must execute at least one test.
+#
+# Normal isolated skips still pass (e.g. one browser test skipping while
+# another browser test executes); only a zero-executed language (or an
+# empty scope) fails.
+CORE_LIVE_LANGS = ("py", "node", "java")
+
+ADAPTER_DEP_SKIP_MARK = "existing dependency required"
+
+
+def _skip_browser_on():
+    return os.environ.get("SKIP_BROWSER", "").strip().lower() in _SKIP_TRUE
+
+
+def selected_live_langs():
+    """Required languages for this invocation: the explicit TEST_LANG
+    selection, or the default-full policy (core + browser unless
+    SKIP_BROWSER=1)."""
+    wanted = {l.strip().lower()
+              for l in os.environ.get("TEST_LANG", "").split(",")
+              if l.strip()}
+    wanted = {l for l in wanted if l in LANG_TOKENS}
+    if wanted:
+        return tuple(sorted(wanted))
+    langs = list(CORE_LIVE_LANGS)
+    if not _skip_browser_on():
+        langs.append("browser")
+    return tuple(langs)
+
+
+def lang_of_test_id(test_id):
+    """Language owning a test id, or None for cross-cutting (shared)
+    tests. Same token rule as _wanted (method/class/module names embed
+    _py_/_node_/_java_/_browser_ or the full word)."""
+    lname = str(test_id).lower()
+    for lang, toks in LANG_TOKENS.items():
+        if any(t in lname for t in toks):
+            return lang
+    return None
+
+
+def iter_suite_tests(suite):
+    """Yield every leaf test in a (possibly nested) suite. Collect before
+    TestSuite.run: CPython replaces executed entries with None after the
+    run (memory cleanup), so post-run iteration is unreliable; Nones are
+    skipped defensively either way."""
+    stack = [suite]
+    while stack:
+        t = stack.pop()
+        if t is None:
+            continue
+        if isinstance(t, unittest.TestSuite):
+            stack.extend(list(t))
+        else:
+            yield t
+
+
+def _skip_covers(skip_test_str, selected_ids):
+    """Test ids covered by one result.skipped entry. Real-test skips cover
+    exactly that test (matched via .id(), not str(): str(TestCase) is
+    "method (Class)" while .id() is the dotted path); a setUpClass
+    placeholder covers that class's selected tests; an unparseable
+    placeholder conservatively covers everything (loud, never a silent
+    pass)."""
+    try:
+        sid = skip_test_str.id()
+    except AttributeError:
+        sid = str(skip_test_str)
+    if sid in selected_ids:
+        return {sid}
+    s = str(skip_test_str)
+    if s.startswith("setUpClass (") and s.endswith(")"):
+        prefix = s[len("setUpClass ("):-1] + "."
+        covered = {tid for tid in selected_ids if tid.startswith(prefix)}
+        return covered if covered else set(selected_ids)
+    return set(selected_ids)
+
+
+def check_live_nonzero(selected_ids, result, required=None):
+    """Enforce the nonzero policy. selected_ids: post-filter test ids in
+    scope; result: the unittest result after the run; required: override
+    for selected_live_langs() (tests). Returns (ok, message, summary)
+    where summary holds executed/skipped totals + per-language counts and
+    is always safe to print (surface the counts even on PASS)."""
+    required = tuple(required) if required is not None \
+        else selected_live_langs()
+    selected_ids = list(selected_ids)
+    by_lang = {}
+    for tid in selected_ids:
+        by_lang.setdefault(lang_of_test_id(tid) or "shared", []).append(tid)
+    covered = set()
+    for skip_test, _reason in getattr(result, "skipped", []):
+        covered |= _skip_covers(skip_test, set(selected_ids))
+    per_lang = {}
+    for lang in list(LANG_TOKENS) + ["shared"]:
+        sel = len(by_lang.get(lang, []))
+        sk = sum(1 for tid in by_lang.get(lang, [])
+                 if tid in covered)
+        per_lang[lang] = {"selected": sel, "skipped": sk,
+                          "executed": sel - sk}
+    executed_total = sum(1 for tid in selected_ids if tid not in covered)
+    skipped_total = sum(1 for tid in selected_ids if tid in covered)
+    summary = {"selected": len(selected_ids), "executed": executed_total,
+               "skipped": skipped_total, "required": list(required),
+               "per_lang": per_lang}
+    missing = [lang for lang in required
+               if per_lang.get(lang, {}).get("executed", 0) < 1]
+    if not selected_ids:
+        return (False, "live scope selected zero tests", summary)
+    if missing:
+        return (False,
+                "live nonzero violation: zero executed tests for "
+                f"required language(s) {missing} "
+                f"(selected={len(selected_ids)} "
+                f"executed={executed_total} "
+                f"skipped={skipped_total})",
+                summary)
+    if executed_total < 1:
+        return (False,
+                "live nonzero violation: selected scope executed zero "
+                f"tests (selected={len(selected_ids)} "
+                f"skipped={skipped_total})",
+                summary)
+    return (True,
+            f"live nonzero ok: executed={executed_total} "
+            f"skipped={skipped_total} "
+            f"required={list(required)}",
+            summary)
+
+
 _SECRET_RE = re.compile(
     r"(?i)(password|passwd|secret|token|api[_-]?key)(\s*[:=]\s*)\S+"
 )
