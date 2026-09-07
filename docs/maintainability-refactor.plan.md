@@ -1,6 +1,6 @@
 # Maintainability Refactor Program — Implementation Plan
 
-Status: M1 IMPLEMENTED (`src/session/` modularization done in the worktree, pending final gate); M2–M6 PLANNED (each requires its FULL analyzer review before executing).
+Status: M1 IMPLEMENTED (`src/session/` modularization done in the worktree, pending final gate); M2 IMPLEMENTED in the worktree (shared test architecture: `tests/contract/` fixtures + Python/JS/Rust consumers, daemon-free `src/bridge.rs` provisioning tests, `tests/_live_home.py` adopted by the 3 class-level live files, `scripts/run_gates.sh` canonical runner, failure-diagnostics bundle; FULL review APPROVED with findings, findings closed in the worktree; pending final gate incl. full live — no commit); M3–M6 PLANNED (each requires its FULL analyzer review before executing).
 Supersedes prior recommendation: `docs/architecture-map.md` §Status + §8 ("no production refactor now") was correct under stability-first priority; this plan is authorized only by the user's explicit long-term maintainability mandate (breaking changes allowed, no gratuitous user-facing changes). New product features stay deferred until this program completes.
 
 ## Problem and Success Criteria

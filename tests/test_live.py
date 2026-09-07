@@ -11,21 +11,21 @@ from pathlib import Path
 import shutil
 import socket
 import subprocess
-import tempfile
+import sys
 import threading
 import time
 import unittest
 import urllib.request
 
+try:
+    from _live_home import LiveHomeMixin, free_port, load_tests
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _live_home import LiveHomeMixin, free_port, load_tests
+
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "target/debug/agent-debugger"
 VENV_PY = Path.home() / ".agent-debugger/adapters/python/venv/bin/python"
-
-
-def free_port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 class _MockOldBridge(threading.Thread):
@@ -100,27 +100,10 @@ class _MockOldBridge(threading.Thread):
             pass
 
 
-class LiveTests(unittest.TestCase):
+class LiveTests(LiveHomeMixin, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.tmp = tempfile.TemporaryDirectory(prefix="debugger-regression-")
-        cls.home = Path(cls.tmp.name)
-        cls.env = dict(os.environ, HOME=str(cls.home))
-        cls.sessions = set()
-        cls.chrome = None
-        cls.http = None
-        cls.log = (cls.home / "runtime.log").open("w")
-        cls.addClassCleanup(cls.cleanup)
-        adapters = cls.home / ".agent-debugger/adapters"
-        for lang, entry in [("python", "venv"), ("node", "node_modules")]:
-            origin = Path.home() / ".agent-debugger/adapters" / lang / entry
-            if not origin.exists():
-                raise unittest.SkipTest(f"existing dependency required: {origin}")
-            dest = adapters / lang / entry
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.symlink_to(origin, target_is_directory=True)
-        cls.fixture = cls.home / "fixture with spaces"
-        cls.fixture.mkdir()
+        cls.setup_home("debugger-regression-", "fixture with spaces")
         (cls.fixture / "Repeat.java").write_text(
             'public class Repeat {\n'
             ' public static void main(String[] args) throws Exception {\n'
@@ -132,35 +115,6 @@ class LiveTests(unittest.TestCase):
         subprocess.run(["javac", "-g", "-d", str(cls.fixture), str(cls.fixture / "Repeat.java")], check=True, timeout=30)
         (cls.fixture / "repeat.py").write_text('import time\nfor i in range(100):\n    value=i+1\n    print(value, flush=True)\n    time.sleep(.15)\n')
         (cls.fixture / "repeat.js").write_text('const captured=7;\nfunction tick() {\n const local=2;\n console.log(local+captured);\n}\nsetInterval(tick,150);\n')
-
-    @classmethod
-    def cleanup(cls):
-        for name in list(cls.sessions):
-            try:
-                cls.cli(name, "close", timeout=85)
-            except Exception:
-                pass
-        if cls.chrome is not None:
-            cls.chrome.terminate()
-            try:
-                cls.chrome.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                cls.chrome.kill()
-                cls.chrome.wait()
-        if cls.http is not None:
-            cls.http.shutdown()
-            cls.http.server_close()
-        cls.log.close()
-        cls.tmp.cleanup()
-
-    @classmethod
-    def cli(cls, name, *args, timeout=30, ok=True, env=None, cwd=None):
-        result = subprocess.run([str(BIN), "--session", name, *args], env=env or cls.env,
-                                cwd=cwd or ROOT, capture_output=True, text=True, timeout=timeout)
-        data = json.loads(result.stdout)
-        if ok and (result.returncode or not data.get("ok")):
-            raise AssertionError(f"{name} {args}: {data}, stderr={result.stderr}")
-        return data.get("data", data)
 
     def test_01_parallel_sessions_and_repeated_steps(self):
         specs = {

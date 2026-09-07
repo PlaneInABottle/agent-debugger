@@ -87,10 +87,8 @@ pub(crate) fn setup_bridge(
             let script = bridge::ensure_browserbridge()?;
             bridge::ensure_ws()?;
             let ws_dir = bridge::node_modules_dir().to_string_lossy().to_string();
-            let node_path = match std::env::var("NODE_PATH") {
-                Ok(existing) if !existing.is_empty() => format!("{ws_dir}:{existing}"),
-                _ => ws_dir,
-            };
+            let node_path =
+                bridge::prepend_node_path(&ws_dir, std::env::var("NODE_PATH").ok().as_deref());
             std::env::set_var("NODE_PATH", node_path);
             (
                 bin,

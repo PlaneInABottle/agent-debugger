@@ -1,0 +1,6 @@
+{
+  "_note": "Frozen cross-language contract: only debugger-confirmed breakpoints persist; removed[] echoes stored raw specs; a batch whose every item fails answers ok:false.",
+  "confirmedOnlyPersistence": true,
+  "removedEcho": "stored raw specs",
+  "totalFailureOkFalse": true
+}

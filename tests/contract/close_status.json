@@ -1,0 +1,7 @@
+{
+  "_note": "Frozen cross-language contract, two layers: every bridge daemon ACKs a framed close with bridgeCloseAck (boolean closed); the CLI maps that to the cliClose shape carrying the session name plus the confirmed flag. Version-agnostic framed {cmd:close} closes even old daemons.",
+  "bridgeCloseAck": {"ok": true, "closed": true, "target": "main"},
+  "close": {"target": "main", "confirmedField": "confirmed"},
+  "closeConfirmedExample": {"closed": "<name>", "confirmed": true, "target": "main"},
+  "closeUnconfirmedExample": {"closed": "<name>", "confirmed": false, "target": "main"}
+}

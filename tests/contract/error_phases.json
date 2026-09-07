@@ -1,0 +1,5 @@
+{
+  "_note": "Frozen cross-language contract: setup/attach failures carry a transport/config/runtime phase; a present-but-corrupt setup error file uses this exact message template ({name} is the session name).",
+  "phases": ["transport", "config", "runtime"],
+  "corruptSetupErrorTemplate": "corrupt setup error file in '{name}' (schemaVersion/phase); close and retry"
+}

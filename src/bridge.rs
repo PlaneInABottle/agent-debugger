@@ -76,15 +76,21 @@ const JS_SHARED: &[(&str, &str)] = &[
     ("framing.js", include_str!("../bridge/js/framing.js")),
 ];
 
+/// True when `path` already holds exactly `source` (stale-write-if-changed
+/// seam: every `ensure_*` below rewrites only on mismatch, so a fresh
+/// adapter dir is never touched and a stale/damaged one always converges).
+fn file_matches(path: &std::path::Path, source: &str) -> bool {
+    std::fs::read_to_string(path)
+        .map(|existing| existing == source)
+        .unwrap_or(false)
+}
+
 /// Write the shared JS core into a bridge dir when changed.
 fn ensure_js_shared(dir: &std::path::Path) -> anyhow::Result<bool> {
     let mut changed = false;
     for (name, source) in JS_SHARED {
         let dest = dir.join(name);
-        let same = std::fs::read_to_string(&dest)
-            .map(|existing| existing == *source)
-            .unwrap_or(false);
-        if !same {
+        if !file_matches(&dest, source) {
             std::fs::create_dir_all(dir)
                 .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.to_string_lossy()))?;
             std::fs::write(&dest, source)
@@ -93,6 +99,15 @@ fn ensure_js_shared(dir: &std::path::Path) -> anyhow::Result<bool> {
         }
     }
     Ok(changed)
+}
+
+/// Prepend the isolated `ws` dir to `NODE_PATH` so any user value keeps
+/// working (pure seam of the browser arm in `session::spawn_lifecycle`).
+pub(crate) fn prepend_node_path(ws_dir: &str, existing: Option<&str>) -> String {
+    match existing {
+        Some(v) if !v.is_empty() => format!("{ws_dir}:{v}"),
+        _ => ws_dir.to_string(),
+    }
 }
 
 pub fn adapter_dir() -> PathBuf {
@@ -121,10 +136,7 @@ pub fn ensure_compiled() -> anyhow::Result<PathBuf> {
     }
     for (name, source) in JAVA_SOURCES {
         let dest = dir.join(name);
-        let same = std::fs::read_to_string(&dest)
-            .map(|existing| existing == *source)
-            .unwrap_or(false);
-        if !same {
+        if !file_matches(&dest, source) {
             stale = true;
         }
     }
@@ -269,14 +281,15 @@ fn run_with_timeout(
 
 /// Write the embedded pybridge when it changed; return its path.
 pub fn ensure_pybridge() -> anyhow::Result<PathBuf> {
-    let dir = python_dir();
+    ensure_pybridge_in(&python_dir())
+}
+
+/// `ensure_pybridge` against an explicit dir (temp-HOME test seam; the
+/// public entry pins the canonical adapter dir).
+fn ensure_pybridge_in(dir: &std::path::Path) -> anyhow::Result<PathBuf> {
     let dest = dir.join("pybridge.py");
-    let stale = match std::fs::read_to_string(&dest) {
-        Ok(existing) => existing != PYBRIDGE_SOURCE,
-        Err(_) => true,
-    };
-    if stale {
-        std::fs::create_dir_all(&dir)
+    if !file_matches(&dest, PYBRIDGE_SOURCE) {
+        std::fs::create_dir_all(dir)
             .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.to_string_lossy()))?;
         std::fs::write(&dest, PYBRIDGE_SOURCE)
             .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", dest.to_string_lossy()))?;
@@ -348,19 +361,20 @@ pub fn ensure_ws() -> anyhow::Result<()> {
 
 /// Write the embedded nodebridge (+ shared core) when changed; return path.
 pub fn ensure_nodebridge() -> anyhow::Result<PathBuf> {
-    let dir = node_dir();
+    ensure_nodebridge_in(&node_dir())
+}
+
+/// `ensure_nodebridge` against an explicit dir (temp-HOME test seam).
+fn ensure_nodebridge_in(dir: &std::path::Path) -> anyhow::Result<PathBuf> {
     let dest = dir.join("nodebridge.js");
     // Independent checks: `||` would short-circuit and skip the shared
     // write exactly when the bridge itself is stale (observed live: new
     // bridge with requires, shared files missing, startup crash).
-    let bridge_stale = match std::fs::read_to_string(&dest) {
-        Ok(existing) => existing != NODEBRIDGE_SOURCE,
-        Err(_) => true,
-    };
-    let shared_stale = ensure_js_shared(&dir)?;
+    let bridge_stale = !file_matches(&dest, NODEBRIDGE_SOURCE);
+    let shared_stale = ensure_js_shared(dir)?;
     let stale = bridge_stale || shared_stale;
     if stale {
-        std::fs::create_dir_all(&dir)
+        std::fs::create_dir_all(dir)
             .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.to_string_lossy()))?;
         std::fs::write(&dest, NODEBRIDGE_SOURCE)
             .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", dest.to_string_lossy()))?;
@@ -380,17 +394,18 @@ pub fn browser_dir() -> PathBuf {
 /// The bridge itself runs on Node (shared provisioning); Chrome is the
 /// *target* and is never installed by us — see find_chrome().
 pub fn ensure_browserbridge() -> anyhow::Result<PathBuf> {
-    let dir = browser_dir();
+    ensure_browserbridge_in(&browser_dir())
+}
+
+/// `ensure_browserbridge` against an explicit dir (temp-HOME test seam).
+fn ensure_browserbridge_in(dir: &std::path::Path) -> anyhow::Result<PathBuf> {
     let dest = dir.join("browserbridge.js");
     // Same no-short-circuit rule as ensure_nodebridge (see above).
-    let bridge_stale = match std::fs::read_to_string(&dest) {
-        Ok(existing) => existing != BROWSERBRIDGE_SOURCE,
-        Err(_) => true,
-    };
-    let shared_stale = ensure_js_shared(&dir)?;
+    let bridge_stale = !file_matches(&dest, BROWSERBRIDGE_SOURCE);
+    let shared_stale = ensure_js_shared(dir)?;
     let stale = bridge_stale || shared_stale;
     if stale {
-        std::fs::create_dir_all(&dir)
+        std::fs::create_dir_all(dir)
             .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.to_string_lossy()))?;
         std::fs::write(&dest, BROWSERBRIDGE_SOURCE)
             .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", dest.to_string_lossy()))?;
@@ -426,6 +441,94 @@ pub fn find_chrome() -> Option<(String, String)> {
 mod tests {
     use super::*;
 
+    fn tmpdir(name: &str) -> PathBuf {
+        // Unique per test (Rust tests run in parallel): pid + name.
+        let dir = std::env::temp_dir().join(format!(
+            "agent-debugger-bridge-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Every contract fixture must parse (a malformed edit breaks all
+    /// three language consumers) and the CLI-side caps must equal the
+    /// frozen values (bridge-side totals live in py/node sources and are
+    /// asserted by their own fixture tests).
+    #[test]
+    fn contract_fixtures_match_cli_constants() {
+        for name in [
+            "timeout_prefix.json",
+            "breaks_echo.json",
+            "identity_caps.json",
+            "error_phases.json",
+            "close_status.json",
+        ] {
+            let text = std::fs::read_to_string(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests")
+                    .join("contract")
+                    .join(name),
+            )
+            .unwrap();
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert!(v.is_object(), "{name} must stay a flat JSON object");
+        }
+        let caps: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/contract/identity_caps.json")).unwrap();
+        assert_eq!(
+            crate::session::IDENTITY_FIELD_CAP,
+            caps["fieldCap"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            crate::session::IDENTITY_TOTAL_CAP,
+            caps["cliTotalCap"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            crate::session::CAUSE_CAP,
+            caps["causeCap"].as_u64().unwrap() as usize
+        );
+        assert_eq!(caps["redacted"].as_str().unwrap(), "[redacted]");
+    }
+
+    /// Marker completeness: every embedded source contributes at least one
+    /// expected class output, so a damaged classes dir (marker present,
+    /// some outputs deleted) still triggers a recompile. `BridgeModel.java`
+    /// provides `Config` (plus `ConfigBridgeException`); `BridgeProto.java`
+    /// provides `BridgeProto` (plus `StreamGobbler`). Update this test with
+    /// the source when adding classes.
+    #[test]
+    fn java_classes_cover_embedded_sources() {
+        // (source file, marker classes it must provide at least one of).
+        let provided: &[(&str, &[&str])] = &[
+            ("JdiBridge.java", &["JdiBridge"]),
+            ("BridgeModel.java", &["Config"]),
+            ("BridgeCli.java", &["BridgeCli"]),
+            ("BridgeConn.java", &["BridgeConn"]),
+            ("BridgeSnapshot.java", &["BridgeSnapshot"]),
+            ("BridgeSession.java", &["BridgeSession"]),
+            ("BridgeProto.java", &["BridgeProto", "StreamGobbler"]),
+            ("BridgeEval.java", &["BridgeEval"]),
+        ];
+        assert_eq!(
+            JAVA_SOURCES.len(),
+            provided.len(),
+            "embedded source set changed: update the provider table"
+        );
+        for (i, (name, _source)) in JAVA_SOURCES.iter().enumerate() {
+            assert_eq!(*name, provided[i].0, "embedded source order changed");
+            assert!(
+                provided[i].1.iter().any(|c| JAVA_CLASSES.contains(c)),
+                "embedded {name} provides no marker class"
+            );
+        }
+        for class in JAVA_CLASSES {
+            let owner = provided.iter().find(|(_, markers)| markers.contains(class));
+            assert!(owner.is_some(), "marker {class} maps to no embedded source");
+        }
+    }
+
     #[test]
     fn debugpy_install_uses_venv_interpreter_with_m_pip() {
         let (program, args) = debugpy_install_command();
@@ -440,5 +543,101 @@ mod tests {
             Some("bin")
         );
         assert_eq!(args, vec!["-m", "pip", "install", "debugpy"]);
+    }
+
+    #[test]
+    fn venv_paths_derive_from_adapter_dir_and_absent_interp_is_no_debugpy() {
+        // Path seam of `ensure_py` (which itself needs processes/network
+        // and stays untested): the venv interpreter is derived from the
+        // adapter dir, never the system PATH. A missing interpreter reads
+        // as "no debugpy" (the check the order logic branches on), never
+        // an error — this test pins the seam, not the order itself.
+        assert_eq!(
+            venv_python(),
+            python_dir().join("venv").join("bin").join("python")
+        );
+        // A missing interpreter is "no debugpy" (fallback proceeds),
+        // never an error: proves the order check degrades, not fails.
+        assert!(!has_debugpy("/nonexistent/agent-debugger-interp"));
+    }
+
+    #[test]
+    fn node_path_prepend_preserves_user_value() {
+        assert_eq!(prepend_node_path("/ws", None), "/ws");
+        assert_eq!(prepend_node_path("/ws", Some("")), "/ws");
+        assert_eq!(prepend_node_path("/ws", Some("/u/lib")), "/ws:/u/lib");
+    }
+
+    #[test]
+    fn stale_embedded_source_rewrites_once_then_stable() {
+        for (ensure, file, source) in [
+            (
+                ensure_pybridge_in as fn(&std::path::Path) -> anyhow::Result<PathBuf>,
+                "pybridge.py",
+                PYBRIDGE_SOURCE,
+            ),
+            (
+                ensure_nodebridge_in as fn(&std::path::Path) -> anyhow::Result<PathBuf>,
+                "nodebridge.js",
+                NODEBRIDGE_SOURCE,
+            ),
+            (
+                ensure_browserbridge_in as fn(&std::path::Path) -> anyhow::Result<PathBuf>,
+                "browserbridge.js",
+                BROWSERBRIDGE_SOURCE,
+            ),
+        ] {
+            let dir = tmpdir(file);
+            std::fs::write(dir.join(file), "// stale embedded copy").unwrap();
+            let dest = ensure(&dir).unwrap();
+            assert_eq!(std::fs::read_to_string(&dest).unwrap(), source);
+            // Second run converges: content identical, no error.
+            let dest2 = ensure(&dir).unwrap();
+            assert_eq!(dest, dest2);
+            assert_eq!(std::fs::read_to_string(&dest2).unwrap(), source);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn shared_js_never_short_circuits() {
+        // Fresh bridge + missing shared files: shared core is still
+        // written (the observed live crash was exactly this shape).
+        for (bridge_name, ensure, source) in [
+            (
+                "nodebridge.js",
+                ensure_nodebridge_in as fn(&std::path::Path) -> anyhow::Result<PathBuf>,
+                NODEBRIDGE_SOURCE,
+            ),
+            (
+                "browserbridge.js",
+                ensure_browserbridge_in as fn(&std::path::Path) -> anyhow::Result<PathBuf>,
+                BROWSERBRIDGE_SOURCE,
+            ),
+        ] {
+            let dir = tmpdir("shared-fresh");
+            std::fs::write(dir.join(bridge_name), source).unwrap();
+            ensure(&dir).unwrap();
+            for (name, source) in JS_SHARED {
+                assert_eq!(
+                    std::fs::read_to_string(dir.join(name)).unwrap(),
+                    *source,
+                    "shared {name} must be provisioned even when the bridge is fresh"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        // Stale bridge + missing shared: both converge in one call.
+        let dir = tmpdir("shared-stale");
+        std::fs::write(dir.join("nodebridge.js"), "// stale").unwrap();
+        ensure_nodebridge_in(&dir).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("nodebridge.js")).unwrap(),
+            NODEBRIDGE_SOURCE
+        );
+        for (name, source) in JS_SHARED {
+            assert_eq!(std::fs::read_to_string(dir.join(name)).unwrap(), *source);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,0 +1,9 @@
+{
+  "_note": "Frozen cross-language contract: every bridge reports wait/stop timeouts with this exact prefix. Additive waitContext travels alongside, never inside the message.",
+  "prefix": "timeout: no stop within",
+  "example": "timeout: no stop within 2s",
+  "waitContext": {
+    "triggerStatusValues": ["unknown"],
+    "captureStageValues": ["armed-wait", "armed-wait-timeout", "before-armed", "session-gone"]
+  }
+}

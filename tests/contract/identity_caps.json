@@ -1,0 +1,10 @@
+{
+  "_note": "Frozen cross-language contract: every layered targetIdentity string field caps at 512 chars with the … (+N more chars) suffix, secrets redact to [redacted], and no target env is ever collected. Aggregate caps are layer-local by pre-existing design (CLI caps the persisted hint, bridges cap the live object) and are recorded here, not unified.",
+  "fieldCap": 512,
+  "cliTotalCap": 2048,
+  "bridgeTotalCap": 4096,
+  "causeCap": 2048,
+  "redacted": "[redacted]",
+  "truncSuffixFormat": "… (+N more chars)",
+  "collectTargetEnv": false
+}

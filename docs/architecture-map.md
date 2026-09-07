@@ -276,14 +276,35 @@ line count" is never alone a justification.
 | Workers/targets | `cmd_targets_in` roster tests | `tests/worker_targets.test.js`, `tests/worker_break_records.test.js`, `tests/vars_frame.test.js` | `tests/test_m5_live.py` |
 | Java bridge | — | `javac` compile check: `bridge/java/src/*.java` + `tests/M4JavaCheck.java`, `M5JavaCheck.java`, `M6JavaCheck.java`, `M7JavaCheck.java`, `BJavaCheck.java`, `CJavaCheck.java` (compile only) | `tests/test_live.py` java adapter |
 | Review regressions | `cargo test` full | `tests/review_fixes.test.js` | `tests/test_live.py` (4 adapters, isolated `HOME`, installed binary `target/debug/agent-debugger`) |
+| Contract fixtures (frozen strings) | `bridge::tests::contract_fixtures_match_cli_constants` | `tests/contract_fixtures.test.js`, `tests/test_contract_fixtures.py` | — (fixtures only, no live) |
+| Provisioning (daemon-free) | `bridge::tests` (stale rewrite, shared-JS no-short-circuit, `NODE_PATH`, venv paths, `JAVA_CLASSES` markers) | — | `tests/_live_home.py` setup (symlink real venv/node_modules, never install) + `tests/test_live_home.py` |
 
 Latest matrices live in: `tests/breaks_concurrency_matrix.test.js` (+
 `tests/test_breaks_concurrency_matrix.py`), `tests/m5_concurrency.test.js` (+
 `tests/test_m5_live.py`), `tests/close_under_load.test.js` (+
-`tests/test_close_under_load.py`). Full gate before any release:
-`cargo test` + `cargo fmt --check` + `cargo build` + `python3
-tests/test_pybridge.py` + `node --test tests/*.test.js` + `javac` bridge check
-+ `python3 tests/test_live.py`.
+`tests/test_close_under_load.py`). Full gate before any release is the
+canonical runner `scripts/run_gates.sh` (the command list below is
+informative — the script is normative; do not copy this prose into new
+runners): unit = `cargo test` + `cargo fmt --check` + every
+`tests/test_*.py` except the three live suites (auto-discovered, sorted) +
+`node --test tests/*.test.js` + `javac` bridge/checks; live = `cargo build`
++ `tests/test_live.py` + `tests/test_m5_live.py` + `tests/test_ux_live.py`,
+with `TEST_LANG`/`SKIP_BROWSER` filters for live only.
+
+Shared test architecture (M2): `tests/contract/*.json` is the single source
+for frozen cross-language strings (consumed by
+`tests/test_contract_fixtures.py`, `tests/contract_fixtures.test.js`, and
+`src/bridge.rs` tests — no golden snapshots, no new dependency);
+provisioning is covered daemon-free by `src/bridge.rs` tests (stale rewrite,
+shared-JS no-short-circuit, `NODE_PATH` prepend, venv paths,
+`JAVA_CLASSES` marker completeness); concurrency matrices keep their local
+`threading.Barrier` / promise-barrier idioms (centralizing them would exceed
+the duplicated lines — no shared helper); `tests/_live_home.py` owns the
+isolated-`HOME` setup/cleanup + failure bundle for exactly the three
+class-level live files (`test_live`, `test_m5_live`, `test_ux_live`), with
+unit tests in `tests/test_live_home.py`; live failures print artifact paths
+(`bridge.log`/`session.json`/`error.json`/`stops.json`) plus a redacted
+`bridge.log` tail, never target env.
 
 ## 8. Refactor policy (triggers, not permission)
 
