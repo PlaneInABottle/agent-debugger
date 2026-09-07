@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo fmt check
+        run: cargo fmt --check
+
+      - name: Cargo test
+        run: cargo test
+
+      - name: Bridge owner gates
+        shell: bash
+        run: |
+          ./scripts/check_nodebridge_owners.sh
+          ./scripts/check_browserbridge_owners.sh
+          ./scripts/check_pybridge_owners.sh
+          ./scripts/check_java_owners.sh

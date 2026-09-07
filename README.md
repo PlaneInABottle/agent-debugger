@@ -36,15 +36,29 @@ Traditional debuggers are built for human eyes and interactive GUI IDEs. They re
 
 ## Installation
 
-### Prerequisites
-- [Rust toolchain](https://rustup.rs/) (1.89+ recommended for stable file locks; tested on 1.94+).
-- Installed runtime engines for the languages you want to debug:
-  - Python: `python3` (debugpy is automatically installed in an isolated cache).
-  - Node.js: `node` (Node 18+).
-  - Browser: Google Chrome or Chromium.
-  - Java: JDK (Java 17+ recommended) with `javac` and `java` on `PATH`.
+### 1. One-Line Install Script (macOS & Linux)
 
-### Build & Install from Source
+Downloads the pre-compiled binary matching your OS and architecture:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/PlaneInABottle/agent-debugger/master/install.sh | sh
+```
+
+### 2. Via NPM (No Rust Toolchain Required)
+
+Run instantly with `npx` or install globally via `npm`:
+
+```bash
+# Run instantly without global installation
+npx @planeinabottle/agent-debugger doctor
+
+# Or install globally as `agent-debugger`
+npm install -g @planeinabottle/agent-debugger
+```
+
+### 3. Build & Install from Source (Cargo)
+
+If you have Rust installed (1.89+):
 
 ```bash
 git clone https://github.com/PlaneInABottle/agent-debugger.git
@@ -52,14 +66,16 @@ cd agent-debugger
 cargo install --path .
 ```
 
-Verify your installation:
+### Environment Verification
+
+After installation, verify your environment readiness:
 
 ```bash
 agent-debugger --version
 agent-debugger doctor
 ```
 
-`agent-debugger doctor` inspects available system runtimes, tools, ports, and reports environment readiness.
+`agent-debugger doctor` checks available system runtimes (Python, Node.js, Java JDK, Google Chrome) and reports debugging readiness.
 
 ---
 

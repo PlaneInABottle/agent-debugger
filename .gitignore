@@ -4,3 +4,8 @@
 __pycache__/
 *.pyc
 examples/maven-demo/target/
+node_modules/
+bin/agent-debugger
+bin/agent-debugger.exe
+*.tgz
+

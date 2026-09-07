@@ -1,0 +1,42 @@
+{
+  "name": "@planeinabottle/agent-debugger",
+  "version": "0.2.0",
+  "description": "Headless, snapshot-first multi-language debugger for AI agents and terminal workflows",
+  "bin": {
+    "agent-debugger": "./bin/agent-debugger.js"
+  },
+  "scripts": {
+    "postinstall": "node ./scripts/postinstall.js"
+  },
+  "files": [
+    "bin/",
+    "scripts/postinstall.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "debugger",
+    "agent",
+    "headless",
+    "dap",
+    "cdp",
+    "ai-agent",
+    "python",
+    "node",
+    "java",
+    "browser"
+  ],
+  "author": "PlaneInABottle <mirza.altay@protonmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PlaneInABottle/agent-debugger.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PlaneInABottle/agent-debugger/issues"
+  },
+  "homepage": "https://github.com/PlaneInABottle/agent-debugger#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
