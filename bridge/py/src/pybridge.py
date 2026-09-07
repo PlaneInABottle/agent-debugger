@@ -873,6 +873,343 @@ def _serialized_gate(fn):
     return wrap
 
 
+# ---------------------------------------------------------------------------
+# M3 in-file state owners, narrow track (single-file MUST: src/bridge.rs
+# embeds this file via include_str!, so no physical split). Session stays
+# the sole runtime owner: it constructs exactly one TargetRegistry + one
+# ServerState, holds Session._gate (threading.RLock; order _gate ->
+# DapConn.mu, never reverse, no new locks anywhere), and orchestrates DAP
+# transport. Each owner holds its own mutable state and exposes a bounded
+# API plus a cheap assert_valid() invariant for tests. Breakpoint
+# bookkeeping and the stop/wait/capture machine stay Session-owned sections
+# (their state IS the swapped context / thread-local attribution — a
+# wrapper only added bypass; rejected, see architecture-map §6).
+# ---------------------------------------------------------------------------
+
+
+class TargetRegistry:
+    """Canonical owner of per-target lifecycle + the in-flight serving id.
+
+    Holds: live/ignored child table (tid -> ChildTarget), creation order,
+    every id ever issued (never reused), bounded exited history + eviction
+    counter, ignored/helpers lifetime counters, the deferred-attach staging
+    queue + single in-flight handshake flag, retired (failed-handshake)
+    sockets, and _serving (target id of the in-flight command).
+
+    Per-target park/break fields live on Session (main context) and each
+    ChildTarget; swap_fields() context-switches them. DAP IO stays Session
+    orchestration. Lock precondition: caller must hold Session._gate (all
+    methods are gate-serialized sections; none acquire locks, none do
+    socket/DAP IO — only a bounded stderr warn on overflow release, as
+    before). Invariant: order ⊆ table keys; seen ⊇ issued ids; serving is
+    "main" or a table key; exited history ≤ MAX_EXITED_HISTORY.
+    """
+
+    def __init__(self):
+        self.table = {}          # tid -> ChildTarget (live + ignored)
+        self.order = []          # creation order for roster listing
+        self.seen_ids = set()    # every id ever issued (no reuse)
+        self.exited_history = []  # bounded last-known entries (max 16)
+        self.ignored = 0         # released (over-budget) children, lifetime
+        self.helpers_released = 0  # spawn `-c` helpers, lifetime (no budget)
+        self.dropped_exited = 0  # exited-history evictions, lifetime
+        self.serving = "main"    # target id of the in-flight command
+        self.retired = []        # (tid, sock) failed handshakes, kept OPEN
+        self.attach_pending = []  # staged debugpyAttach events (bounded)
+        self.attach_busy = False  # single in-flight handshake flag
+
+    # -- roster reads (caller holds _gate) --
+
+    def live_targets(self):
+        """Live (non-exited) children in creation order."""
+        return [self.table[tid] for tid in self.order
+                if tid in self.table and not self.table[tid].exited]
+
+    def active_nonmain(self):
+        """Budgeted children: live, tracked (ignored releases stay in the
+        table with state ignored and never consume budget; helpers never
+        enter the table at all)."""
+        return [t for t in self.live_targets()
+                if t.state in ("running", "stopped")]
+
+    # -- target resolution (caller holds _gate) --
+
+    def resolve_inner(self, req, main_suspended, main_exited, main_seq):
+        """Which target a command serves: explicit id (validated), else the
+        most recently stopped live target, else main. IDs/errors/selection
+        semantics unchanged (moved verbatim from Session)."""
+        want = req.get("target") if isinstance(req, dict) else None
+        if want is None and isinstance(req, dict):
+            auto = req.get("_auto_target")
+            if auto is not None:
+                inner = dict(req)
+                inner["target"] = auto
+                del inner["_auto_target"]
+                return self.resolve_inner(inner, main_suspended,
+                                          main_exited, main_seq)
+        if want is not None:
+            if want == "main":
+                if main_exited:
+                    raise BridgeErr("target main has exited — close this session")
+                return "main"
+            t = self.table.get(want)
+            if t is None:
+                for e in self.exited_history:
+                    if e.get("id") == want:
+                        raise BridgeErr(
+                            f"target {want} has exited — close this session")
+                raise BridgeErr(f"unknown target: {want}")
+            if t.state == "ignored":
+                raise BridgeErr(f"target {want} was released (over budget)")
+            if t.exited or t.state == "exited":
+                raise BridgeErr(f"target {want} has exited — close this session")
+            return want
+        best, best_seq = "main", (main_seq if main_suspended else 0)
+        for t in self.live_targets():
+            if t.suspended and t.stop_seq > best_seq:
+                best, best_seq = t.id, t.stop_seq
+        if best == "main" and main_exited:
+            raise BridgeErr("target VM has exited — close this session")
+        return best
+
+    # -- target-local context switch (caller holds _gate via _TargetScope;
+    # DAP IO inside takes DapConn.mu: order _gate -> mu, never reverse) --
+
+    @staticmethod
+    def swap_fields(dst, src):
+        """Exchange park/DAP fields between main (Session) and a child."""
+        for f in ("dap", "thread_id", "frames", "suspended", "stop_info",
+                  "last_top", "last_func", "last_changed", "last_removed",
+                  "last_changed_complete", "last_change_tracking",
+                  "last_track_warn", "last_track_complete",
+                  "last_track_reason", "stop_states",
+                  "_hitkeys", "_awaiting_continued", "_suspects", "_co_seen",
+                  "_suspect_warned"):
+            dst_v, src_v = getattr(dst, f), getattr(src, f)
+            setattr(dst, f, src_v)
+            setattr(src, f, dst_v)
+
+    # -- lifecycle mutations (caller holds _gate) --
+
+    def note_exit(self, tid, last_stop=None):
+        """Move a live child to the bounded exited history (never reused).
+        The child's socket is closed here: only fully-established sessions
+        (attach drained) ever reach the table, and closing those is
+        adapter-contained; half-built sessions are never closed — they are
+        abandoned open (closing those kills the adapter process)."""
+        t = self.table.pop(tid, None)
+        if t is None:
+            return None
+        try:
+            self.order.remove(tid)
+        except ValueError:
+            pass
+        try:
+            if t.sock is not None:
+                t.sock.close()
+        except Exception:
+            pass
+        t.exited = True
+        t.state = "exited"
+        t.dap = None
+        t.sock = None
+        if last_stop is not None:
+            t.last_stop = last_stop
+        entry = {"id": t.id, "kind": "child", "pid": t.pid,
+                 "state": "exited", "lastStop": t.last_stop,
+                 "observed": t.observed,
+                 "scope": "target" if t.target_raws else "inherited"}
+        self.exited_history.append(entry)
+        while len(self.exited_history) > MAX_EXITED_HISTORY:
+            del self.exited_history[0]
+            self.dropped_exited += 1
+        return entry
+
+    def mark_ignored(self, tid, pid, why):
+        """Release without a connection: socket-less roster record (never
+        parked, never served), lifetime counter, bounded retention."""
+        child = ChildTarget(tid, pid, None, None,
+                            {"pid": pid, "source": "debugpy-subProcessId"})
+        child.exited = True
+        child.state = "ignored"
+        self.table[tid] = child
+        self.order.append(tid)
+        self.ignored += 1
+        self.evict_old_ignored()
+        sys.stderr.write(f"warn: child {tid} {why}: released\n")
+
+    def evict_old_ignored(self):
+        """Bound retained ignored entries (counters stay lifetime)."""
+        dropped = [tid for tid in self.order
+                   if (t := self.table.get(tid)) is not None
+                   and t.state == "ignored"]
+        while len(dropped) > MAX_IGNORED_RETAINED:
+            old = dropped.pop(0)
+            self.table.pop(old, None)
+            try:
+                self.order.remove(old)
+            except ValueError:
+                pass
+
+    def release_helper(self):
+        self.helpers_released += 1
+
+    # -- deferred child admission (caller holds _gate except the blocking
+    # private handshake between claim and commit, which touches only the
+    # private DapConn) --
+
+    def stage_attach(self, cfg, body):
+        """Fast admission: dedup + bounded enqueue, never IO. Queue overflow
+        marks the child ignored BEFORE any socket opens (same
+        bounded-ownership law as the retired-full path)."""
+        if not cfg.subprocess or cfg.kind != "launch":
+            return
+        if not isinstance(body, dict):
+            return
+        pid = body.get("subProcessId")
+        if isinstance(pid, bool) or not isinstance(pid, int):
+            return
+        tid = f"child:{pid}"
+        if tid in self.seen_ids:
+            return  # ids are never reused within a session
+        self.seen_ids.add(tid)
+        if len(self.attach_pending) >= MAX_PENDING_ATTACH:
+            self.mark_ignored(tid, pid, "attach queue full")
+            return
+        self.attach_pending.append((tid, pid, dict(body)))
+
+    def claim_drain(self):
+        """Single in-flight drainer claim (whichever pump staged/claimed —
+        no new threads)."""
+        if self.attach_busy or not self.attach_pending:
+            return False
+        self.attach_busy = True
+        return True
+
+    def pop_staged(self):
+        if not self.attach_pending:
+            return None
+        return self.attach_pending.pop(0)
+
+    def finish_drain(self):
+        self.attach_busy = False
+
+    def retired_full(self):
+        return len(self.retired) >= MAX_RETIRED_SOCKETS
+
+    def retire_socket(self, tid, sock):
+        self.retired.append((tid, sock))
+
+    def drain_retired(self):
+        """Take (and clear) retired sockets for teardown-time close only."""
+        out = self.retired
+        self.retired = []
+        return out
+
+    def pop_all(self):
+        """Take every roster entry for teardown (clears table + order)."""
+        out = [(tid, self.table.pop(tid)) for tid in list(self.order)
+               if tid in self.table]
+        self.order = [tid for tid in self.order if tid in self.table]
+        return out
+
+    def record_failed_handshake(self, tid, pid, observed):
+        """Bounded history for a handshake that never reached the roster
+        (socket already retired OPEN by the caller)."""
+        self.exited_history.append(
+            {"id": tid, "kind": "child", "pid": pid,
+             "state": "exited", "lastStop": None,
+             "observed": observed, "scope": "inherited"})
+        while len(self.exited_history) > MAX_EXITED_HISTORY:
+            del self.exited_history[0]
+            self.dropped_exited += 1
+
+    def commit_child(self, child, sock):
+        """Commit an established child (caller holds _gate). Returns
+        "attached", or closes the established session (adapter-contained)
+        and releases it when the claim-time budget no longer holds."""
+        if child.id in self.table \
+                or len(self.active_nonmain()) >= MAX_ACTIVE_NONMAIN:
+            # Defensive: the claim-time budget should still hold (only
+            # this drainer commits), but if it does not, the session is
+            # established, so an adapter-contained close + release keeps
+            # every bound exact.
+            try:
+                sock.close()
+            except Exception:
+                pass
+            self.mark_ignored(child.id, child.pid, "over budget")
+            return "ignored"
+        child.state = "running"
+        self.table[child.id] = child
+        self.order.append(child.id)
+        return "attached"
+
+    def assert_valid(self):
+        """Roster invariant: order ⊆ table; serving known; history bounded;
+        active roster within budget+ignored retention."""
+        assert all(tid in self.table for tid in self.order), \
+            "roster order references missing table entry"
+        assert len(self.table) == len(set(self.table)), \
+            "duplicate roster ids"
+        assert self.serving == "main" or self.serving in self.table, \
+            f"serving unknown target: {self.serving}"
+        assert len(self.exited_history) <= MAX_EXITED_HISTORY, \
+            "exited history over bound"
+        assert self.dropped_exited >= 0 and self.ignored >= 0 \
+            and self.helpers_released >= 0, "negative lifetime counter"
+        assert len(self.attach_pending) <= MAX_PENDING_ATTACH, \
+            "attach staging over bound"
+        assert len(self.retired) <= MAX_RETIRED_SOCKETS, \
+            "retired sockets over bound"
+        return True
+
+
+class ServerState:
+    """Canonical owner of framed-server admission + terminal close.
+
+    Holds: the live connection-handler count (bounded by
+    MAX_ACTIVE_HANDLERS) and the closing flag (terminal close accepted:
+    only further closes served). The overload single-winner rule lives
+    here: exactly one closer runs the teardown. No transport/protocol
+    extraction — just the counters. Lock precondition: caller must hold
+    Session._gate. Invariant: 0 <= active <= MAX_ACTIVE_HANDLERS.
+    """
+
+    def __init__(self):
+        self.active = 0       # live connection handlers (bounded)
+        self.closing = False  # close accepted: only further closes served
+
+    def try_admit(self, limit):
+        """Admit one handler when under the pool bound (caller holds _gate)."""
+        if self.active >= limit:
+            return False
+        self.active += 1
+        return True
+
+    def release(self):
+        """Drop one handler; never negative (close-cleanup-once backstop)."""
+        assert self.active > 0, "handler count would go negative"
+        self.active -= 1
+
+    def claim_close(self):
+        """Terminal-close single winner: first caller runs the teardown."""
+        mine = not self.closing
+        self.closing = True
+        return mine
+
+    def mark_closing(self):
+        self.closing = True
+
+    def is_closing(self):
+        return self.closing
+
+    def assert_valid(self):
+        assert 0 <= self.active <= MAX_ACTIVE_HANDLERS, \
+            "handler count outside pool bound"
+        return True
+
+
 class Session:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -902,6 +1239,11 @@ class Session:
         self.log_count = 0
         self.log_dropped = 0  # lifetime lines evicted by the log ring
         self.configured = False  # True once launch/attach handshake completes
+        # -- breakpoint transaction (Session-owned section, NOT an owner
+        # object: these lists ARE the per-target swapped context — the
+        # global pair lives here, each child's pair on its ChildTarget, and
+        # TargetRegistry.swap_fields exchanges them. A wrapper only added
+        # bypass; see architecture-map §6).
         self.stop_states = []  # arm-time records served by `breaks`
         # Match keys aligned with stop_states by index: ("break", abspath,
         # requested, bound) | ("logpoint", abspath, requested, bound) |
@@ -921,34 +1263,36 @@ class Session:
         self._suspects = []    # held pre-`continued` stopped events (bounded)
         self._co_seen = set()  # threadIds already attributed this park episode
         self._suspect_warned = False
-        # -- multi-target roster (M-T): main keeps its own fields above;
-        # children live in targets by opaque id (child:<pid>, never reused).
-        self.targets = {}        # tid -> ChildTarget (live + ignored)
-        self.target_order = []   # creation order for roster listing
-        self._seen_ids = set()   # every id ever issued (no reuse)
-        self.exited_targets = []  # bounded last-known entries (max 16)
-        self.ignored = 0         # released (over-budget) children, lifetime
-        self.helpers_released = 0  # spawn `-c` helpers, lifetime (no budget)
-        self.dropped_exited = 0  # exited-history evictions, lifetime
+        # -- stop/wait/capture attribution (Session-owned section, NOT an
+        # owner object: the park clock/diag/pending/outstanding ride the
+        # swapped context + thread-local pump attribution, so a wrapper only
+        # added bypass; see architecture-map §6).
         self._stop_seq = 0       # monotonic park clock for auto-select
         self._main_seq = 0       # seq of the main park (0 = never parked)
-        self._serving = "main"   # target id of the in-flight command
         self._pending_target = None  # resume-wait owner for error attribution
-        self._retired_sockets = []  # (tid, sock) failed handshakes, kept OPEN
-        # -- deferred child admission: staged debugpyAttach events (bounded)
-        # plus the single in-flight handshake flag. The drainer is whichever
-        # pump staged/claimed (no new threads); the handshake runs with the
-        # gate released so live reads stay prompt.
-        self._attach_pending = []
-        self._attach_busy = False
+        # -- M3 narrow owners (retained): TargetRegistry owns the roster
+        # lifecycle (table/order/seen/history/counters/serving/staging/
+        # retired) + resolve/swap/note/commit; ServerState owns the handler
+        # pool + terminal-close winner. Lock precondition for owner
+        # mutation: hold self._gate (order _gate -> DapConn.mu, never
+        # reverse; no new locks).
+        self.targets_reg = TargetRegistry()
+        self.server_state = ServerState()
+        # Same-object roster views for established tests/readers (no
+        # duplicate source: these ARE the registry's containers; item-level
+        # use only, never wholesale reassign — scalars/counters/serving stay
+        # on the registry and are read as targets_reg.X).
+        self.targets = self.targets_reg.table
+        self.target_order = self.targets_reg.order
+        self._seen_ids = self.targets_reg.seen_ids
+        self.exited_targets = self.targets_reg.exited_history
+        self._attach_pending = self.targets_reg.attach_pending
         # -- M5 concurrency: _gate serializes swapped-field sections and
         # event-dispatch mutations (never held across select/pump waits, so
         # live snapshot reads stay prompt). Per-connection DAP IO serializes
         # on each DapConn.mu; lock order is always _gate -> mu.
         self._gate = threading.RLock()
         self._outstanding = {}   # tid -> resume cmd (continue/step) in flight
-        self._active = 0         # live connection handlers (bounded)
-        self._closing = False    # close accepted: only further closes served
         self._park_local = threading.local()  # per-pump parked target id
         # -- stop diagnostics (UX batch): session-monotonic stop id plus the
         # previous park for same-location/same-thread diagnosis. Globals (not
@@ -966,18 +1310,32 @@ class Session:
         self._target_identity = None  # {"debuggee","endpoint","adapter"} or None
         self._identity_hint = ""     # debuggee-first one-liner for timeouts
 
-    # -- multi-target helpers
+    def assert_owners(self):
+        """Aggregate retained-owner invariants (tests; not a production scan)."""
+        self.targets_reg.assert_valid()
+        self.server_state.assert_valid()
+        return True
+
+    # (M3 narrow: no compatibility properties — roster views live in
+    # __init__ as same-object aliases; scalars/counters/serving route
+    # through targets_reg / server_state directly.)
+
+    # === Section: target registry + swap (owner: TargetRegistry) ===
+    # Roster/history/admission/retired lifecycle + resolve/swap entry points
+    # below route into Session.targets_reg. Same-object views (targets,
+    # target_order, _seen_ids, exited_targets, _attach_pending) exist for
+    # established readers; scalars/counters/serving use targets_reg.X.
+    # -- multi-target helpers (canonical state: TargetRegistry) --
 
     def live_targets(self):
         """Live (non-exited) children in creation order."""
-        return [self.targets[tid] for tid in self.target_order
-                if tid in self.targets and not self.targets[tid].exited]
+        return self.targets_reg.live_targets()
 
     def active_nonmain(self):
         """Budgeted children: live, tracked (ignored releases stay in the
         table with state ignored and never consume budget; helpers never
         enter the table at all)."""
-        return [t for t in self.live_targets() if t.state in ("running", "stopped")]
+        return self.targets_reg.active_nonmain()
 
     def resolve_target(self, req):
         """Which target a command serves: explicit id (validated), else the
@@ -988,77 +1346,49 @@ class Session:
             return self._resolve_target_inner(req)
 
     def _resolve_target_inner(self, req):
-        want = req.get("target") if isinstance(req, dict) else None
-        if want is None and isinstance(req, dict):
-            auto = req.get("_auto_target")
-            if auto is not None:
-                inner = dict(req)
-                inner["target"] = auto
-                del inner["_auto_target"]
-                return self._resolve_target_inner(inner)
-        if want is not None:
-            if want == "main":
-                if self.exited:
-                    raise BridgeErr("target main has exited — close this session")
-                return "main"
-            t = self.targets.get(want)
-            if t is None:
-                for e in self.exited_targets:
-                    if e.get("id") == want:
-                        raise BridgeErr(
-                            f"target {want} has exited — close this session")
-                raise BridgeErr(f"unknown target: {want}")
-            if t.state == "ignored":
-                raise BridgeErr(f"target {want} was released (over budget)")
-            if t.exited or t.state == "exited":
-                raise BridgeErr(f"target {want} has exited — close this session")
-            return want
-        best, best_seq = "main", (self._main_seq if self.suspended else 0)
-        for t in self.live_targets():
-            if t.suspended and t.stop_seq > best_seq:
-                best, best_seq = t.id, t.stop_seq
-        if best == "main" and self.exited:
-            raise BridgeErr("target VM has exited — close this session")
-        return best
+        # Canonical roster state lives in TargetRegistry; the main park
+        # clock stays a plain Session field (swapped-context semantics).
+        # This stays the orchestration entry (callers hold _gate via
+        # resolve_target/dispatch).
+        return self.targets_reg.resolve_inner(req, self.suspended,
+                                              self.exited,
+                                              self._main_seq)
 
     def _swap_fields(self, dst, src):
-        """Exchange park/DAP fields between main (self) and a child."""
-        for f in ("dap", "thread_id", "frames", "suspended", "stop_info",
-                  "last_top", "last_func", "last_changed", "last_removed",
-                  "last_changed_complete", "last_change_tracking",
-                  "last_track_warn", "last_track_complete",
-                  "last_track_reason", "stop_states",
-                  "_hitkeys", "_awaiting_continued", "_suspects", "_co_seen",
-                  "_suspect_warned"):
-            dst_v, src_v = getattr(dst, f), getattr(src, f)
-            setattr(dst, f, src_v)
-            setattr(src, f, dst_v)
+        """Exchange park/DAP fields between main (self) and a child
+        (canonical op: TargetRegistry.swap_fields)."""
+        TargetRegistry.swap_fields(dst, src)
 
     class _TargetScope:
         """Serve one command against a child using the main code paths.
         The scope holds Session._gate for its duration (M5: concurrent
         handlers must never swap shared park fields under each other);
         DAP IO inside takes DapConn.mu (order _gate -> mu, never reverse).
-        Restores main state afterwards."""
+        The child ref is captured on entry so exit ALWAYS restores the
+        main context — even when the child was removed mid-command (its
+        exit already snapshotted history; the removal stands, the child is
+        never resurrected)."""
 
         def __init__(self, session, tid):
             self.session = session
             self.tid = tid
+            self._child = None
 
         def __enter__(self):
             st = self.session
             st._gate.acquire()
-            st._serving = self.tid
+            st.targets_reg.serving = self.tid
             if self.tid != "main":
-                st._swap_fields(st, st.targets[self.tid])
+                self._child = st.targets[self.tid]
+                st._swap_fields(st, self._child)
             return self
 
         def __exit__(self, *exc):
             st = self.session
             try:
-                if self.tid != "main" and self.tid in st.targets:
-                    st._swap_fields(st, st.targets[self.tid])
-                st._serving = "main"
+                if self._child is not None:
+                    st._swap_fields(st, self._child)
+                st.targets_reg.serving = "main"
             finally:
                 st._gate.release()
             return False
@@ -1095,47 +1425,18 @@ class Session:
             entries.extend(self.exited_targets)
             resp = {"ok": True, "targets": entries,
                     "selected": self._resolve_target_inner({}),
-                    "ignored": self.ignored,
-                    "helpersReleased": self.helpers_released,
-                    "droppedExited": self.dropped_exited,
+                    "ignored": self.targets_reg.ignored,
+                    "helpersReleased": self.targets_reg.helpers_released,
+                    "droppedExited": self.targets_reg.dropped_exited,
                     "targetIdentity": (self._target_identity
                                        if isinstance(self._target_identity, dict)
                                        else None)}
             return self.stamp(resp, "main")
 
     def _note_exit(self, tid, last_stop=None):
-        """Move a live child to the bounded exited history (never reused).
-        The child's socket is closed here: only fully-established sessions
-        (attach drained) ever reach the table, and closing those is
-        adapter-contained (Session[2] precedent); half-built sessions are
-        never closed — they are abandoned open (closing those kills the
-        adapter process, probe-verified)."""
-        t = self.targets.pop(tid, None)
-        if t is None:
-            return
-        try:
-            self.target_order.remove(tid)
-        except ValueError:
-            pass
-        try:
-            if t.sock is not None:
-                t.sock.close()
-        except Exception:
-            pass
-        t.exited = True
-        t.state = "exited"
-        t.dap = None
-        t.sock = None
-        if last_stop is not None:
-            t.last_stop = last_stop
-        entry = {"id": t.id, "kind": "child", "pid": t.pid,
-                 "state": "exited", "lastStop": t.last_stop,
-                 "observed": t.observed,
-                 "scope": "target" if t.target_raws else "inherited"}
-        self.exited_targets.append(entry)
-        while len(self.exited_targets) > MAX_EXITED_HISTORY:
-            del self.exited_targets[0]
-            self.dropped_exited += 1
+        """Move a live child to the bounded exited history (canonical state:
+        TargetRegistry.note_exit; socket/close semantics unchanged)."""
+        return self.targets_reg.note_exit(tid, last_stop)
 
     def dap_request(self, command, args=None, timeout=30, semantic=False):
         try:
@@ -1747,7 +2048,7 @@ class Session:
         builds it). Child target parks/resumes never rewrite the
         main-focused file: the per-target last stop lives in the roster
         served by `targets`."""
-        eff = target if target is not None else self._serving
+        eff = target if target is not None else self.targets_reg.serving
         if eff != "main":
             if stopped and self.frames:
                 try:
@@ -2240,24 +2541,8 @@ class Session:
         self._drain_attach_chain()
 
     def _stage_attach(self, body):
-        """Fast admission under _gate: dedup + bounded enqueue, never IO.
-        Queue overflow marks the child ignored BEFORE any socket opens
-        (same bounded-ownership law as the retired-full path)."""
-        if not self.cfg.subprocess or self.cfg.kind != "launch":
-            return
-        if not isinstance(body, dict):
-            return
-        pid = body.get("subProcessId")
-        if isinstance(pid, bool) or not isinstance(pid, int):
-            return
-        tid = f"child:{pid}"
-        if tid in self._seen_ids:
-            return  # ids are never reused within a session
-        self._seen_ids.add(tid)
-        if len(self._attach_pending) >= MAX_PENDING_ATTACH:
-            self._mark_ignored(tid, pid, "attach queue full")
-            return
-        self._attach_pending.append((tid, pid, dict(body)))
+        """Fast admission (canonical state: TargetRegistry.stage_attach)."""
+        self.targets_reg.stage_attach(self.cfg, body)
 
     def _drain_attach_chain(self):
         """Run staged handshakes with the gate RELEASED (single in-flight
@@ -2265,26 +2550,29 @@ class Session:
         beyond the bounded staging list). Each claim/commit is a short gate
         section; the blocking private handshake between them is not. One
         reader per private DapConn holds: the drainer owns it until commit,
-        since uncommitted sessions are invisible to _live_conns."""
+        since uncommitted sessions are invisible to _live_conns. Staging
+        state is canonical in TargetRegistry; the phase snapshot comes from
+        the inline claim-time tuple below."""
         with self._gate:
-            if self._attach_busy or not self._attach_pending:
+            if not self.targets_reg.claim_drain():
                 return
-            self._attach_busy = True
         try:
             while True:
                 with self._gate:
-                    if not self._attach_pending:
+                    nxt = self.targets_reg.pop_staged()
+                    if nxt is None:
                         return
-                    tid, pid, body = self._attach_pending.pop(0)
-                    if len(self._retired_sockets) >= MAX_RETIRED_SOCKETS:
+                    tid, pid, body = nxt
+                    if self.targets_reg.retired_full():
                         # Retired (failed-handshake) ownership is full and
                         # nothing may be closed mid-session: mark ignored
                         # BEFORE opening. Only reachable after 16
                         # consecutive handshake failures (adapter failure
                         # mode); documented residual hang risk there.
-                        self._mark_ignored(tid, pid, "retired ownership full")
+                        self.targets_reg.mark_ignored(
+                            tid, pid, "retired ownership full")
                         continue
-                    over = len(self.active_nonmain()) >= MAX_ACTIVE_NONMAIN
+                    over = len(self.targets_reg.active_nonmain()) >= MAX_ACTIVE_NONMAIN
                     # Phase snapshot under lock: the arm below runs outside
                     # the gate against the private connection only, so it
                     # must not touch shared config/state afterwards.
@@ -2295,7 +2583,7 @@ class Session:
                                  tid, pid, body, snap)
         finally:
             with self._gate:
-                self._attach_busy = False
+                self.targets_reg.finish_drain()
 
     def _run_attach(self, kind, tid, pid, body, snap):
         """One child handshake outside _gate. Never raises (a backstop warn
@@ -2308,7 +2596,7 @@ class Session:
                 # so it is never suspended pending configuration — it runs
                 # free and exits on its own (every mp run verifies this).
                 with self._gate:
-                    self.helpers_released += 1
+                    self.targets_reg.release_helper()
                 sys.stderr.write(
                     f"warn: released spawn helper for {tid} (no budget used)\n")
                 return
@@ -2425,34 +2713,16 @@ class Session:
                 except Exception:
                     pass
             with self._gate:
-                self._retired_sockets.append((tid, sock))
+                self.targets_reg.retire_socket(tid, sock)
             sys.stderr.write(f"warn: child {tid} handshake failed: {e}\n")
             with self._gate:
-                self.exited_targets.append(
-                    {"id": tid, "kind": "child", "pid": pid,
-                     "state": "exited", "lastStop": None,
-                     "observed": child.observed, "scope": "inherited"})
-                while len(self.exited_targets) > MAX_EXITED_HISTORY:
-                    del self.exited_targets[0]
-                    self.dropped_exited += 1
+                self.targets_reg.record_failed_handshake(
+                    tid, pid, child.observed)
             return
         with self._gate:
-            if (tid in self.targets
-                    or len(self.active_nonmain()) >= MAX_ACTIVE_NONMAIN):
-                # Defensive: the claim-time budget should still hold (only
-                # this drainer commits), but if it does not, the session is
-                # established, so an adapter-contained close + release keeps
-                # every bound exact.
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-                self._mark_ignored(tid, pid, "over budget")
-                return
-            child.state = "running"
-            self.targets[tid] = child
-            self.target_order.append(tid)
-        sys.stderr.write(f"target: {tid} attached (pid {pid})\n")
+            outcome = self.targets_reg.commit_child(child, sock)
+        if outcome == "attached":
+            sys.stderr.write(f"target: {tid} attached (pid {pid})\n")
 
     def _run_minimal_attach(self, tid, pid, body):
         """Over-budget release outside _gate: full minimal handshake
@@ -2484,52 +2754,26 @@ class Session:
                 except Exception:
                     pass
             with self._gate:
-                self._retired_sockets.append((tid, sock))
+                self.targets_reg.retire_socket(tid, sock)
             sys.stderr.write(f"warn: child {tid} release failed: {e}\n")
             with self._gate:
-                self.exited_targets.append(
-                    {"id": tid, "kind": "child", "pid": pid,
-                     "state": "exited", "lastStop": None,
-                     "observed": {"pid": pid, "source": "debugpy-subProcessId"},
-                     "scope": "inherited"})
-                while len(self.exited_targets) > MAX_EXITED_HISTORY:
-                    del self.exited_targets[0]
-                    self.dropped_exited += 1
+                self.targets_reg.record_failed_handshake(
+                    tid, pid, {"pid": pid, "source": "debugpy-subProcessId"})
             return
         try:
             sock.close()
         except Exception:
             pass
         with self._gate:
-            self._mark_ignored(tid, pid, "over budget")
+            self.targets_reg.mark_ignored(tid, pid, "over budget")
 
     def _mark_ignored(self, tid, pid, why):
-        """Release without a connection: socket-less roster record (never
-        parked, never served), lifetime counter, bounded retention."""
-        child = ChildTarget(tid, pid, None, None,
-                            {"pid": pid, "source": "debugpy-subProcessId"})
-        child.exited = True
-        child.state = "ignored"
-        self.targets[tid] = child
-        self.target_order.append(tid)
-        self.ignored += 1
-        self._evict_old_ignored()
-        sys.stderr.write(f"warn: child {tid} {why}: released\n")
+        """Release without a connection (canonical state: TargetRegistry)."""
+        self.targets_reg.mark_ignored(tid, pid, why)
 
     def _evict_old_ignored(self):
-        """Bound retained ignored entries (counters stay lifetime)."""
-        kept, dropped = [], []
-        for tid in self.target_order:
-            t = self.targets.get(tid)
-            if t is not None and t.state == "ignored":
-                dropped.append(tid)
-        while len(dropped) > MAX_IGNORED_RETAINED:
-            old = dropped.pop(0)
-            self.targets.pop(old, None)
-            try:
-                self.target_order.remove(old)
-            except ValueError:
-                pass
+        """Bound retained ignored entries (canonical: TargetRegistry)."""
+        self.targets_reg.evict_old_ignored()
 
     def _apply_verification(self, rec, got, requested, is_logpoint):
         """Fold one setBreakpoints answer into a record. Returns the bound
@@ -2565,6 +2809,11 @@ class Session:
             del rec["detail"]
         return requested
 
+    # === Section: breakpoint store + transaction (Session-owned) ===
+    # No owner object here by design (M3 review): the records/keys ARE the
+    # per-target swapped context (global pair on Session, copies on each
+    # ChildTarget), so a wrapper only added bypass. Serialization stays
+    # Session._gate + @_serialized_gate; DAP arming stays orchestration.
     def arm_breakpoints(self):
         # Entry point (startup + tests): arms the global intent on the
         # current DAP connection. Child inherits reuse _arm_global through
@@ -2660,6 +2909,11 @@ class Session:
                 {"spec": "exc", "kind": "exc", "state": "armed", "hits": 0})
             self._hitkeys.append(("exc",))
 
+    # === Section: stop/wait/capture machine (Session-owned) ===
+    # No owner object here by design (M3 review): the park clock, diag,
+    # pending/outstanding attribution ride the swapped context + the
+    # thread-local pump id, so a wrapper only added bypass. Freshness gate,
+    # timeout prefix, waitContext and captureStage schemas unchanged.
     def _live_conns(self):
         """All readable DAP sessions: main first, then live children. One
         reader (this thread) per connection — never a thread per target."""
@@ -3002,7 +3256,7 @@ class Session:
         main-focused (child parks skip the session.json rewrite). The park
         is also recorded thread-locally (M5) so concurrent resume pumps on
         different handler threads attribute their own stop exactly."""
-        eff = target if target is not None else self._serving
+        eff = target if target is not None else self.targets_reg.serving
         self.thread_id = tid
         self.suspended = True
         self.frames = []
@@ -3272,7 +3526,7 @@ class Session:
                 "location": self.location_json(),
                 "threads": threads,
                 "frames": self.frames_json(True),
-                "diag": self._stop_diag(self._serving, threads),
+                "diag": self._stop_diag(self.targets_reg.serving, threads),
                 "warning": PARK_WARNING}
 
     def cmd_stack(self):
@@ -4370,6 +4624,8 @@ class Session:
                             spec += f"|{c}"
                         rec = {"spec": spec, "kind": "break", "hits": 0}
                         bound = self._refresh_rec(rec, got, False, ln)
+                        # Child-swapped context (inside _TargetScope): these
+                        # are the target's own lists, not the global store.
                         self.stop_states.append(rec)
                         self._hitkeys.append(("break", path, ln, bound))
                         t.inherited_keys.add(key)
@@ -4463,6 +4719,8 @@ class Session:
                         spec += f"|{c}"
                     rec = {"spec": spec, "kind": "break", "hits": 0}
                     bound = self._refresh_rec(rec, got, False, ln)
+                    # Child-swapped context (inside _TargetScope): the
+                    # target's own lists plus its ephemeral raw map.
                     self.stop_states.append(rec)
                     self._hitkeys.append(("break", path, ln, bound))
                     t.target_raws[(path, ln, c)] = r
@@ -4611,6 +4869,8 @@ class Session:
                 for key in items:
                     stored_raw = t.target_raws.pop(key, "") or self.cfg.break_raws.get(key, "")
                     t.inherited_keys.discard(key)
+                    # Child-swapped context (inside _TargetScope): the
+                    # target's own aligned pair, not the global store.
                     for i, hk in enumerate(list(self._hitkeys)):
                         if (hk[0] == "break" and len(hk) >= 3
                                 and hk[1] == key[0] and hk[2] == key[1]):
@@ -4882,7 +5142,7 @@ class Session:
                 "dropped": dropped, "lines": lines[-tail:]}
 
     def require_stopped(self):
-        if self._serving == "main" and self.main_exited:
+        if self.targets_reg.serving == "main" and self.main_exited:
             raise BridgeErr("target main has exited — close this session")
         if self.exited:
             raise BridgeErr("target VM has exited — close this session")
@@ -4894,7 +5154,7 @@ class Session:
                 raise BridgeErr("target stopped but stack is unavailable; retry context or continue")
 
     def require_live(self):
-        if self._serving == "main" and self.main_exited:
+        if self.targets_reg.serving == "main" and self.main_exited:
             raise BridgeErr("target main has exited — close this session")
         if self.exited:
             raise BridgeErr("target VM has exited — close this session")
@@ -4976,7 +5236,7 @@ class Session:
                 req = dict(req)
                 req["_auto_target"] = auto
         with self._gate:
-            if self._closing:
+            if self.server_state.is_closing():
                 raise BridgeErr("session is closing")
             check_tid = None
             if cmd in RESUME_CMDS or cmd in WAIT_CMDS or cmd in CAPTURE_CMDS \
@@ -5034,27 +5294,30 @@ class Session:
                     if self._outstanding.get(resume_tid) == cmd:
                         del self._outstanding[resume_tid]
 
+    # === Section: framed server + terminal close (owner: ServerState) ===
+    # Handler pool + close-winner counters live in Session.server_state and
+    # are touched only via try_admit/release/claim_close/is_closing
+    # (production + tests; no raw bypass). MAX_THREADS=8 single _gate.
     def cleanup(self):
         # Retired (failed-handshake) sockets first: they are closed ONLY
         # here, at overall teardown — never mid-session (never-close-live
         # debugpy law). Then live table sockets (fully established, so
         # contained), then the parent terminate which reaps the tree.
-        for _tid, sock in self._retired_sockets:
+        # Roster/retired state is canonical in TargetRegistry.
+        for _tid, sock in self.targets_reg.drain_retired():
             try:
                 if sock is not None:
                     sock.close()
             except Exception:
                 pass
-        self._retired_sockets = []
         # Child sessions next: raw close only, and only here at teardown.
         # (A DAP disconnect would finalize the shared adapter session
         # before the parent's terminate below; raw closes of
         # fully-established sessions are adapter-contained, while the
-        # parent terminate reaps the whole tree on launch anyway.)
-        for tid in list(self.target_order):
-            t = self.targets.pop(tid, None)
-            if t is None:
-                continue
+        # parent terminate reaps the whole tree on launch anyway.
+        # drain_retired cleared the retired list above; pop_all clears the
+        # roster — both canonical in TargetRegistry.)
+        for _tid, t in self.targets_reg.pop_all():
             try:
                 if t.sock is not None:
                     t.sock.close()
@@ -5394,10 +5657,10 @@ def _close_from_conn(st, conn):
     """Terminal close handling for one connection, outside the handler
     pool: every close gets the closed ACK; exactly one winner runs the
     teardown (launch kills its tree, attach detaches). The pool counter
-    is untouched (the overload path never counted)."""
+    is untouched (the overload path never counted). Single-winner state
+    is canonical in ServerState.claim_close (under Session._gate)."""
     with st._gate:
-        mine = not st._closing
-        st._closing = True
+        mine = st.server_state.claim_close()
     try_write_frame(conn, {"ok": True, "closed": True, "target": "main"})
     if not mine:
         try:
@@ -5460,7 +5723,7 @@ def _handle_one(st, conn):
         try:
             resp = st.dispatch(req)
             if isinstance(resp, dict) and "target" not in resp:
-                resp["target"] = getattr(st, "_serving", "main")
+                resp["target"] = st.targets_reg.serving
             try:
                 write_frame(conn, resp)
             except Exception:
@@ -5488,7 +5751,7 @@ def _handle_one(st, conn):
         except Exception:
             pass
         with st._gate:
-            st._active -= 1
+            st.server_state.release()
 
 
 def serve(st, server, nonce):
@@ -5506,14 +5769,14 @@ def serve(st, server, nonce):
         # Abandoned (dir rm'd or respawned under our name)? Quit quietly.
         if not am_owner(st.cfg.dir, nonce):
             with st._gate:
-                st._closing = True
+                st.server_state.mark_closing()
             try:
                 st.cleanup()
             except Exception:
                 pass
             return
         with st._gate:
-            if st._closing:
+            if st.server_state.is_closing():
                 return
             outstanding = bool(st._outstanding)
         if not outstanding:
@@ -5525,15 +5788,13 @@ def serve(st, server, nonce):
         except OSError:
             return
         with st._gate:
-            if st._closing:
+            if st.server_state.is_closing():
                 try:
                     conn.close()
                 except Exception:
                     pass
                 return
-            overloaded = st._active >= MAX_ACTIVE_HANDLERS
-            if not overloaded:
-                st._active += 1
+            overloaded = not st.server_state.try_admit(MAX_ACTIVE_HANDLERS)
         if overloaded:
             # Pool-full bypass outside the gate (the frame read below is
             # bounded by the framing deadline — never an unbounded wait

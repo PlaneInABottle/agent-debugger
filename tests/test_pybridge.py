@@ -1284,7 +1284,7 @@ class BridgeTests(unittest.TestCase):
                 self.fake_child(st, pid)
                 st._note_exit(f"child:{pid}")
             self.assertEqual(len(st.exited_targets), bridge.MAX_EXITED_HISTORY)
-            self.assertEqual(st.dropped_exited, 20 - bridge.MAX_EXITED_HISTORY)
+            self.assertEqual(st.targets_reg.dropped_exited, 20 - bridge.MAX_EXITED_HISTORY)
             ids = [e["id"] for e in st.exited_targets]
             self.assertNotIn("child:0", ids)  # oldest evicted first
 
@@ -1298,7 +1298,7 @@ class BridgeTests(unittest.TestCase):
                 self.fake_child(st, pid)
                 st._note_exit(f"child:{pid}")
             self.assertEqual(len(st.exited_targets), bridge.MAX_EXITED_HISTORY)
-            self.assertEqual(st.dropped_exited, 20 - bridge.MAX_EXITED_HISTORY)
+            self.assertEqual(st.targets_reg.dropped_exited, 20 - bridge.MAX_EXITED_HISTORY)
             self.assertEqual(st.target_order, [])
             self.assertEqual(st.live_targets(), [])
             self.assertEqual(st.active_nonmain(), [])
@@ -1466,7 +1466,7 @@ class BridgeTests(unittest.TestCase):
                 "python -X frozen_modules=off -c import pydevd; "
                 "from multiprocessing.resource_tracker import main;main(4)"))
             st._accept_child({"subProcessId": 4242, "connect": {}})
-            self.assertEqual(st.helpers_released, 1)
+            self.assertEqual(st.targets_reg.helpers_released, 1)
             self.assertEqual(st.targets, {})
             self.assertIn("child:4242", st._seen_ids)
 
@@ -1522,12 +1522,12 @@ class BridgeTests(unittest.TestCase):
             self.assertNotIn("setBreakpoints", calls)
             # Established close happened; ignored record is socket-less.
             sock.close.assert_called_once_with()
-            self.assertEqual(st.ignored, 1)
+            self.assertEqual(st.targets_reg.ignored, 1)
             t = st.targets["child:999"]
             self.assertEqual(t.state, "ignored")
             self.assertIsNone(t.dap)
             self.assertIsNone(t.sock)
-            self.assertEqual(st._retired_sockets, [])
+            self.assertEqual(st.targets_reg.retired, [])
             with self.assertRaises(bridge.BridgeErr) as cm:
                 st.resolve_target({"target": "child:999"})
             self.assertIn("released", str(cm.exception))
@@ -1565,9 +1565,9 @@ class BridgeTests(unittest.TestCase):
                         st._accept_child({"subProcessId": pid, "connect": {}})
             # Bounded ownership: exactly MAX opens, rest ignored pre-connect.
             self.assertEqual(len(opened), bridge.MAX_RETIRED_SOCKETS)
-            self.assertEqual(len(st._retired_sockets), bridge.MAX_RETIRED_SOCKETS)
-            self.assertEqual(st.ignored, total - bridge.MAX_RETIRED_SOCKETS)
-            for _tid, sock in st._retired_sockets:
+            self.assertEqual(len(st.targets_reg.retired), bridge.MAX_RETIRED_SOCKETS)
+            self.assertEqual(st.targets_reg.ignored, total - bridge.MAX_RETIRED_SOCKETS)
+            for _tid, sock in st.targets_reg.retired:
                 sock.close.assert_not_called()
             # No live tracked targets (only socket-less ignored records),
             # bounded exited history from the failures.
@@ -1580,7 +1580,7 @@ class BridgeTests(unittest.TestCase):
             st.adapter = None
             st.dap = None
             st.cleanup()
-            self.assertEqual(st._retired_sockets, [])
+            self.assertEqual(st.targets_reg.retired, [])
             for sock in opened:
                 sock.close.assert_called_once_with()
 
@@ -1589,12 +1589,12 @@ class BridgeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             st = self.target_session(tmp)
             st._child_cmdline = Mock(return_value="/usr/bin/python3 /app/w.py")
-            st._retired_sockets = [("child:1", Mock())
+            st.targets_reg.retired = [("child:1", Mock())
                                    for _ in range(bridge.MAX_RETIRED_SOCKETS)]
             with patch.object(bridge.socket, "create_connection") as cc:
                 st._accept_child({"subProcessId": 777, "connect": {}})
                 cc.assert_not_called()
-            self.assertEqual(st.ignored, 1)
+            self.assertEqual(st.targets_reg.ignored, 1)
             self.assertIn("child:777", st._seen_ids)
 
     def test_every_response_carries_target(self):
@@ -2158,11 +2158,11 @@ class BridgeTests(unittest.TestCase):
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 with st._gate:
-                    if st._active >= 8:
+                    if st.server_state.active >= 8:
                         break
                 time.sleep(0.02)
             with st._gate:
-                self.assertEqual(st._active, 8)
+                self.assertEqual(st.server_state.active, 8)
             t0 = time.monotonic()
             resp = self.client_roundtrip(port, {"cmd": "noop"})
             self.assertLess(time.monotonic() - t0, 3.0)
@@ -2195,7 +2195,7 @@ class BridgeTests(unittest.TestCase):
                 return {"ok": True}
             st.dispatch = fake_dispatch
             srv, cli = socket.socketpair()
-            st._active = 1  # serve() owns the increment; direct _handle_one
+            self.assertTrue(st.server_state.try_admit(bridge.MAX_ACTIVE_HANDLERS))  # serve() owns the increment; direct _handle_one
             t = threading.Thread(target=bridge._handle_one, args=(st, srv),
                                  daemon=True)
             t.start()
@@ -2206,7 +2206,7 @@ class BridgeTests(unittest.TestCase):
             t.join(5)
             self.assertFalse(t.is_alive())
             with st._gate:
-                self.assertEqual(st._active, 0)
+                self.assertEqual(st.server_state.active, 0)
 
 
 class TargetIdentityTests(unittest.TestCase):
@@ -2400,7 +2400,7 @@ class TargetIdentityTests(unittest.TestCase):
         ctx = {"waitStartedAt": 1, "waitedMs": 2, "triggerStatus": "unknown",
                "targetIdentity": None, "note": bridge.WAIT_NOTE}
         st.dispatch = Mock(side_effect=bridge.StopTimeout("timeout: no stop within 2s", ctx))
-        st._active = 1
+        self.assertTrue(st.server_state.try_admit(bridge.MAX_ACTIVE_HANDLERS))
         t = threading.Thread(target=bridge._handle_one, args=(st, left), daemon=True)
         t.start()
         bridge.write_frame(right, {"cmd": "wait", "timeout": 2})

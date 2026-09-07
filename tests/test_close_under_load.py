@@ -74,11 +74,11 @@ class CloseUnderLoadTests(unittest.TestCase):
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 with st._gate:
-                    if st._active >= 8:
+                    if st.server_state.active >= 8:
                         break
                 time.sleep(0.02)
             with st._gate:
-                self.assertEqual(st._active, 8)
+                self.assertEqual(st.server_state.active, 8)
             # Ninth ordinary command: existing overloaded rejection, fast.
             t0 = time.monotonic()
             ninth = client_roundtrip(port, {"cmd": "threads"})
@@ -87,15 +87,15 @@ class CloseUnderLoadTests(unittest.TestCase):
             self.assertIn("overloaded", ninth["error"])
             self.assertEqual(ninth.get("target"), "main")
             with st._gate:
-                self.assertEqual(st._active, 8)
+                self.assertEqual(st.server_state.active, 8)
             # Tenth connection with an exact close: terminal ACK outside
             # the pool — close is never starved by admitted handlers.
             tenth = client_roundtrip(port, {"cmd": "close"})
             self.assertTrue(tenth.get("closed"), tenth)
             self.assertTrue(tenth.get("ok"), tenth)
             with st._gate:
-                self.assertTrue(st._closing)
-                self.assertEqual(st._active, 8)
+                self.assertTrue(st.server_state.is_closing())
+                self.assertEqual(st.server_state.active, 8)
             blocker.set()
             for t in ths:
                 t.join(5)
@@ -111,7 +111,7 @@ class CloseUnderLoadTests(unittest.TestCase):
             st = self.serve_session(tmp)
             st.cleanup = Mock()
             st.server = Mock()
-            st._active = 0
+            self.assertEqual(st.server_state.active, 0)
             for _ in range(2):
                 srv, cli = socket.socketpair()
                 try:
@@ -121,9 +121,9 @@ class CloseUnderLoadTests(unittest.TestCase):
                     cli.close()
                 self.assertEqual(
                     resp, {"ok": True, "closed": True, "target": "main"})
-            self.assertTrue(st._closing)
+            self.assertTrue(st.server_state.is_closing())
             st.cleanup.assert_called_once_with()
-            self.assertEqual(st._active, 0, "pool counter untouched")
+            self.assertEqual(st.server_state.active, 0, "pool counter untouched")
 
 
 if __name__ == "__main__":

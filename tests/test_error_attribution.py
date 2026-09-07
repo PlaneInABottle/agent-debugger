@@ -37,7 +37,7 @@ class ErrorAttributionTests(unittest.TestCase):
 
         def fake_dispatch(req):
             if req.get("marker") == "sibling":
-                st._serving = "child:61"
+                st.targets_reg.serving = "child:61"
                 st._pending_target = "child:61"
                 entered.set()
                 self.assertTrue(release.wait(10), "sibling must stay held")
@@ -50,7 +50,7 @@ class ErrorAttributionTests(unittest.TestCase):
         bridge.write_frame(sib_cli, {"cmd": "threads", "marker": "sibling"})
         t = threading.Thread(target=bridge._handle_one, args=(st, sib_srv),
                              daemon=True)
-        st._active = 1  # serve() owns the increment; direct _handle_one
+        self.assertTrue(st.server_state.try_admit(bridge.MAX_ACTIVE_HANDLERS))  # serve() owns the increment; direct _handle_one
         t.start()
         self.assertTrue(entered.wait(10), "sibling never held state")
         return t, sib_cli, release
@@ -59,7 +59,7 @@ class ErrorAttributionTests(unittest.TestCase):
         srv, cli = socket.socketpair()
         try:
             bridge.write_frame(cli, req)
-            st._active += 1
+            self.assertTrue(st.server_state.try_admit(bridge.MAX_ACTIVE_HANDLERS))
             bridge._handle_one(st, srv)
             cli.settimeout(5)
             return bridge.read_frame(cli)
@@ -89,7 +89,7 @@ class ErrorAttributionTests(unittest.TestCase):
 
             def fake_dispatch(req):
                 if req.get("marker") == "sibling":
-                    st._serving = "child:61"
+                    st.targets_reg.serving = "child:61"
                     st._pending_target = "child:61"
                     return {"ok": True}
                 raise bridge.BridgeErr("no stopped thread")
@@ -97,12 +97,12 @@ class ErrorAttributionTests(unittest.TestCase):
             st.dispatch = fake_dispatch
             # Sibling holds the wrong state synchronously (no barrier
             # needed: the failing call runs entirely under it).
-            st._serving = "child:61"
+            st.targets_reg.serving = "child:61"
             st._pending_target = "child:61"
             try:
                 resp = self.run_failing(st, {"cmd": "eval", "expr": "1+1"})
             finally:
-                st._serving = "main"
+                st.targets_reg.serving = "main"
                 st._pending_target = None
             self.assertFalse(resp["ok"])
             # Omitted target resolves for THIS request (nothing parked ->

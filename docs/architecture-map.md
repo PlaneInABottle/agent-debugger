@@ -262,6 +262,26 @@ consumer stay in ONE file (`BridgeSession.java`) under ONE lock
 helpers; keep exactly one state owner + one lock order per bridge. "Reduce
 line count" is never alone a justification.
 
+M3 (implemented, narrow track, Python bridge only): `bridge/py/src/pybridge.py`
+stays one embedded file (`src/bridge.rs` `PYBRIDGE_SOURCE` untouched) with
+exactly two retained in-file owners constructed by `Session` (still holding
+`_gate`, order `_gate -> mu`, no new locks): `TargetRegistry` (child
+roster/creation order/seen-ids/bounded exited history/ignored+helpers
+counters/`serving`/attach staging + in-flight flag/retired sockets +
+`resolve_inner`/`swap_fields`/`note_exit`/`commit_child`) and `ServerState`
+(handler pool via `try_admit`/`release` + terminal-close single winner via
+`claim_close`; `assert_valid` enforces `0 <= active <= MAX_ACTIVE_HANDLERS`).
+Breakpoint bookkeeping and the stop/wait/capture machine stay Session-owned
+sections, NOT owner objects: their state IS the per-target swapped context
+(global `stop_states`/`_hitkeys` on Session, copies on each `ChildTarget`)
+and the thread-local pump attribution, so a `BreakpointStore`/
+`StopCoordinator` wrapper only added bypass (tried, rejected on FULL review —
+no compat-property aliases; roster containers are same-object views,
+scalars/counters/serving route through the owners directly). Future
+extraction trigger (unchanged bar): a measured defect attributable to the
+boundary + FULL plan/review, never size alone. Zero protocol/sidecar/schema
+delta; Node/Browser/Java untouched (M4/M5).
+
 ## 7. Test map (boundary → exact files)
 
 | Boundary | Rust unit (`cargo test`, incl. `src/session.rs` tests) | Bridge unit | Live / matrix |
@@ -270,7 +290,7 @@ line count" is never alone a justification.
 | Setup/error phases | `error.json` phase tests (`transport`/`config`/`runtime`, corrupt message) | `tests/setup_phase.test.js`, `tests/test_pybridge.py` | `tests/test_error_attribution.py` |
 | Target identity (no `observedTarget`) | `owner_*`, `session_entry` asserts (`observedTarget` absent, flat never promoted) | `tests/target_identity.test.js` | `tests/test_live.py` identity cases |
 | Breaks add/remove/clear | `confirmed_*` persistence tests, `breaks_lock_*` | `tests/breaks_add.test.js`, `tests/breaks_remove.test.js`, `tests/m3_fixes.test.js`, `tests/m4_fixes.test.js` | `tests/test_live.py` live add/remove |
-| Concurrency/serve | lock/quarantine unit tests (`reclaim_*`, `detach_*`, endpoint claim) | `tests/breaks_concurrency_matrix.test.js`, `tests/m5_concurrency.test.js`, `tests/test_pybridge.py` (+12 M5) | `tests/test_breaks_concurrency_matrix.py`, `tests/test_m5_live.py` (6 scenarios) |
+| Concurrency/serve | lock/quarantine unit tests (`reclaim_*`, `detach_*`, endpoint claim) | `tests/breaks_concurrency_matrix.test.js`, `tests/m5_concurrency.test.js`, `tests/test_pybridge.py` (+12 M5), `tests/test_pybridge_owners.py` (M3 narrow-owner tests: registry lifecycle/swap incl. missing-child exit, server pool/close) | `tests/test_breaks_concurrency_matrix.py`, `tests/test_m5_live.py` (6 scenarios) |
 | Close under load | `close` confirm/port-death tests | `tests/close_under_load.test.js` | `tests/test_close_under_load.py` |
 | Wait/capture/timeout | stop-freshness unit tests | `tests/wait_capture.test.js`, `tests/stoptimeout.test.js` | `tests/test_wait_capture.py`, `tests/test_ux_live.py` (timeout prefix asserts), `tests/test_main_exit_visibility.py` |
 | Workers/targets | `cmd_targets_in` roster tests | `tests/worker_targets.test.js`, `tests/worker_break_records.test.js`, `tests/vars_frame.test.js` | `tests/test_m5_live.py` |
