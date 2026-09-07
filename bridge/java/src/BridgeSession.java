@@ -1359,11 +1359,7 @@ class BridgeSession {
                     return;
                 }
                 if (st.activeHandlers >= MAX_ACTIVE_HANDLERS) {
-                    try {
-                        sock.setSoTimeout(5000);
-                        BridgeProto.writeFrame(sock.getOutputStream(), overloadedJson());
-                    } catch (Exception ignored) {}
-                    try { sock.close(); } catch (Exception ignored) {}
+                    serveOverload(st, sock);
                     continue;
                 }
                 st.activeHandlers++;
@@ -1381,6 +1377,55 @@ class BridgeSession {
      *  response — target-side work still publishes. */
     static String overloadedJson() {
         return "{\"ok\":false,\"error\":\"overloaded: too many active handlers\",\"target\":\"main\"}";
+    }
+
+    /** Pool-full bypass: one bounded frame read under the existing framing
+     *  limits/deadlines (never an unbounded wait). An exact `close` gets
+     *  terminal close handling outside the pool — close can never be
+     *  starved by admitted handlers. Anything else gets the existing
+     *  overloaded rejection; malformed/timeout reads just close the
+     *  socket. The pool counter is untouched (this path never counted). */
+    static void serveOverload(SessionState st, Socket sock) {
+        String req;
+        try {
+            sock.setSoTimeout(5000);
+            req = BridgeProto.readFrame(sock.getInputStream());
+        } catch (Exception ignored) {
+            try { sock.close(); } catch (Exception ignored2) {}
+            return;
+        }
+        String cmd;
+        try {
+            cmd = BridgeProto.parseCmd(req);
+        } catch (Exception ignored) {
+            try { sock.close(); } catch (Exception ignored2) {}
+            return;
+        }
+        if ("close".equals(cmd)) {
+            closeFromConn(st, sock);
+            return;
+        }
+        try {
+            BridgeProto.writeFrame(sock.getOutputStream(), overloadedJson());
+        } catch (Exception ignored) {}
+        try { sock.close(); } catch (Exception ignored) {}
+    }
+
+    /** Terminal close handling for one connection, outside the handler
+     *  pool: every close gets the closed ACK; exactly one winner runs the
+     *  teardown (check-and-set under sessionLock). The pool counter is
+     *  untouched. */
+    static void closeFromConn(SessionState st, Socket sock) {
+        boolean mine;
+        synchronized (st.sessionLock) {
+            mine = !st.closing;
+            st.closing = true;
+        }
+        try {
+            BridgeProto.writeFrame(sock.getOutputStream(), "{\"ok\":true,\"closed\":true,\"target\":\"main\"}");
+        } catch (Exception ignored) {}
+        try { sock.close(); } catch (Exception ignored) {}
+        if (mine) cleanup(st);
     }
     static void handleOne(SessionState st, Socket sock) {
         try {
@@ -1407,13 +1452,7 @@ class BridgeSession {
                 // wait for a handler that itself awaits a stop — tear down
                 // now (launch kills its VM, attach detaches). In-flight
                 // resume handlers abort on the torn-down transport.
-                try {
-                    BridgeProto.writeFrame(sock.getOutputStream(), "{\"ok\":true,\"closed\":true,\"target\":\"main\"}");
-                } catch (Exception ignored) {}
-                synchronized (st.sessionLock) {
-                    st.closing = true;
-                }
-                cleanup(st);
+                closeFromConn(st, sock);
             } catch (Exception e) {
                 // Central ok:false envelope: every dispatch failure (busy,
                 // closing, stopped/exited, frame validation, unknown cmd,
@@ -1441,9 +1480,15 @@ class BridgeSession {
     }
 
     static void cleanup(SessionState st) {
+        cleanupCalls++;
         cleanupVm(st);
         try { st.server.close(); } catch (Exception ignored) {}
     }
+
+    /** Teardown invocation count (test seam for close idempotence: every
+     *  close ACKs, exactly one winner runs the teardown above). Production
+     *  semantics untouched — incremented unconditionally, never read. */
+    static int cleanupCalls = 0;
 
     /** Setup-failure path: kill exactly the VM we started (launch exits the
      *  target, attach detaches); close semantics stay untouched. */

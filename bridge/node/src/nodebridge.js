@@ -817,7 +817,7 @@ class Session {
     this.outstanding = new Map();
     this.activeConns = 0;         // live connection handlers (bounded)
     this._swapTail = null;        // swap/tracking-field mutex chain
-    this._mutationTail = null;    // breaks-mutation mutex chain (adds only)
+    this._mutationTail = null;    // breaks-mutation mutex chain (all mutations)
     this.mainDead = false;        // main session over; workers may live on
     this.sender = null;           // per-target CDP sender (null = main cdp)
     this.nodeWorkerEnabled = false;
@@ -914,8 +914,11 @@ class Session {
   /** Serialize breaks mutations (same promise-chain idiom as _swapRun, own
    *  tail so swap traffic never waits on a plant): concurrent identical
    *  adds recheck under the chain, so the second sees the first's state
-   *  (empty-added, no duplicate records). Mutation paths never swap shared
-   *  fields, so this never nests with _swapRun in either order. */
+   *  (empty-added, no duplicate records); concurrent add×remove/clear on a
+   *  same-file replace converge the same way (no ghost/resurrection).
+   *  Mutation paths never swap shared fields, so this never nests with
+   *  _swapRun in either order. The chain is NOT reentrant: entry points
+   *  wrap once and inner work calls the _Inner/drop forms directly. */
   async _mutationRun(fn) {
     let release;
     const willLock = new Promise((resolve) => {
@@ -1994,21 +1997,26 @@ class Session {
       try {
         res = await this.workerSend(w, 'Debugger.setBreakpointByUrl', params, 5000);
       } catch (e) {
-        const rec = {
-          spec: this.dispSpec(spec, kind), kind, hits: 0,
-          state: 'pending', detail: `inherit failed: ${(e && e.message) || e}`,
-        };
-        if (kind === 'logpoint') rec.detail = `${spec.template} (${rec.detail})`;
-        else rec.hits = 0;
-        w.stopStates.push(rec);
+        // No plant, no intent key, no record: a stopStates entry here would
+        // be unreachable — remove/clear drop by canonical key, which was
+        // never registered, so no command could ever eliminate it (phantom).
+        // Warn only; the next global add re-inherits this line.
+        process.stderr.write(`warn: worker ${w.id} inherit failed for ` +
+          `${this.dispSpec(spec, kind)}: ${(e && e.message) || e}\n`);
         continue;
       }
       const bpId = res.breakpointId;
       const rec = { spec: this.dispSpec(spec, kind), kind, hits: 0 };
       if (kind === 'logpoint') rec.detail = spec.template;
       const ckey = `${spec.path}:${spec.line}|${(spec.cond || '')}`;
-      if (kind === 'break') w.breakKeys.set(ckey, bpId || null);
-      if (kind === 'break') w.breakRecByKey.set(ckey, rec);
+      if (kind === 'break') {
+        w.breakKeys.set(ckey, bpId || null);
+        w.breakRecByKey.set(ckey, rec);
+        // Admitted even when V8 refused the plant (null bpId): the
+        // rejected record is displayed, and remove/clear drop by admitted
+        // key — without this no command could ever eliminate it (phantom).
+        w.inheritedKeys.add(ckey);
+      }
       if (!bpId) {
         rec.state = 'rejected';
         rec.detail = kind === 'logpoint' ? `${spec.template} (rejected)` : `breakpoint rejected: ${spec.path}:${spec.line}`;
@@ -2016,7 +2024,6 @@ class Session {
         continue;
       }
       if (kind === 'logpoint') this.logpointIds.set(bpId, spec.template);
-      else w.inheritedKeys.add(ckey);
       // NB: logpoint lines stay OUT of inheritedKeys on purpose: the
       // remove/clear paths drop by break key, and a logpoint plant must
       // never be dropped as if it were a line break (logpoints ride along
@@ -3813,14 +3820,33 @@ class Session {
         continue;
       }
       const bpId = res.breakpointId;
+      const ckey = `${f.path}:${f.line}|${f.cond || ''}`;
       if (!bpId) {
-        failed.push(f);
+        // V8 explicit refusal: keyed rejected record like admission
+        // (callers admit it to inheritedKeys/targetRaws, so global or
+        // scoped remove/clear can eliminate it). Exactly one record per
+        // canonical key — never a duplicate.
+        const rec = {
+          spec: this.dispSpec(f, 'break'), kind: 'break', hits: 0,
+          state: 'rejected',
+          detail: `breakpoint rejected: ${f.path}:${f.line}`,
+        };
+        w.breakKeys.set(ckey, null);
+        if (!w.breakRecByKey.has(ckey)) {
+          w.breakRecByKey.set(ckey, rec);
+          w.stopStates.push(rec);
+        }
+        const entry = {
+          raw: f.raw, spec: rec.spec, kind: 'break',
+          state: 'rejected', hits: 0, detail: rec.detail,
+        };
+        added.push(entry);
         continue;
       }
       const rec = { spec: this.dispSpec(f, 'break'), kind: 'break', hits: 0 };
       this.breakIdToRec.set(bpId, { rec, line: f.line });
-      w.breakKeys.set(`${f.path}:${f.line}|${f.cond || ''}`, bpId);
-      w.breakRecByKey.set(`${f.path}:${f.line}|${f.cond || ''}`, rec);
+      w.breakKeys.set(ckey, bpId);
+      w.breakRecByKey.set(ckey, rec);
       const locs = res.locations || [];
       const slidTo = slidLine(locs, f.line);
       if (slidTo !== null) {
@@ -4049,6 +4075,9 @@ class Session {
     return this.withStamp(resp, tid);
   }
 
+  /** Every admitted worker break key: inherited copies plus ephemeral
+   *  entries (logpoint plants never join — remove/clear by break key can
+   *  never drop them). */
   workerAllKeys(w) {
     return [...new Set([...w.inheritedKeys, ...w.targetRaws.keys()])];
   }
@@ -4064,8 +4093,15 @@ class Session {
    * `--target X` matches only X's ephemeral target-scoped records (no
    * global intent change). Bare remove drops the global intent plus its
    * inherited plant copies on every live worker.
+   *
+   * Serialized on the mutation chain with add/clear (the chain is not
+   * reentrant: this wrapper owns the run, the _Inner form does the work).
    */
   async cmdBreaksRemove(req) {
+    return this._mutationRun(() => this._cmdBreaksRemoveInner(req));
+  }
+
+  async _cmdBreaksRemoveInner(req) {
     const scope = req && typeof req.target === 'string' ? req.target : null;
     if (scope !== null && scope !== 'main') {
       const tid = this.resolveTarget(req);
@@ -4113,15 +4149,16 @@ class Session {
     if (matched.length === 0) {
       return this.withStamp({ ok: true, removed: [], missing, stops: this.stopStates }, 'main');
     }
-    const resp = await this.dropBreakKeys(matched, missing);
-    // The global intent is gone: drop its inherited copies on every live
-    // worker (per-target backend rules; a worker failure warns while the
-    // confirmed main removal stands).
+    const { resp, confirmed } = await this.dropBreakKeys(matched, missing);
+    // Propagate only confirmed main removals: a breakpoint whose backend
+    // call failed keeps its intent AND its inherited copies (dropping the
+    // copy while the intent stands would diverge bridge intent, backend,
+    // and persistence).
     const childWarnings = [];
     for (const id of this.workerOrder) {
       const w = this.workerTable.get(id);
       if (!w || w.exited || w.state === 'ignored') continue;
-      const doomed = matched.filter((k) => w.inheritedKeys.has(k));
+      const doomed = confirmed.filter((k) => w.inheritedKeys.has(k));
       if (doomed.length === 0) continue;
       try {
         await this.dropWorkerKeys(id, doomed, []);
@@ -4136,6 +4173,10 @@ class Session {
   }
 
   async cmdBreaksClear(req = {}) {
+    return this._mutationRun(() => this._cmdBreaksClearInner(req));
+  }
+
+  async _cmdBreaksClearInner(req = {}) {
     const scope = req && typeof req.target === 'string' ? req.target : null;
     if (scope !== null && scope !== 'main') {
       const tid = this.resolveTarget(req);
@@ -4155,14 +4196,20 @@ class Session {
     for (const key of this.breakRaws.keys()) {
       if (!ordered.includes(key)) ordered.push(key);
     }
-    const finishClear = async (resp) => {
-      // Bare clear is the full line-break reset: global intent plus every
-      // inherited copy plus every ephemeral worker record.
+    const finishClear = async (resp, confirmedMain) => {
+      // Bare clear resets ephemeral records always, plus inherited copies
+      // only for confirmed main removals (a failed file keeps its intent
+      // and its copies).
+      const confirmedSet = new Set(confirmedMain);
       const childWarnings = [];
       for (const id of this.workerOrder) {
         const w = this.workerTable.get(id);
         if (!w || w.exited || w.state === 'ignored') continue;
-        const doomed = this.workerAllKeys(w);
+        // Admitted keys, but inherited copies only for confirmed main
+        // removals (ephemeral records always reset; a failed file keeps
+        // its intent and its copies).
+        const doomed = this.workerAllKeys(w).filter(
+          (k) => w.targetRaws.has(k) || confirmedSet.has(k));
         if (doomed.length === 0) continue;
         try {
           await this.dropWorkerKeys(id, doomed, []);
@@ -4176,14 +4223,16 @@ class Session {
       return this.withStamp(resp, 'main');
     };
     if (ordered.length === 0) {
-      return finishClear({ ok: true, removed: [], stops: this.stopStates });
+      return finishClear({ ok: true, removed: [], stops: this.stopStates }, []);
     }
-    return finishClear(await this.dropBreakKeys(ordered, []));
+    const { resp, confirmed } = await this.dropBreakKeys(ordered, []);
+    return finishClear(resp, confirmed);
   }
 
   async dropBreakKeys(keys, missing) {
     const removed = [];
     const failed = [];
+    const confirmed = [];
     for (const key of keys) {
       const bpId = this.breakKeys.get(key);
       // The live record by canonical key — exact even for rejected plants
@@ -4217,6 +4266,7 @@ class Session {
         if (ri >= 0) this.stopStates.splice(ri, 1);
       }
       removed.push({ raw: storedRaw, spec: rec ? rec.spec : loc, kind: 'break', hits: 0 });
+      confirmed.push(key);
       await this.rearmShadowedLogpoint(kpath, kline);
     }
     if (removed.length === 0) {
@@ -4228,7 +4278,7 @@ class Session {
       resp.failed = failed;
       resp.warning = 'partial remove: no change for ' + failed.map((f) => f.raw).filter(Boolean).join(', ');
     }
-    return resp;
+    return { resp, confirmed };
   }
 
   /** Re-plant a startup-shadowed logpoint freed by a break removal (the
@@ -4388,60 +4438,13 @@ async function serve(st, server, queue) {
   // reads serve published state; same-target rivals busy-reject in
   // dispatch. A client disconnect drops only its own response: target-side
   // work still publishes.
-  async function handleConn(conn) {
-    st.activeConns += 1;
-    try {
-      let req;
-      try {
-        req = await readFrame(conn);
-      } catch (e) {
-        try {
-          await writeFrame(conn, { ok: false, error: String((e && e.message) || e) });
-        } catch (_) { /* client already gone — nothing to answer */ }
-        return;
-      }
-      try {
-        const resp = await st.dispatch(req);
-        if (resp && typeof resp === 'object' && !('target' in resp)) {
-          resp.target = (st && st.serving) || 'main';
-        }
-        try {
-          await writeFrame(conn, resp);
-        } catch (_) { /* client went away mid-command: work already ran */ }
-      } catch (e) {
-        if (e instanceof CloseSession) {
-          // Terminal and accepted despite any outstanding resume: never
-          // wait for a handler that itself awaits a stop — tear down now
-          // (launch kills its process, attach detaches). In-flight resume
-          // handlers abort on the torn-down transport; the serve loop
-          // below gives them a bounded grace to flush error responses.
-          try {
-            await writeFrame(conn, { ok: true, closed: true, target: 'main' });
-          } catch (_) { /* client already gone */ }
-          st.closing = true;
-          await st.cleanup().catch(() => {});
-          return;
-        }
-        const msg = e instanceof BridgeErr ? e.message : `internal: ${(e && e.message) || e}`;
-        const target = (st && (st.pendingTarget || st.serving)) || 'main';
-        const resp = { ok: false, error: msg, target };
-        if (e && e.waitContext && typeof e.waitContext === 'object') {
-          resp.waitContext = e.waitContext;
-        }
-        try {
-          await writeFrame(conn, resp);
-        } catch (_) { /* client already gone */ }
-      }
-    } finally {
-      conn.destroy();
-      st.activeConns -= 1;
-    }
-  }
 
   for (;;) {
     if (!amOwner(st.cfg.dir)) {
       await st.cleanup().catch(() => {});
       process.exit(0);
+      return; // exit never returns; bound stubbed/embedded use instead
+      // of spinning cleanup+exit forever.
     }
     if (st.closing) {
       // Bounded grace for in-flight handlers to flush their aborts, then
@@ -4464,20 +4467,135 @@ async function serve(st, server, queue) {
       if (queue.length === 0 && !amOwner(st.cfg.dir)) {
         await st.cleanup().catch(() => {});
         process.exit(0);
+        return; // exit never returns; bound stubbed/embedded use instead
+        // of spinning cleanup+exit forever.
       }
     }
     if (st.closing) continue;
     const conn = queue.shift();
     if (!conn) continue;
     if (st.activeConns >= MAX_ACTIVE_HANDLERS) {
-      try {
-        await writeFrame(conn, { ok: false, error: 'overloaded: too many active handlers', target: 'main' });
-      } catch (_) { /* client already gone */ }
-      conn.destroy();
+      await handleOverload(st, conn);
       continue;
     }
-    handleConn(conn).catch(() => {});
+    handleConn(st, conn).catch(() => {});
   }
+}
+
+/** Pool-full bypass: one bounded frame read under the existing framing
+ *  limits/deadlines (never an unbounded wait). An exact `close` gets
+ *  terminal close handling outside the pool — close can never be starved
+ *  by admitted handlers. Anything else gets the existing overloaded
+ *  rejection; malformed/timeout reads just close the socket. The pool
+ *  counter is untouched (this path never counted). */
+async function handleOverload(st, conn) {
+  let req;
+  try {
+    req = await readFrame(conn); // existing 5s framing deadline
+  } catch (_) {
+    try {
+      conn.destroy();
+    } catch (_) { /* already gone */ }
+    return;
+  }
+  if (req && typeof req === 'object' && !Array.isArray(req) && req.cmd === 'close') {
+    await closeFromConn(st, conn);
+    return;
+  }
+  try {
+    await writeFrame(conn, { ok: false, error: 'overloaded: too many active handlers', target: 'main' });
+  } catch (_) { /* client already gone */ }
+  conn.destroy();
+}
+
+/** Serve one CLI connection: exactly one request and one response. */
+async function handleConn(st, conn) {
+  st.activeConns += 1;
+  try {
+    let req;
+    try {
+      req = await readFrame(conn);
+    } catch (e) {
+      try {
+        await writeFrame(conn, { ok: false, error: String((e && e.message) || e) });
+      } catch (_) { /* client already gone — nothing to answer */ }
+      return;
+    }
+    const errTarget = errorTargetFor(st, req);
+    try {
+      const resp = await st.dispatch(req);
+      if (resp && typeof resp === 'object' && !('target' in resp)) {
+        resp.target = (st && st.serving) || 'main';
+      }
+      try {
+        await writeFrame(conn, resp);
+      } catch (_) { /* client went away mid-command: work already ran */ }
+    } catch (e) {
+      if (e instanceof CloseSession) {
+        // Terminal and accepted despite any outstanding resume: never
+        // wait for a handler that itself awaits a stop — tear down now
+        // (launch kills its process, attach detaches). In-flight resume
+        // handlers abort on the torn-down transport; the serve loop
+        // below gives them a bounded grace to flush error responses.
+        await closeFromConn(st, conn);
+        return;
+      }
+      const msg = e instanceof BridgeErr ? e.message : `internal: ${(e && e.message) || e}`;
+      const resp = { ok: false, error: msg, target: errTarget };
+      if (e && e.waitContext && typeof e.waitContext === 'object') {
+        resp.waitContext = e.waitContext;
+      }
+      try {
+        await writeFrame(conn, resp);
+      } catch (_) { /* client already gone */ }
+    }
+  } finally {
+    conn.destroy();
+    st.activeConns -= 1;
+  }
+}
+
+/** Request-local error attribution for one connection's envelope.
+ *  Derived synchronously at frame-read time, before any concurrent await
+ *  can mutate shared serving state: an explicit string target is echoed
+ *  verbatim (even unknown — the envelope names what was asked); an
+ *  omitted target uses this request's own resolution where available,
+ *  else the legacy "main" default. Never another handler's shared
+ *  pendingTarget/serving. Success stamps are untouched. */
+function errorTargetFor(st, req) {
+  try {
+    if (req && typeof req.target === 'string') return req.target;
+    try {
+      return st.resolveTarget(req);
+    } catch (_) { /* fall through to the default */ }
+  } catch (_) { /* fall through to the default */ }
+  return 'main';
+}
+
+/** Terminal close handling for one connection, outside the handler pool:
+ *  every close gets the closed ACK; exactly one winner runs the teardown
+ *  (the single-threaded check-and-set is atomic — no await between the
+ *  flag read and write). The pool counter is untouched (the overload path
+ *  never counted). */
+async function closeFromConn(st, conn) {
+  let mine = false;
+  if (!st.closing) {
+    st.closing = true;
+    mine = true;
+  }
+  try {
+    await writeFrame(conn, { ok: true, closed: true, target: 'main' });
+  } catch (_) { /* client already gone */ }
+  if (!mine) {
+    try {
+      conn.destroy();
+    } catch (_) { /* already gone */ }
+    return;
+  }
+  await st.cleanup().catch(() => {});
+  try {
+    conn.destroy();
+  } catch (_) { /* already gone */ }
 }
 
 function writeSessionFile(dir, obj, cfg, st) {

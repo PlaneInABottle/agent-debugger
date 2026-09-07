@@ -1433,9 +1433,72 @@ fn startup_lock_path(sessions_root: &std::path::Path, name: &str) -> PathBuf {
 /// a wrongful steal costs a live startup its dir.
 const STARTUP_LOCK_STALE: Duration = Duration::from_secs(120);
 
+/// Stale verdict over an already-read mtime: true only when provably at
+/// least `STARTUP_LOCK_STALE` old. Single source for the 120s policy —
+/// the acquire path and the close gate both judge snapshotted timestamps
+/// through here, so a vanished lock reads as reclaimable (not live) while
+/// undatable/future ones fail closed.
+fn stale_startup_mtime(mtime: std::time::SystemTime) -> bool {
+    std::time::SystemTime::now()
+        .duration_since(mtime)
+        .ok()
+        .map(|age| age >= STARTUP_LOCK_STALE)
+        .unwrap_or(false)
+}
+
+/// Pre-delete guard for `close` over an unpublished session dir (no
+/// session.json yet): the dir may belong to an actively starting bridge
+/// whose handshake has not published. Fresh, live, or undatable startup
+/// locks bail with a stable retryable "starting" error and the dir is
+/// untouched. A provably stale lock is detached-and-verified (a freshly
+/// replaced lock never matches the stale bytes, so it is never deleted)
+/// and close proceeds. A session.json that appears at any point takes the
+/// normal bridge path — close re-reads it fresh after this gate, so a
+/// starter that just published is closed, never deleted mid-handshake.
+/// No sleeps: every branch decides on current filesystem state.
+fn startup_close_gate(sessions_root: &std::path::Path, name: &str) -> anyhow::Result<()> {
+    // Published sessions take the normal bridge path regardless of any
+    // lock file (a lock may legitimately still be held at publish time).
+    if sessions_root.join(name).join("session.json").exists() {
+        return Ok(());
+    }
+    let lock = startup_lock_path(sessions_root, name);
+    let raw = match std::fs::read_to_string(&lock) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => anyhow::bail!("session '{name}' is starting; retry shortly"),
+    };
+    // Snapshot the mtime with the bytes: a lock reclaimed under us reads
+    // as gone (nothing live left to protect — proceed), an undatable one
+    // as live (fail closed).
+    let mtime = match std::fs::metadata(&lock).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => anyhow::bail!("session '{name}' is starting; retry shortly"),
+    };
+    let stale = stale_startup_mtime(mtime);
+    if !stale {
+        anyhow::bail!("session '{name}' is starting; retry shortly");
+    }
+    // Provably stale: drop only the exact verified-stale bytes. A lock
+    // replaced under us (fresh starter) mismatches and is left intact —
+    // close still bails so the new starter keeps its dir.
+    if quarantine_verified(&lock, &raw) {
+        return Ok(());
+    }
+    anyhow::bail!("session '{name}' is starting; retry shortly");
+}
+
 struct StartupGuard {
     path: PathBuf,
     nonce: String,
+}
+
+impl std::fmt::Debug for StartupGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Nonce never prints: lock nonces are internal coordination values.
+        write!(f, "StartupGuard({})", self.path.display())
+    }
 }
 
 impl Drop for StartupGuard {
@@ -1490,41 +1553,80 @@ fn acquire_startup_lock(path: &std::path::Path) -> anyhow::Result<StartupGuard> 
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => anyhow::bail!("cannot create startup lock: {e}"),
     }
-    // Lock held by someone: steal only if provably stale, once.
-    let stale = std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
-        .map(|age| age >= STARTUP_LOCK_STALE)
-        .unwrap_or(false);
-    if !stale {
-        let holder = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
+    // Snapshot the exact bytes with the mtime: a lock reclaimed under us
+    // reads as gone (path free — one atomic claim attempt decides), an
+    // undatable one as live (fail closed).
+    let raw = match std::fs::read_to_string(path) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return claim_stale_startup_lock(path);
+        }
+        Err(_) => {
+            let holder = lock_holder_name(path);
+            anyhow::bail!(
+                "session '{holder}' is starting (concurrent start in progress; retry shortly)"
+            )
+        }
+    };
+    let mtime = match std::fs::metadata(path).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return claim_stale_startup_lock(path);
+        }
+        Err(_) => {
+            let holder = lock_holder_name(path);
+            anyhow::bail!(
+                "session '{holder}' is starting (concurrent start in progress; retry shortly)"
+            )
+        }
+    };
+    // Steal only a provably stale record via the verified quarantine
+    // transfer: a fresh or replaced rival lock never matches, so it can
+    // never be deleted — a bare remove_file here could (two retriers, one
+    // rival claim between verdict and unlink). Single attempt, fail
+    // closed; the atomic create_new below still admits exactly one owner.
+    if !stale_startup_mtime(mtime) {
+        let holder = lock_holder_name(path);
         anyhow::bail!(
             "session '{holder}' is starting (concurrent start in progress; retry shortly)"
         );
     }
-    std::fs::remove_file(path)
-        .map_err(|e| anyhow::anyhow!("cannot clear stale startup lock: {e}"))?;
-    let nonce2 = startup_nonce();
-    std::fs::OpenOptions::new()
+    if !quarantine_verified(path, &raw) {
+        let holder = lock_holder_name(path);
+        anyhow::bail!(
+            "session '{holder}' is starting (concurrent start in progress; retry shortly)"
+        );
+    }
+    claim_stale_startup_lock(path)
+}
+
+/// Session name from a startup lock path (the file stem); best-effort for
+/// retryable "starting" errors only, never a claim decision.
+fn lock_holder_name(path: &std::path::Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+/// Single atomic claim attempt after a verified stale detach: success owns
+/// the name; any failure (a rival won the slot meanwhile) reads as a live
+/// start — exactly one owner ever emerges from concurrent steals.
+fn claim_stale_startup_lock(path: &std::path::Path) -> anyhow::Result<StartupGuard> {
+    let nonce = startup_nonce();
+    let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
         .map_err(|_| {
             anyhow::anyhow!("session is starting (concurrent start in progress; retry shortly)")
-        })
-        .and_then(|mut f| {
-            use std::io::Write as _;
-            f.write_all(nonce2.as_bytes())
-                .map_err(|e| anyhow::anyhow!("cannot write startup lock: {e}"))?;
-            Ok(StartupGuard {
-                path: path.to_path_buf(),
-                nonce: nonce2,
-            })
-        })
+        })?;
+    use std::io::Write as _;
+    f.write_all(nonce.as_bytes())
+        .map_err(|e| anyhow::anyhow!("cannot write startup lock: {e}"))?;
+    Ok(StartupGuard {
+        path: path.to_path_buf(),
+        nonce,
+    })
 }
 
 /// Spawn the bridge daemon and wait for the first stop.
@@ -3472,9 +3574,32 @@ fn read_log_tail(dir: &std::path::Path) -> String {
     }
 }
 
+/// Delete a session dir at close time, unless it is unpublished and a
+/// starter claimed the name since the gate: a fresh lock reads as an
+/// active start (retryable, dir intact), never a leftover to reap. This
+/// narrows the gate-to-delete window (which spans the bridge forward) to
+/// the instant before deletion. Published dirs always proceed.
+fn remove_unpublished_dir(
+    sessions_root: &std::path::Path,
+    name: &str,
+    dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    if !dir.join("session.json").exists() && startup_lock_path(sessions_root, name).exists() {
+        anyhow::bail!("session '{name}' is starting; retry shortly");
+    }
+    std::fs::remove_dir_all(dir).map_err(|e| anyhow::anyhow!("cannot remove session: {e}"))?;
+    Ok(())
+}
+
 /// Close a session; retain management state if the daemon stays alive.
 pub fn close(name: &str) -> anyhow::Result<Value> {
     let dir = checked_session_dir(name)?;
+    // Startup-window guard: an unpublished dir may belong to an actively
+    // starting bridge (no session.json yet). A live starter keeps its dir
+    // with a retryable error; only a lock-free or provably-stale-lock dir
+    // proceeds to the normal path below (which re-reads session.json
+    // fresh, so a starter that just published is closed via its bridge).
+    startup_close_gate(&sessions_dir(), name)?;
     // Whether the bridge ACKed the close. A false here (with the port
     // already dead) means the daemon died on its own; a false with the port
     // alive means it is wedged — the dir is still removed, but the caller
@@ -3531,7 +3656,7 @@ pub fn close(name: &str) -> anyhow::Result<Value> {
     if !dir.exists() {
         anyhow::bail!("no session '{name}'");
     }
-    std::fs::remove_dir_all(&dir).map_err(|e| anyhow::anyhow!("cannot remove session: {e}"))?;
+    remove_unpublished_dir(&sessions_dir(), name, &dir)?;
     Ok(json!({"closed": name, "confirmed": confirmed, "target": "main"}))
 }
 
@@ -4614,6 +4739,206 @@ mod tests {
         drop(g3);
         assert!(!lock.exists());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn startup_lock_two_contenders_exactly_one_owner() {
+        // Two starters race one stale-seeded lock: exactly one emerges
+        // holding it (atomic create_new after the verified detach), the
+        // other bails retryably. The winner's fresh nonce survives in the
+        // file — a bare remove-then-claim could have deleted it.
+        // Outcome assertion is deterministic (count == 1); only scheduling
+        // varies. Guards stay held through the count.
+        let base = tmpdir("startup-steal-race");
+        let lock = startup_lock_path(&base, "demo");
+        std::fs::write(&lock, "crashed-starter").unwrap();
+        backdate(&lock, STARTUP_LOCK_STALE + Duration::from_secs(5));
+        std::thread::scope(|s| {
+            let h1 = s.spawn(|| acquire_startup_lock(&lock).ok());
+            let h2 = s.spawn(|| acquire_startup_lock(&lock).ok());
+            let results = [h1.join().unwrap(), h2.join().unwrap()];
+            assert_eq!(
+                results.iter().filter(|g| g.is_some()).count(),
+                1,
+                "exactly one steal racer must win"
+            );
+            // The survivor's nonce is the file content (fresh, intact).
+            let winner = results.into_iter().flatten().next().unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&lock).unwrap(),
+                winner.nonce,
+                "fresh winner nonce survives"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn startup_lock_fresh_and_replaced_records_survive() {
+        // A live lock is never touched; a stale verdict overtaken by a
+        // fresh replacement bails with the new record intact.
+        let base = tmpdir("startup-steal-fresh");
+        let lock = startup_lock_path(&base, "demo");
+        std::fs::write(&lock, "live-starter").unwrap();
+        let err = acquire_startup_lock(&lock).unwrap_err();
+        assert!(format!("{err:#}").contains("is starting"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&lock).unwrap(), "live-starter");
+        // Stale bytes, then a fresh rival claims before our verdict runs:
+        // the quarantine re-verify mismatches — hands off, rival intact.
+        std::fs::write(&lock, "stale-bytes").unwrap();
+        backdate(&lock, STARTUP_LOCK_STALE + Duration::from_secs(5));
+        std::fs::write(&lock, "rival-fresh-nonce").unwrap();
+        let err = acquire_startup_lock(&lock).unwrap_err();
+        assert!(format!("{err:#}").contains("is starting"), "{err:#}");
+        assert_eq!(
+            std::fs::read_to_string(&lock).unwrap(),
+            "rival-fresh-nonce",
+            "replaced rival lock must survive the steal"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn remove_unpublished_dir_guards_fresh_claims() {
+        // Unpublished dir + fresh lock: retryable bail, dir and lock
+        // intact. Unpublished dir, no lock: proceeds and removes.
+        // Published dir + lock: proceeds (normal bridge path owns it).
+        let root = tmpdir("close-rm-unpublished");
+        let name = "demo";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = startup_lock_path(&root, name);
+        std::fs::write(&lock, "fresh-starter").unwrap();
+        let err = remove_unpublished_dir(&root, name, &dir).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("session 'demo' is starting; retry shortly"),
+            "{err:#}"
+        );
+        assert!(dir.is_dir(), "claimed dir preserved");
+        assert!(lock.exists(), "fresh lock preserved");
+        std::fs::remove_file(&lock).unwrap();
+        remove_unpublished_dir(&root, name, &dir).expect("lock-free proceeds");
+        assert!(!dir.exists(), "unclaimed dir removed");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("session.json"), r#"{"port":1}"#).unwrap();
+        std::fs::write(&lock, "fresh-starter").unwrap();
+        remove_unpublished_dir(&root, name, &dir).expect("published proceeds");
+        assert!(!dir.exists(), "published dir removed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn close_startup_gate_fresh_lock_blocks_and_preserves() {
+        // Actively starting session: unpublished dir + live lock. Close
+        // bails retryably and touches neither the dir nor the lock.
+        let root = tmpdir("close-gate-fresh");
+        let name = "demo";
+        std::fs::create_dir_all(root.join(name)).unwrap();
+        let lock = startup_lock_path(&root, name);
+        std::fs::write(&lock, "live-starter-nonce").unwrap();
+        let err = startup_close_gate(&root, name).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("session 'demo' is starting; retry shortly"),
+            "{err:#}"
+        );
+        assert!(root.join(name).is_dir(), "starting dir untouched");
+        assert!(lock.exists(), "live lock untouched");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn close_startup_gate_stale_lock_proceeds_and_drops_lock() {
+        // Crashed starter: provably stale lock is detached-and-verified,
+        // the gate proceeds (close then removes the dead dir itself).
+        // The gate never deletes dirs — only the stale lock.
+        let root = tmpdir("close-gate-stale");
+        let name = "demo";
+        std::fs::create_dir_all(root.join(name)).unwrap();
+        let lock = startup_lock_path(&root, name);
+        std::fs::write(&lock, "crashed-starter").unwrap();
+        let old = std::time::SystemTime::now() - STARTUP_LOCK_STALE - Duration::from_secs(5);
+        let f = std::fs::File::options().write(true).open(&lock).unwrap();
+        f.set_modified(old).unwrap();
+        drop(f);
+        startup_close_gate(&root, name).expect("stale lock proceeds");
+        assert!(!lock.exists(), "stale lock dropped");
+        assert!(root.join(name).is_dir(), "gate never deletes dirs");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn close_startup_gate_replaced_lock_is_preserved() {
+        // A lock replaced under a stale verdict (fresh starter claimed the
+        // name) mismatches the verified bytes: hands off, new lock intact.
+        let root = tmpdir("close-gate-replaced");
+        let lock = startup_lock_path(&root, "demo");
+        std::fs::write(&lock, "stale-bytes").unwrap();
+        assert!(
+            !quarantine_verified(&lock, "different-bytes"),
+            "mismatch must not detach"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&lock).unwrap(),
+            "stale-bytes",
+            "fresh record intact"
+        );
+        // A replacement with a fresh mtime reads as live at the gate.
+        std::fs::write(&lock, "new-starter-nonce").unwrap();
+        let err = startup_close_gate(&root, "demo").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("is starting; retry shortly"),
+            "{err:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&lock).unwrap(), "new-starter-nonce");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn close_startup_gate_concurrent_stale_reclaim() {
+        // Eight racers on one stale lock: all proceed, the lock is dropped
+        // exactly once (rename admits one detacher; the rest see NotFound),
+        // and no quarantine file lingers.
+        let root = tmpdir("close-gate-race");
+        let name = "demo";
+        std::fs::create_dir_all(root.join(name)).unwrap();
+        let lock = startup_lock_path(&root, name);
+        std::fs::write(&lock, "crashed-starter").unwrap();
+        let old = std::time::SystemTime::now() - STARTUP_LOCK_STALE - Duration::from_secs(5);
+        let f = std::fs::File::options().write(true).open(&lock).unwrap();
+        f.set_modified(old).unwrap();
+        drop(f);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    startup_close_gate(&root, name).expect("stale reclaim proceeds");
+                });
+            }
+        });
+        assert!(!lock.exists(), "stale lock dropped once");
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(".q-"))
+            .collect();
+        assert!(leftovers.is_empty(), "no quarantine lingers: {leftovers:?}");
+        assert!(root.join(name).is_dir(), "gate never deletes dirs");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn close_startup_gate_published_session_ignores_lock() {
+        // A session.json that appeared (starter just published) takes the
+        // normal bridge path regardless of any lock file.
+        let root = tmpdir("close-gate-published");
+        let name = "demo";
+        std::fs::create_dir_all(root.join(name)).unwrap();
+        std::fs::write(root.join(name).join("session.json"), r#"{"port":1}"#).unwrap();
+        let lock = startup_lock_path(&root, name);
+        std::fs::write(&lock, "live-starter-nonce").unwrap();
+        startup_close_gate(&root, name).expect("published proceeds");
+        assert!(lock.exists(), "live lock untouched on the bridge path");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

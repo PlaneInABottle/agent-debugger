@@ -4047,7 +4047,12 @@ class Session:
     def _threads_for(self, tid):
         """One target's live thread dump: (running, threads). Busy targets
         (a resume outstanding) serve the published running truth with zero
-        DAP traffic — never waits, never opens a second DAP reader."""
+        DAP traffic — never waits, never opens a second DAP reader. A dead
+        main fails fast with the typed main-exited error: its DAP session
+        is gone (None) while children may live on, so reading threads
+        through it would only propagate a DAP None failure."""
+        if tid == "main" and self.main_exited:
+            raise BridgeErr("target main has exited — close this session")
         with self._gate:
             busy = tid in self._outstanding
         if busy:
@@ -4062,12 +4067,16 @@ class Session:
 
     def cmd_threads(self, req=None):
         # Explicit --target X (including main) dumps that target only
-        # (unchanged single-target shape). Bare threads aggregates main plus
-        # every live non-ignored non-exited child in targets/breaks order
-        # (main first, then creation order); exited history is excluded.
-        # Top-level running/threads stay the auto-selected target's dump and
-        # the per-target entries ride additively under `targets` with a
-        # `selected` stamp, so single-target sessions read byte-identical.
+        # (unchanged single-target shape; an exited main fails fast with
+        # the typed main-exited error via _threads_for). Bare threads
+        # aggregates every live non-ignored non-exited child in
+        # targets/breaks order, with main first only while main itself is
+        # live — a dead main is excluded up front so its gone DAP session
+        # never fails the call and live children stay visible; exited
+        # history is excluded. Top-level running/threads stay the
+        # auto-selected target's dump and the per-target entries ride
+        # additively under `targets` with a `selected` stamp, so
+        # single-target sessions read byte-identical.
         req = req or {}
         if isinstance(req, dict) and req.get("target") is not None:
             tid = self.resolve_target(req)
@@ -4078,15 +4087,17 @@ class Session:
             selected = self._resolve_target_inner(req)
             if self.exited:
                 raise BridgeErr("target VM has exited — close this session")
-            roster = ["main"] + [t.id for t in self.active_nonmain()]
+            roster = (([] if self.main_exited else ["main"])
+                      + [t.id for t in self.active_nonmain()])
         if len(roster) == 1:
-            running, threads = self._threads_for(selected)
+            tid = roster[0]
+            running, threads = self._threads_for(tid)
             return self.stamp({"ok": True, "running": running,
-                               "threads": threads}, selected)
+                               "threads": threads}, tid)
         # A child that exits (or is released) between the roster snapshot
         # and its dump is skipped — never failing the whole call; the
         # survivors stay attributable. Anything else (e.g. a DAP read
-        # failure, or main's own exit) still propagates.
+        # failure) still propagates.
         entries = []
         for tid in roster:
             try:
@@ -4621,8 +4632,11 @@ class Session:
                                + ", ".join(f["raw"] for f in failed if f["raw"]))
         return self.stamp(resp, tid)
 
+    @_serialized_gate
     def cmd_breaks_remove(self, req):
         """Remove live line breaks by stored identity (running or parked).
+        Serialized on the reentrant gate with add/clear (same-file replace
+        races converge: check+plant+state is atomic, no ghost/resurrection).
         Phase 1 validates/matches the whole batch with zero backend
         mutation (unmatched specs land in `missing`, never ok:false);
         phase 2 re-sends each touched file merged without the removed
@@ -4680,16 +4694,17 @@ class Session:
         if not matched:
             return self.stamp({"ok": True, "removed": [], "missing": missing,
                                "stops": self.stop_states}, "main")
-        resp = self._drop_break_keys(matched, missing)
-        # The global intent is gone: drop its inherited copies on every live
-        # child (per-target backend rules; a child failure warns while the
-        # confirmed main removal stands).
+        resp, confirmed = self._drop_break_keys(matched, missing)
+        # Propagate only confirmed main removals: a file whose backend
+        # call failed keeps its intent AND its inherited copies (dropping
+        # the copy while the intent stands would diverge bridge intent,
+        # backend, and persistence).
         child_warnings = []
         for tid in self.target_order:
             t = self.targets.get(tid)
             if t is None or t.exited or t.state == "ignored" or t.dap is None:
                 continue
-            doomed = [k for k in matched if k in t.inherited_keys]
+            doomed = [k for k in confirmed if k in t.inherited_keys]
             if not doomed:
                 continue
             try:
@@ -4700,8 +4715,11 @@ class Session:
             resp["warning"] = ((resp.get("warning", "") + "; ") if resp.get("warning") else "") + "; ".join(child_warnings)
         return self.stamp(resp, "main")
 
+    @_serialized_gate
     def cmd_breaks_clear(self, req=None):
         """Drop all live line breaks (logpoints ride along untouched).
+        Serialized on the reentrant gate with add/remove (same-file replace
+        races converge, no ghost/resurrection).
         Same per-file replace granularity as remove. `--target X` drops only
         X's ephemeral target-scoped records; bare clear is the full reset:
         global intent + every inherited copy + every ephemeral record."""
@@ -4741,13 +4759,19 @@ class Session:
             if child_warnings:
                 resp["warning"] = "; ".join(child_warnings)
             return self.stamp(resp, "main")
-        resp = self._drop_break_keys(ordered, [])
+        resp, confirmed = self._drop_break_keys(ordered, [])
+        confirmed_set = set(confirmed)
         child_warnings = []
         for tid in self.target_order:
             t = self.targets.get(tid)
             if t is None or t.exited or t.state == "ignored" or t.dap is None:
                 continue
-            doomed = list(set(t.inherited_keys) | set(t.target_raws.keys()))
+            # Ephemeral records always reset; inherited copies only for
+            # confirmed main removals (a failed file keeps its intent and
+            # its copies).
+            doomed = list(dict.fromkeys(
+                list(t.target_raws.keys())
+                + [k for k in t.inherited_keys if k in confirmed_set]))
             if not doomed:
                 continue
             try:
@@ -4761,12 +4785,16 @@ class Session:
     def _drop_break_keys(self, keys, missing):
         """Phase 2 of remove/clear: per-file DAP replace without `keys`.
         A file whose DAP call fails keeps every entry (`failed[]`); only
-        confirmed files mutate config/state/raws."""
+        confirmed files mutate config/state/raws. Returns (resp, confirmed)
+        where confirmed lists exactly the canonical keys removed — callers
+        propagate inherited copies for confirmed keys only (never the
+        requested set)."""
         by_file = {}
         for key in keys:
             by_file.setdefault(key[0], []).append(key)
         removed = []
         failed = []
+        confirmed = []
         for path, items in by_file.items():
             drop = set(items)
             params = []
@@ -4795,6 +4823,7 @@ class Session:
                 stored_raw = self.cfg.break_raws.pop(key, "")
                 if key in self.cfg.breaks:
                     self.cfg.breaks.remove(key)
+                confirmed.append(key)
                 # One live record per file+requested line (same-line
                 # differing conds are rejected at add), so the requested
                 # line disambiguates without touching conds.
@@ -4817,7 +4846,7 @@ class Session:
             resp["failed"] = failed
             resp["warning"] = ("partial remove: no change for "
                                + ", ".join(f["raw"] for f in failed if f["raw"]))
-        return resp
+        return resp, confirmed
 
     def _remove_spec(self, key):
         """Display spec for a stored key (relative path + cond)."""
@@ -5338,6 +5367,84 @@ def idle_pump(st):
         pass
 
 
+def _error_target(st, req):
+    """Request-local error attribution for one connection's envelope.
+
+    Derived synchronously at frame-read time, before any concurrent await
+    can mutate shared serving state: an explicit string target is echoed
+    verbatim (even unknown — the envelope names what was asked); an
+    omitted target uses this request's own resolution where available,
+    else the legacy "main" default. Never another handler's shared
+    _pending_target/_serving. Success stamps are untouched."""
+    try:
+        if isinstance(req, dict):
+            raw = req.get("target")
+            if isinstance(raw, str):
+                return raw
+            try:
+                return st.resolve_target(req)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return "main"
+
+
+def _close_from_conn(st, conn):
+    """Terminal close handling for one connection, outside the handler
+    pool: every close gets the closed ACK; exactly one winner runs the
+    teardown (launch kills its tree, attach detaches). The pool counter
+    is untouched (the overload path never counted)."""
+    with st._gate:
+        mine = not st._closing
+        st._closing = True
+    try_write_frame(conn, {"ok": True, "closed": True, "target": "main"})
+    if not mine:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return
+    try:
+        st.cleanup()
+    except Exception:
+        pass
+    try:
+        st.server.close()
+    except Exception:
+        pass
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _handle_overload(st, conn):
+    """Pool-full bypass: one bounded frame read under the existing framing
+    limits/deadlines (never an unbounded wait). An exact `close` gets
+    terminal close handling outside the pool — close can never be starved
+    by admitted handlers. Anything else gets the existing overloaded
+    rejection; malformed/timeout reads just close the socket."""
+    try:
+        req = read_frame(conn)
+    except BridgeErr:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return
+    if isinstance(req, dict) and req.get("cmd") == "close":
+        _close_from_conn(st, conn)
+        return
+    try_write_frame(conn, {"ok": False,
+                           "error": "overloaded: too many active handlers",
+                           "target": "main"})
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
 def _handle_one(st, conn):
     """Serve a single CLI connection on a handler thread (M5): exactly one
     request and one response per connection. A client disconnect never
@@ -5349,6 +5456,7 @@ def _handle_one(st, conn):
         except BridgeErr as e:
             try_write_frame(conn, {"ok": False, "error": str(e)})
             return
+        err_target = _error_target(st, req)
         try:
             resp = st.dispatch(req)
             if isinstance(resp, dict) and "target" not in resp:
@@ -5364,28 +5472,16 @@ def _handle_one(st, conn):
             # the teardown now (launch kills its tree, attach detaches) and
             # stop accepting. In-flight resume handlers abort on the closed
             # sockets; their responses drop harmlessly (daemon threads).
-            with st._gate:
-                st._closing = True
-            try_write_frame(conn, {"ok": True, "closed": True, "target": "main"})
-            try:
-                st.cleanup()
-            except Exception:
-                pass
-            try:
-                st.server.close()
-            except Exception:
-                pass
+            _close_from_conn(st, conn)
         except BridgeErr as e:
-            target = getattr(st, "_pending_target", None) or getattr(st, "_serving", "main")
-            resp = {"ok": False, "error": str(e), "target": target}
+            resp = {"ok": False, "error": str(e), "target": err_target}
             wc = getattr(e, "wait_context", None)
             if isinstance(wc, dict):
                 resp["waitContext"] = wc
             try_write_frame(conn, resp)
         except Exception as e:
-            target = getattr(st, "_pending_target", None) or getattr(st, "_serving", "main")
             try_write_frame(conn, {"ok": False, "error": f"internal: {e}",
-                                    "target": target})
+                                    "target": err_target})
     finally:
         try:
             conn.close()
@@ -5435,16 +5531,16 @@ def serve(st, server, nonce):
                 except Exception:
                     pass
                 return
-            if st._active >= MAX_ACTIVE_HANDLERS:
-                try_write_frame(conn, {"ok": False,
-                                        "error": "overloaded: too many active handlers",
-                                        "target": "main"})
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                continue
-            st._active += 1
+            overloaded = st._active >= MAX_ACTIVE_HANDLERS
+            if not overloaded:
+                st._active += 1
+        if overloaded:
+            # Pool-full bypass outside the gate (the frame read below is
+            # bounded by the framing deadline — never an unbounded wait
+            # under the lock): an exact close still terminates, everything
+            # else is rejected as before.
+            _handle_overload(st, conn)
+            continue
         t = threading.Thread(target=_handle_one, args=(st, conn), daemon=True)
         t.start()
 

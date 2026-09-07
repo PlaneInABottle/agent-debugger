@@ -665,7 +665,7 @@ class Session {
     // 'main': one tab per session); live reads bypass it entirely.
     this.outstanding = new Map(); // tid -> resume cmd in flight
     this.activeConns = 0;         // live connection handlers (bounded)
-    this._mutationTail = null;    // breaks-mutation mutex chain (adds only)
+    this._mutationTail = null;    // breaks-mutation mutex chain (all mutations)
     // -- layered target identity (M-ID): the attached tab (debuggee,
     // protocol-confirmed) plus the debugger listener (endpoint). Built at
     // handshake; published redacted + capped in session.json.
@@ -2381,7 +2381,10 @@ class Session {
    */
   /** Serialize breaks mutations (promise-chain mutex): concurrent
    *  identical adds recheck under the chain, so the second sees the
-   *  first's state (empty-added, no duplicate records). */
+   *  first's state (empty-added, no duplicate records); concurrent
+   *  add×remove/clear converge the same way (no ghost/resurrection).
+   *  The chain is NOT reentrant: entry points wrap once and inner work
+   *  calls the _Inner/drop forms directly. */
   async _mutationRun(fn) {
     let release;
     const willLock = new Promise((resolve) => {
@@ -2561,8 +2564,15 @@ class Session {
    * the normal logpoint path (or records pending + warning). Reload never
    * restores removed breaks (plants come from cfg, which already dropped
    * them).
+   *
+   * Serialized on the mutation chain with add/clear (the chain is not
+   * reentrant: this wrapper owns the run, the _Inner form does the work).
    */
   async cmdBreaksRemove(req) {
+    return this._mutationRun(() => this._cmdBreaksRemoveInner(req));
+  }
+
+  async _cmdBreaksRemoveInner(req) {
     await this.verifyTab();
     if (this.exited) throw new BridgeErr(EXITED_MSG);
     const raws = req.breaks;
@@ -2587,6 +2597,10 @@ class Session {
   }
 
   async cmdBreaksClear() {
+    return this._mutationRun(() => this._cmdBreaksClearInner());
+  }
+
+  async _cmdBreaksClearInner() {
     await this.verifyTab();
     if (this.exited) throw new BridgeErr(EXITED_MSG);
     const ordered = [];
@@ -2760,58 +2774,13 @@ async function serve(st, server, queue) {
   // an unbounded spawn). Live reads serve published state while a resume
   // is outstanding; rivals busy-reject in dispatch. A client disconnect
   // drops only its own response.
-  async function handleConn(conn) {
-    st.activeConns += 1;
-    try {
-      let req;
-      try {
-        req = await readFrame(conn);
-      } catch (e) {
-        try {
-          await writeFrame(conn, { ok: false, error: String((e && e.message) || e) });
-        } catch (_) { /* client already gone — nothing to answer */ }
-        return;
-      }
-      try {
-        const resp = await st.dispatch(req);
-        if (resp && typeof resp === 'object' && !('target' in resp)) {
-          resp.target = 'main';
-        }
-        try {
-          await writeFrame(conn, resp);
-        } catch (_) { /* client went away mid-command: work already ran */ }
-      } catch (e) {
-        if (e instanceof CloseSession) {
-          // Terminal and accepted despite any outstanding resume: never
-          // wait for a handler that itself awaits a stop — detach now.
-          // The serve loop below gives in-flight handlers a bounded grace
-          // to flush their aborts.
-          try {
-            await writeFrame(conn, { ok: true, closed: true, target: 'main' });
-          } catch (_) { /* client already gone */ }
-          st.closing = true;
-          await st.cleanup().catch(() => {});
-          return;
-        }
-        const msg = e instanceof BridgeErr ? e.message : `internal: ${(e && e.message) || e}`;
-        const resp = { ok: false, error: msg, target: 'main' };
-        if (e && e.waitContext && typeof e.waitContext === 'object') {
-          resp.waitContext = e.waitContext;
-        }
-        try {
-          await writeFrame(conn, resp);
-        } catch (_) { /* client already gone */ }
-      }
-    } finally {
-      conn.destroy();
-      st.activeConns -= 1;
-    }
-  }
 
   for (;;) {
     if (!amOwner(st.cfg.dir)) {
       await st.cleanup().catch(() => {});
       process.exit(0);
+      return; // exit never returns; bound stubbed/embedded use instead
+      // of spinning cleanup+exit forever.
     }
     if (st.closing) {
       await sleep(500);
@@ -2832,20 +2801,116 @@ async function serve(st, server, queue) {
       if (queue.length === 0 && !amOwner(st.cfg.dir)) {
         await st.cleanup().catch(() => {});
         process.exit(0);
+        return; // exit never returns; bound stubbed/embedded use instead
+        // of spinning cleanup+exit forever.
       }
     }
     if (st.closing) continue;
     const conn = queue.shift();
     if (!conn) continue;
     if (st.activeConns >= MAX_ACTIVE_HANDLERS) {
-      try {
-        await writeFrame(conn, { ok: false, error: 'overloaded: too many active handlers', target: 'main' });
-      } catch (_) { /* client already gone */ }
-      conn.destroy();
+      await handleOverload(st, conn);
       continue;
     }
-    handleConn(conn).catch(() => {});
+    handleConn(st, conn).catch(() => {});
   }
+}
+
+/** Pool-full bypass: one bounded frame read under the existing framing
+ *  limits/deadlines (never an unbounded wait). An exact `close` gets
+ *  terminal close handling outside the pool — close can never be starved
+ *  by admitted handlers. Anything else gets the existing overloaded
+ *  rejection; malformed/timeout reads just close the socket. The pool
+ *  counter is untouched (this path never counted). */
+async function handleOverload(st, conn) {
+  let req;
+  try {
+    req = await readFrame(conn); // existing 5s framing deadline
+  } catch (_) {
+    try {
+      conn.destroy();
+    } catch (_) { /* already gone */ }
+    return;
+  }
+  if (req && typeof req === 'object' && !Array.isArray(req) && req.cmd === 'close') {
+    await closeFromConn(st, conn);
+    return;
+  }
+  try {
+    await writeFrame(conn, { ok: false, error: 'overloaded: too many active handlers', target: 'main' });
+  } catch (_) { /* client already gone */ }
+  conn.destroy();
+}
+
+/** Serve one CLI connection: exactly one request and one response. */
+async function handleConn(st, conn) {
+  st.activeConns += 1;
+  try {
+    let req;
+    try {
+      req = await readFrame(conn);
+    } catch (e) {
+      try {
+        await writeFrame(conn, { ok: false, error: String((e && e.message) || e) });
+      } catch (_) { /* client already gone — nothing to answer */ }
+      return;
+    }
+    try {
+      const resp = await st.dispatch(req);
+      if (resp && typeof resp === 'object' && !('target' in resp)) {
+        resp.target = 'main';
+      }
+      try {
+        await writeFrame(conn, resp);
+      } catch (_) { /* client went away mid-command: work already ran */ }
+    } catch (e) {
+      if (e instanceof CloseSession) {
+        // Terminal and accepted despite any outstanding resume: never
+        // wait for a handler that itself awaits a stop — detach now.
+        // The serve loop below gives in-flight handlers a bounded grace
+        // to flush their aborts.
+        await closeFromConn(st, conn);
+        return;
+      }
+      const msg = e instanceof BridgeErr ? e.message : `internal: ${(e && e.message) || e}`;
+      const resp = { ok: false, error: msg, target: 'main' };
+      if (e && e.waitContext && typeof e.waitContext === 'object') {
+        resp.waitContext = e.waitContext;
+      }
+      try {
+        await writeFrame(conn, resp);
+      } catch (_) { /* client already gone */ }
+    }
+  } finally {
+    conn.destroy();
+    st.activeConns -= 1;
+  }
+}
+
+/** Terminal close handling for one connection, outside the handler pool:
+ *  every close gets the closed ACK; exactly one winner runs the teardown
+ *  (the single-threaded check-and-set is atomic — no await between the
+ *  flag read and write). The pool counter is untouched (the overload path
+ *  never counted). */
+async function closeFromConn(st, conn) {
+  let mine = false;
+  if (!st.closing) {
+    st.closing = true;
+    mine = true;
+  }
+  try {
+    await writeFrame(conn, { ok: true, closed: true, target: 'main' });
+  } catch (_) { /* client already gone */ }
+  if (!mine) {
+    try {
+      conn.destroy();
+    } catch (_) { /* already gone */ }
+    return;
+  }
+  await st.cleanup().catch(() => {});
+  try {
+    conn.destroy();
+  } catch (_) { /* already gone */ }
 }
 
 function writeSessionFile(dir, obj, cfg, st) {
