@@ -2,10 +2,16 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org/)
-[![Status](https://img.shields.io/badge/status-production--ready-green.svg)]()
+[![Status](https://img.shields.io/badge/status-early%20access%20%2F%20active%20development-yellow.svg)](https://github.com/PlaneInABottle/agent-debugger/issues)
 
 > **Headless, snapshot-first multi-language debugger for AI agents and terminal workflows.**  
 > Supports **Python**, **Node.js**, **Browser (Chrome/CDP)**, and **Java** over a single unified protocol.
+
+---
+
+> ⚠️ **Early Access & Bug Notice:**  
+> `agent-debugger` is a newly launched, actively developing project. While the core architecture, kernel file locks, and embedded language bridges are backed by an extensive test suite (unit, concurrency, and live integration tests), real-world multi-runtime debugging inevitably encounters edge cases across different OS environments, package managers, and runtime versions.  
+> If you hit unexpected behavior or find a bug, please [open an issue](https://github.com/PlaneInABottle/agent-debugger/issues) with the output of `agent-debugger doctor`. Feedback, bug reports, and pull requests are warmly welcome!
 
 ---
 
