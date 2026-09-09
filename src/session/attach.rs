@@ -269,10 +269,20 @@ pub(crate) fn find_live_endpoint_owner_in(
             Ok(m) if m.file_type().is_dir() => {}
             _ => continue,
         }
-        let stops: Value = std::fs::read_to_string(dir.join("stops.json"))
+        // Noisy siblings (launch intents, malformed or unreadable sidecars,
+        // still-starting dirs) are skipped entry by entry: a `?` here would
+        // abort the whole scan on an unrelated dir and hide a live owner.
+        let stops: Value = match std::fs::read_to_string(dir.join("stops.json"))
             .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())?;
-        let (eh, ep) = intent_endpoint(&stops)?;
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+        {
+            Some(v) => v,
+            None => continue,
+        };
+        let (eh, ep) = match intent_endpoint(&stops) {
+            Some(e) => e,
+            None => continue,
+        };
         if ep != port || normalize_attach_host(&eh) != norm {
             continue;
         }
@@ -281,9 +291,13 @@ pub(crate) fn find_live_endpoint_owner_in(
         if !attach_exclusive(session_lang_opt(&dir).as_deref().unwrap_or("")) {
             continue;
         }
-        let sess: Value = std::fs::read_to_string(dir.join("session.json"))
+        let sess: Value = match std::fs::read_to_string(dir.join("session.json"))
             .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())?;
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+        {
+            Some(v) => v,
+            None => continue,
+        };
         match sess.get("kind").and_then(|k| k.as_str()) {
             Some("attach") | Some("launch") => {}
             _ => continue,
@@ -928,6 +942,123 @@ mod tests {
         // Socket closed: the owner reads dead now, no block, no cleanup.
         assert!(find_live_endpoint_owner_in(&root, "new", "127.0.0.1", 5678).is_none());
         assert!(root.join("owner").exists(), "scan must not delete");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn endpoint_scan_skips_noisy_siblings_in_any_order() {
+        // Noisy siblings that must never abort the scan: launch-kind intent
+        // without an endpoint, malformed stops.json/session.json, an
+        // unreadable stops.json (a directory, so read fails for any user),
+        // and a starting dir (valid intent, no session.json yet). Every
+        // noise entry aborts the pre-fix `?` scan when iterated before the
+        // owner, so each fresh root covers oneowner name: across many names
+        // at least one owner iterates after noise on any filesystem hash
+        // order (read_dir order is never alphabetical/creation order), which
+        // makes the pre-fix failure deterministic in practice while the
+        // fixed scan passes every root deterministically.
+        fn build_noise(root: &std::path::Path) {
+            // Launch-kind sibling with no parseable endpoint.
+            let dir = root.join("launch-noise");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("lang.json"), r#"{"lang":"py"}"#).unwrap();
+            std::fs::write(dir.join("stops.json"), r#"{"requestedTarget":{}}"#).unwrap();
+            std::fs::write(
+                dir.join("session.json"),
+                r#"{"name":"launch-noise","kind":"launch","port":1}"#,
+            )
+            .unwrap();
+            // Malformed stops.json.
+            let dir = root.join("malformed-stops");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("stops.json"), "not json").unwrap();
+            // Valid intent, malformed session.json.
+            let dir = root.join("malformed-session");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("stops.json"),
+                r#"{"requestedTarget":{"host":"127.0.0.1","port":5678,"pid":null}}"#,
+            )
+            .unwrap();
+            std::fs::write(dir.join("session.json"), "not json").unwrap();
+            // Unreadable stops.json (a directory: read_to_string always fails).
+            let dir = root.join("unreadable");
+            std::fs::create_dir_all(dir.join("stops.json")).unwrap();
+            // Starting dir: valid intent, no session.json yet.
+            let dir = root.join("starting");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("stops.json"),
+                r#"{"requestedTarget":{"host":"127.0.0.1","port":5678,"pid":null}}"#,
+            )
+            .unwrap();
+        }
+        // Owner-first creation order plus one owner-last root per name:
+        // iteration order (not creation order) decides who is seen first.
+        for owner in [
+            "owner", "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+            "india", "juliet", "kilo",
+        ] {
+            for layout in ["owner-first", "owner-last"] {
+                let root = tmpdir(&format!("endpoint-noisy-{layout}-{owner}"));
+                let sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let live = sock.local_addr().unwrap().port();
+                if layout == "owner-first" {
+                    fake_owner(&root, owner, "py", "attach", "127.0.0.1", json!(5678), live);
+                    build_noise(&root);
+                } else {
+                    build_noise(&root);
+                    fake_owner(&root, owner, "py", "attach", "127.0.0.1", json!(5678), live);
+                }
+                assert_eq!(
+                    find_live_endpoint_owner_in(&root, "new", "127.0.0.1", 5678),
+                    Some(owner.to_string()),
+                    "live owner must survive noisy siblings ({layout}/{owner})"
+                );
+                drop(sock);
+                let _ = std::fs::remove_dir_all(&root);
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_scan_without_live_owner_is_none() {
+        // Only launch/browser-shared/dead/malformed entries: no live
+        // exclusive owner, so the scan must return None (never a collision).
+        let root = tmpdir("endpoint-no-owner");
+        let sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let live = sock.local_addr().unwrap().port();
+        // Browser session on the same port (live daemon, shared CDP port).
+        fake_owner(
+            &root,
+            "tab",
+            "browser",
+            "attach",
+            "127.0.0.1",
+            json!(5678),
+            live,
+        );
+        // Dead exclusive owner (nothing listens on port 1).
+        fake_owner(&root, "dead", "py", "attach", "127.0.0.1", json!(5678), 1);
+        // Malformed siblings.
+        let dir = root.join("malformed-stops");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stops.json"), "not json").unwrap();
+        let dir = root.join("malformed-session");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("stops.json"),
+            r#"{"requestedTarget":{"host":"127.0.0.1","port":5678,"pid":null}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("session.json"), "not json").unwrap();
+        // Launch-kind entry with no endpoint.
+        let dir = root.join("launcher");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lang.json"), r#"{"lang":"py"}"#).unwrap();
+        std::fs::write(dir.join("stops.json"), r#"{"requestedTarget":{}}"#).unwrap();
+        assert!(find_live_endpoint_owner_in(&root, "new", "127.0.0.1", 5678).is_none());
+        drop(sock);
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -88,7 +88,7 @@ pub(crate) fn setup_bridge(
             let bin = bridge::ensure_node()?;
             let script = bridge::ensure_browserbridge()?;
             bridge::ensure_ws()?;
-            let ws_dir = bridge::node_modules_dir().to_string_lossy().to_string();
+            let ws_dir = bridge::node_modules_dir()?.to_string_lossy().to_string();
             let node_path =
                 bridge::prepend_node_path(&ws_dir, std::env::var("NODE_PATH").ok().as_deref());
             std::env::set_var("NODE_PATH", node_path);
@@ -156,7 +156,7 @@ pub(crate) fn setup_bridge(
 
 /// Spawn the bridge daemon and wait for the first stop.
 pub fn spawn(name: &str, spec: &SpawnSpec) -> anyhow::Result<Value> {
-    spawn_in(&sessions_dir(), name, spec)
+    spawn_in(&sessions_dir()?, name, spec)
 }
 
 /// One classification site for every attach setup failure (fast error.json,
@@ -379,7 +379,7 @@ pub(crate) fn spawn_in(
     let _endpoint_guard = match &endpoint {
         Some((host, port)) => {
             let norm = normalize_attach_host(host);
-            let locks = endpoint_locks_dir_for(sessions_root);
+            let locks = endpoint_locks_dir_for(sessions_root)?;
             match acquire_endpoint_lock(&locks, sessions_root, name, spec.lang, &norm, *port)? {
                 EndpointClaim::Held(g) => {
                     if let Some(owner) =

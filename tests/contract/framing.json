@@ -1,0 +1,17 @@
+{
+  "_note": "Shared framing negatives + valid shapes for the three bridges (M2). expect is by error category (reject vs accept), never by byte-identical message text. raw uses JSON escapes; harnesses feed raw as UTF-8 bytes then EOF. rawRepeat expands to prefix + char*count (header-overflow needs >8192 bytes with no blank line).",
+  "cases": [
+    {"name": "negative", "expect": "reject", "raw": "Content-Length: -5\r\n\r\nxxxxx"},
+    {"name": "empty-value", "expect": "reject", "raw": "Content-Length:\r\n\r\n{}"},
+    {"name": "plus", "expect": "reject", "raw": "Content-Length: +5\r\n\r\n12345"},
+    {"name": "non-digit", "expect": "reject", "raw": "Content-Length: 12x\r\n\r\n{}"},
+    {"name": "duplicate", "expect": "reject", "raw": "Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}"},
+    {"name": "missing", "expect": "reject", "raw": "X-Other: 1\r\n\r\n{}"},
+    {"name": "oversize-digits", "expect": "reject", "raw": "Content-Length: 9999999999999999999999\r\n\r\n{}"},
+    {"name": "unicode-digits", "expect": "reject", "raw": "Content-Length: ٥\r\n\r\n{}"},
+    {"name": "body-overflow", "expect": "reject", "raw": "Content-Length: 1048577\r\n\r\n"},
+    {"name": "header-overflow", "expect": "reject", "rawRepeat": {"prefix": "X-Pad: ", "char": "x", "count": 8200}},
+    {"name": "normal-object", "expect": "accept", "raw": "Content-Length: 11\r\n\r\n{\"ok\":true}", "body": "{\"ok\":true}"},
+    {"name": "valid-relaxed-header", "expect": "accept", "raw": "X-Pad: abc\r\ncontent-length: 11\r\n\r\n{\"ok\":true}", "body": "{\"ok\":true}"}
+  ]
+}

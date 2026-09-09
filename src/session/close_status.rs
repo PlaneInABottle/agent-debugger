@@ -4,7 +4,8 @@ use super::forward::forward_target;
 use super::identity::{layered_identity_or_null, stops_armed};
 use super::locks::{quarantine_verified, stale_startup_mtime, startup_lock_path};
 use super::paths::{
-    check_name, checked_session_dir, real_dir_for_delete, session_port, sessions_dir,
+    check_dir_real, check_name, checked_session_dir, read_session_file, real_dir_for_delete,
+    sessions_dir, SessionReadError,
 };
 use super::sidecar::{cli_markers_v2, session_lang_opt, SCHEMA_VERSION};
 use crate::client;
@@ -129,19 +130,62 @@ pub(crate) fn remove_dir_after_foreign_probe(dir: &std::path::Path) -> anyhow::R
 
 /// Close a session; retain management state if the daemon stays alive.
 pub fn close(name: &str) -> anyhow::Result<Value> {
-    let dir = checked_session_dir(name)?;
+    checked_session_dir(name)?;
+    close_in(&sessions_dir()?, name)
+}
+
+/// Testable close over an explicit sessions root (same logic as `close`,
+/// without resolving the real sessions dir): enables the deterministic
+/// close matrix on isolated tmp roots without touching the real
+/// `~/.agent-debugger`.
+///
+/// Decided matrix (breaking, authorized): only a missing `session.json`
+/// with no live starter cleans the stale unpublished dir. IO failures,
+/// JSON corruption, and missing/invalid ports preserve the dir with an
+/// actionable error (session path + next step) — never an automatic
+/// delete, PID kill, or force mode.
+pub(crate) fn close_in(sessions_root: &std::path::Path, name: &str) -> anyhow::Result<Value> {
+    check_name(name)?;
+    let dir = sessions_root.join(name);
+    check_dir_real(&dir)?;
     // Startup-window guard: an unpublished dir may belong to an actively
     // starting bridge (no session.json yet). A live starter keeps its dir
     // with a retryable error; only a lock-free or provably-stale-lock dir
     // proceeds to the normal path below (which re-reads session.json
     // fresh, so a starter that just published is closed via its bridge).
-    startup_close_gate(&sessions_dir(), name)?;
+    startup_close_gate(sessions_root, name)?;
     // Whether the bridge ACKed the close. A false here (with the port
     // already dead) means the daemon died on its own; a false with the port
     // alive means it is wedged — the dir is still removed, but the caller
     // sees the difference instead of a fabricated success.
     let mut confirmed = false;
-    if let Ok(port) = session_port(name) {
+    let session_file = dir.join("session.json");
+    let port: Option<u16> = match read_session_file(&dir) {
+        Ok(v) => match v
+            .get("port")
+            .and_then(|p| p.as_u64())
+            .and_then(|p| u16::try_from(p).ok())
+        {
+            Some(p) => Some(p),
+            None => anyhow::bail!(
+                "cannot close session '{name}': session file {} has no valid port; \
+                 check {}, fix or remove it explicitly, then retry",
+                session_file.display(),
+                session_file.display(),
+            ),
+        },
+        // Missing session.json with no live starter (the gate above already
+        // bailed on a live lock): stale unpublished dir, cleaned below.
+        Err(SessionReadError::NotFound { .. }) => None,
+        // IO failures and corruption preserve the dir with an actionable
+        // error instead of falling through to the delete path.
+        Err(e) => anyhow::bail!(
+            "cannot close session '{name}': {e}; \
+             check {}, fix or remove it explicitly, then retry",
+            session_file.display(),
+        ),
+    };
+    if let Some(port) = port {
         // Generous timeout: bridges serve one command at a time, so a close
         // behind a blocking step/continue queues until that command finishes.
         // A short timeout here used to orphan the daemon (client gave up,
@@ -191,7 +235,7 @@ pub fn close(name: &str) -> anyhow::Result<Value> {
     if !dir.exists() {
         anyhow::bail!("no session '{name}'");
     }
-    remove_unpublished_dir(&sessions_dir(), name, &dir)?;
+    remove_unpublished_dir(sessions_root, name, &dir)?;
     Ok(json!({"closed": name, "confirmed": confirmed, "target": "main"}))
 }
 
@@ -201,12 +245,16 @@ pub fn close(name: &str) -> anyhow::Result<Value> {
 /// sees where each session is parked without any prior memory.
 pub fn status() -> Value {
     let mut sessions = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(sessions_dir()) {
-        for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
-                && checked_session_dir(&entry.file_name().to_string_lossy()).is_ok()
-            {
-                sessions.push(session_entry(&entry.path()));
+    // status() stays infallible (frozen row contract): without a usable
+    // HOME there is no namespace to list, so the row list stays empty.
+    if let Ok(root) = sessions_dir() {
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    && checked_session_dir(&entry.file_name().to_string_lossy()).is_ok()
+                {
+                    sessions.push(session_entry(&entry.path()));
+                }
             }
         }
     }
@@ -602,6 +650,97 @@ mod tests {
             std::fs::remove_file(&dir).unwrap();
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    #[test]
+    fn close_preserves_unreadable_corrupt_and_bad_port() {
+        // Decided matrix: IO failure, JSON corruption, and missing/invalid
+        // port all preserve the dir with an actionable error (session path
+        // + next step) — never an automatic delete. Pre-fix, all four fell
+        // through to the delete path.
+        let cases: Vec<(&str, Box<dyn Fn(&std::path::Path)>)> = vec![
+            // Unreadable session.json (a directory: read_to_string fails
+            // with a non-NotFound IO kind for any user).
+            (
+                "io",
+                Box::new(|dir: &std::path::Path| {
+                    std::fs::create_dir_all(dir.join("session.json")).unwrap();
+                }),
+            ),
+            (
+                "corrupt",
+                Box::new(|dir: &std::path::Path| {
+                    std::fs::write(dir.join("session.json"), "not json").unwrap();
+                }),
+            ),
+            (
+                "no-port",
+                Box::new(|dir: &std::path::Path| {
+                    std::fs::write(
+                        dir.join("session.json"),
+                        r#"{"name":"demo","kind":"launch"}"#,
+                    )
+                    .unwrap();
+                }),
+            ),
+            (
+                "bad-port",
+                Box::new(|dir: &std::path::Path| {
+                    std::fs::write(
+                        dir.join("session.json"),
+                        r#"{"name":"demo","kind":"launch","port":99999}"#,
+                    )
+                    .unwrap();
+                }),
+            ),
+        ];
+        for (tag, setup) in cases {
+            let root = tmpdir(&format!("close-preserve-{tag}"));
+            let name = "demo";
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            setup(&dir);
+            let err = close_in(&root, name).unwrap_err();
+            let msg = format!("{err:#}");
+            let sess = dir.join("session.json").display().to_string();
+            assert!(msg.contains(&sess), "{tag}: error names the path: {msg}");
+            assert!(
+                msg.contains("fix or remove it explicitly"),
+                "{tag}: error gives the next step: {msg}"
+            );
+            assert!(dir.exists(), "{tag}: session dir preserved");
+            assert!(
+                root.join(name).join("session.json").exists(),
+                "{tag}: session file preserved"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn close_cleans_stale_unpublished_and_retries_live_starter() {
+        // Missing session.json with no lock: stale unpublished dir is
+        // cleaned (existing remove_unpublished_dir semantics). With a live
+        // startup lock: retryable, dir and lock intact.
+        let root = tmpdir("close-stale-unpub");
+        let name = "demo";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = close_in(&root, name).expect("stale unpublished cleans");
+        assert_eq!(v["closed"], json!("demo"));
+        assert!(!dir.exists(), "stale unpublished dir removed");
+        // Live starter claims the name: hands off.
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = startup_lock_path(&root, name);
+        std::fs::write(&lock, "live-starter-nonce").unwrap();
+        let err = close_in(&root, name).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("is starting; retry shortly"),
+            "{err:#}"
+        );
+        assert!(dir.is_dir(), "starting dir preserved");
+        assert!(lock.exists(), "live lock preserved");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

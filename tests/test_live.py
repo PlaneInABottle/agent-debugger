@@ -2191,15 +2191,26 @@ class LiveTests(LiveHomeMixin, unittest.TestCase):
         self.assertEqual(markers["schemaVersion"], 2)
         self.assertTrue(self.cli(name, "close")["confirmed"])
         self.sessions.remove(name)
-        # Corrupt session.json: unprovable, refuse; dir survives for close.
+        # Corrupt session.json: unprovable, refuse. Close must preserve
+        # corrupted state for explicit repair/removal; it must not silently
+        # delete a session whose lifecycle state cannot be read.
         self._write_old_fixture(name, kind="launch", port=1)
-        (self.home / ".agent-debugger/sessions" / name / "session.json").write_text("not json")
+        corrupt_dir = self.home / ".agent-debugger/sessions" / name
+        corrupt_file = corrupt_dir / "session.json"
+        corrupt_file.write_text("not json")
         data = self.cli(name, "py", "start", str(script), "--timeout", "2", ok=False)
         self.assertFalse(data["ok"])
         self.assertIn(f"unsupported session '{name}' (schema v1; close it first)",
                       data["error"])
-        out = self.cli(name, "close")
-        self.assertEqual(out["closed"], name)
+        close_data = self.cli(name, "close", ok=False)
+        self.assertFalse(close_data["ok"])
+        self.assertIn("corrupt session file", close_data["error"])
+        self.assertIn(str(corrupt_file), close_data["error"])
+        self.assertTrue(corrupt_dir.is_dir(), "corrupt state must be preserved")
+        # This fixture is owned by this test. Remove it explicitly only
+        # after asserting preservation so the following same-name v2 case
+        # remains deterministic without weakening production close safety.
+        shutil.rmtree(corrupt_dir)
         self._assert_absent(name)
         # v2-present dir bails always, live or dead.
         self.sessions.add(name)

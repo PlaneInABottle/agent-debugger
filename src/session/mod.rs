@@ -80,6 +80,10 @@ pub use identity::{
     IDENTITY_FIELD_CAP, IDENTITY_TOTAL_CAP,
 };
 #[allow(unused_imports)]
+pub(crate) use paths::agent_home;
+#[cfg(test)]
+pub(crate) use paths::with_home;
+#[allow(unused_imports)]
 pub use paths::{normalize_attach_host, session_dir, sessions_dir};
 #[allow(unused_imports)]
 pub use sidecar::{SpawnSpec, SCHEMA_VERSION};

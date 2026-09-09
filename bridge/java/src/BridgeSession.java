@@ -922,16 +922,21 @@ class BridgeSession {
             } catch (Exception e) {
                 return; // server closed
             }
+            boolean overloaded;
             synchronized (st.sessionLock) {
                 if (st.closing) {
                     try { sock.close(); } catch (Exception ignored) {}
                     return;
                 }
-                if (st.activeHandlers >= MAX_ACTIVE_HANDLERS) {
-                    serveOverload(st, sock);
-                    continue;
-                }
-                st.activeHandlers++;
+                // Pool-full bypass decision only: the overload read/teardown
+                // below runs OUTSIDE the lock (a stalled peer's 5s framing
+                // read must never head-of-line-block every other handler).
+                overloaded = st.activeHandlers >= MAX_ACTIVE_HANDLERS;
+                if (!overloaded) st.activeHandlers++;
+            }
+            if (overloaded) {
+                serveOverload(st, sock);
+                continue;
             }
             pool.execute(() -> handleOne(st, sock));
         }

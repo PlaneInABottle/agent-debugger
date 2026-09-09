@@ -2,13 +2,27 @@
 use serde_json::Value;
 use std::path::PathBuf;
 
-pub fn sessions_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(".agent-debugger").join("sessions")
+pub fn sessions_dir() -> anyhow::Result<PathBuf> {
+    Ok(agent_home()?.join(".agent-debugger").join("sessions"))
 }
 
-pub fn session_dir(name: &str) -> PathBuf {
-    sessions_dir().join(name)
+pub fn session_dir(name: &str) -> anyhow::Result<PathBuf> {
+    Ok(sessions_dir()?.join(name))
+}
+
+/// Fail-closed home root (M3): `HOME` unset or blank is an actionable
+/// error, never a silent shared `/tmp` fallback (which aimed every user
+/// without `HOME` at one shared root). All session/adapter/lock roots
+/// route through here.
+pub(crate) fn agent_home() -> anyhow::Result<PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.trim().is_empty() {
+        anyhow::bail!(
+            "HOME is unset or empty; set HOME to a writable private directory \
+             (e.g. export HOME=$PWD/.agent-home)"
+        );
+    }
+    Ok(PathBuf::from(home))
 }
 
 /// Session names are single filesystem segments. Without this, an absolute
@@ -29,7 +43,7 @@ pub(crate) fn check_name(name: &str) -> anyhow::Result<()> {
 
 pub(crate) fn checked_session_dir(name: &str) -> anyhow::Result<PathBuf> {
     check_name(name)?;
-    let dir = session_dir(name);
+    let dir = session_dir(name)?;
     check_dir_real(&dir)?;
     Ok(dir)
 }
@@ -83,6 +97,64 @@ pub(crate) fn read_session(name: &str) -> anyhow::Result<Value> {
     serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("corrupt session file: {e}"))
 }
 
+/// Kind-preserving read of a session dir's `session.json` for lifecycle
+/// decisions (`close`): unlike `read_session` (which erases every read
+/// failure into `no session`), this distinguishes missing (NotFound), other
+/// IO, and JSON corruption so callers preserve state they cannot understand
+/// instead of deleting it. Takes the dir (not a name) so tests exercise it
+/// on isolated tmp roots.
+#[derive(Debug)]
+pub(crate) enum SessionReadError {
+    /// No `session.json` at all.
+    NotFound { path: String },
+    /// Any other read failure, with its kind for the message.
+    Io {
+        kind: std::io::ErrorKind,
+        path: String,
+    },
+    /// Present but unparseable.
+    Corrupt { path: String, detail: String },
+}
+
+impl std::fmt::Display for SessionReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionReadError::NotFound { path } => write!(f, "no session file at {path}"),
+            SessionReadError::Io { kind, path } => {
+                write!(f, "unreadable session file at {path} ({kind:?})")
+            }
+            SessionReadError::Corrupt { path, detail } => {
+                write!(f, "corrupt session file at {path}: {detail}")
+            }
+        }
+    }
+}
+
+pub(crate) fn read_session_file(dir: &std::path::Path) -> Result<Value, SessionReadError> {
+    let file = dir.join("session.json");
+    let raw = match std::fs::read_to_string(&file) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SessionReadError::NotFound {
+                path: file.display().to_string(),
+            });
+        }
+        Err(e) => {
+            return Err(SessionReadError::Io {
+                kind: e.kind(),
+                path: file.display().to_string(),
+            });
+        }
+    };
+    match serde_json::from_str(&raw) {
+        Ok(v) => Ok(v),
+        Err(e) => Err(SessionReadError::Corrupt {
+            path: file.display().to_string(),
+            detail: e.to_string(),
+        }),
+    }
+}
+
 pub(crate) fn session_port(name: &str) -> anyhow::Result<u16> {
     let session = read_session(name)?;
     session
@@ -90,6 +162,56 @@ pub(crate) fn session_port(name: &str) -> anyhow::Result<u16> {
         .and_then(|p| p.as_u64())
         .and_then(|p| u16::try_from(p).ok())
         .ok_or_else(|| anyhow::anyhow!("corrupt session file for '{name}'"))
+}
+
+/// Test-only serialization for HOME-mutating tests (Rust runs tests in
+/// threads of one process and env vars are process-global): every test
+/// that sets/removes HOME goes through `with_home`, which holds this
+/// guard and restores the previous value. Never nested (std Mutex is not
+/// reentrant). Other tests only DERIVE paths from HOME (never write
+/// through them), so a concurrent read observes a self-consistent root.
+#[cfg(test)]
+pub(crate) static HOME_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+struct HomeRestore<'a> {
+    _held: std::sync::MutexGuard<'a, ()>,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl Drop for HomeRestore<'_> {
+    fn drop(&mut self) {
+        self.restore_env();
+    }
+}
+
+#[cfg(test)]
+impl HomeRestore<'_> {
+    fn restore_env(&self) {
+        match &self.previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+}
+
+/// Run `f` with HOME set/removed, restoring the previous value after.
+/// Holds HOME_TEST_GUARD for the duration.
+#[cfg(test)]
+pub(crate) fn with_home<T>(home: Option<&std::path::Path>, f: impl FnOnce() -> T) -> T {
+    let held = HOME_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let restore = HomeRestore {
+        _held: held,
+        previous: std::env::var_os("HOME"),
+    };
+    match home {
+        Some(h) => std::env::set_var("HOME", h),
+        None => std::env::remove_var("HOME"),
+    }
+    let out = f();
+    drop(restore);
+    out
 }
 
 pub(crate) fn startup_nonce() -> String {
@@ -171,6 +293,103 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn read_session_file_preserves_error_kind() {
+        // The close matrix routes through this seam: missing, IO failure,
+        // and corruption must stay distinguishable (read_session erases
+        // them all into `no session`).
+        let base = tmpdir("read-kind");
+        let dir = base.join("demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(matches!(
+            read_session_file(&dir),
+            Err(SessionReadError::NotFound { .. })
+        ));
+        std::fs::write(dir.join("session.json"), "not json").unwrap();
+        assert!(matches!(
+            read_session_file(&dir),
+            Err(SessionReadError::Corrupt { .. })
+        ));
+        std::fs::remove_file(dir.join("session.json")).unwrap();
+        std::fs::create_dir_all(dir.join("session.json")).unwrap();
+        match read_session_file(&dir) {
+            Err(SessionReadError::Io { kind, .. }) => {
+                assert_ne!(kind, std::io::ErrorKind::NotFound)
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
+        std::fs::remove_dir_all(dir.join("session.json")).unwrap();
+        std::fs::write(
+            dir.join("session.json"),
+            r#"{"name":"demo","kind":"launch","port":1}"#,
+        )
+        .unwrap();
+        assert_eq!(read_session_file(&dir).unwrap()["port"], Value::from(1));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn agent_home_fails_closed_without_home() {
+        // Unset, empty, and blank HOME all fail with the actionable error
+        // (never a silent shared /tmp root); every root propagates it.
+        for home in [
+            None,
+            Some(std::path::Path::new("")),
+            Some(std::path::Path::new("   ")),
+        ] {
+            with_home(home, || {
+                let err = format!("{:#}", agent_home().unwrap_err());
+                assert!(err.contains("HOME is unset or empty"), "{err}");
+                assert!(err.contains("agent-home"), "{err}");
+                assert!(sessions_dir().is_err());
+                assert!(session_dir("demo").is_err());
+                assert!(checked_session_dir("demo").is_err());
+            });
+        }
+        // A set HOME still resolves the canonical roots.
+        with_home(
+            Some(std::path::Path::new("/tmp/agent-debugger-home-probe")),
+            || {
+                assert_eq!(
+                    sessions_dir().unwrap(),
+                    std::path::Path::new("/tmp/agent-debugger-home-probe/.agent-debugger/sessions")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn with_home_restores_after_panic() {
+        // Hold the existing non-reentrant guard manually so both the
+        // restoration and the assertion happen under HOME_TEST_GUARD.
+        // Calling with_home here would deadlock by design.
+        let held = HOME_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let before = std::env::var_os("HOME");
+        let restore = HomeRestore {
+            _held: held,
+            previous: before.clone(),
+        };
+        std::env::remove_var("HOME");
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("intentional HOME guard panic");
+        }));
+        assert!(panic.is_err());
+        restore.restore_env();
+        assert_eq!(std::env::var_os("HOME"), before);
+        drop(restore);
+        // The mutex and environment remain usable after unwinding.
+        with_home(
+            Some(std::path::Path::new("/tmp/home-restore-check")),
+            || {
+                assert_eq!(
+                    std::env::var_os("HOME"),
+                    Some(std::ffi::OsString::from("/tmp/home-restore-check"))
+                );
+            },
+        );
+        assert_eq!(std::env::var_os("HOME"), before);
     }
 
     #[test]

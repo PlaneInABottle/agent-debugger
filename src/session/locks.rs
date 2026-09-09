@@ -166,22 +166,21 @@ pub(crate) fn claim_stale_startup_lock(path: &std::path::Path) -> anyhow::Result
 /// each other. The lock is held from preflight through bridge handshake
 /// until session ownership is published; afterwards the published session
 /// (found by the scan above) owns the endpoint.
-pub(crate) fn endpoint_locks_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home)
+pub(crate) fn endpoint_locks_dir() -> anyhow::Result<PathBuf> {
+    Ok(super::paths::agent_home()?
         .join(".agent-debugger")
-        .join("endpoint-locks")
+        .join("endpoint-locks"))
 }
 
 /// Locks dir scoped to a sessions root (unit tests pass a tmpdir so the
 /// reservation is exercised without touching the real namespace).
 /// Production roots (`~/.agent-debugger/sessions`) map to the canonical
 /// `~/.agent-debugger/endpoint-locks`.
-pub(crate) fn endpoint_locks_dir_for(sessions_root: &std::path::Path) -> PathBuf {
-    sessions_root
-        .parent()
-        .map(|p| p.join("endpoint-locks"))
-        .unwrap_or_else(endpoint_locks_dir)
+pub(crate) fn endpoint_locks_dir_for(sessions_root: &std::path::Path) -> anyhow::Result<PathBuf> {
+    match sessions_root.parent() {
+        Some(p) => Ok(p.join("endpoint-locks")),
+        None => endpoint_locks_dir(),
+    }
 }
 
 pub(crate) fn endpoint_lock_path(
@@ -578,6 +577,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn endpoint_locks_dir_fails_closed_without_home() {
+        // Same fail-closed contract as the session roots: no /tmp fallback.
+        crate::session::with_home(None, || {
+            let err = format!("{:#}", endpoint_locks_dir().unwrap_err());
+            assert!(err.contains("HOME is unset or empty"), "{err}");
+            // Scoped roots never need HOME (sibling mapping only).
+            assert_eq!(
+                endpoint_locks_dir_for(std::path::Path::new("/x/sessions")).unwrap(),
+                std::path::Path::new("/x/endpoint-locks")
+            );
+        });
+        crate::session::with_home(Some(std::path::Path::new("/tmp/probe-home")), || {
+            assert_eq!(
+                endpoint_locks_dir().unwrap(),
+                std::path::Path::new("/tmp/probe-home/.agent-debugger/endpoint-locks")
+            );
+            // Scoped roots map to their sibling locks dir without HOME.
+            assert_eq!(
+                endpoint_locks_dir_for(std::path::Path::new("/tmp/r/sessions")).unwrap(),
+                std::path::Path::new("/tmp/r/endpoint-locks")
+            );
+        });
     }
 
     /// Set a file's mtime into the past (stale-policy tests control age

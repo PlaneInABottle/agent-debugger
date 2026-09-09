@@ -422,9 +422,29 @@ pub(crate) fn port_lookup(port: u16) -> Option<ProcInfo> {
 /// Parse /proc/net/tcp{,6} for a loopback LISTEN socket's inode.
 #[cfg(target_os = "linux")]
 pub(crate) fn tcp_listen_inode(port: u16) -> Option<String> {
+    tcp_listen_inode_in(
+        port,
+        std::path::Path::new("/proc/net/tcp"),
+        std::path::Path::new("/proc/net/tcp6"),
+    )
+}
+
+/// Injectable-input seam for `tcp_listen_inode` (same parse, caller-supplied
+/// files): an unreadable first file falls through to the second instead of
+/// returning `None` early. Compiled on Linux plus under test so the fallback
+/// is portable-tested on macOS too.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn tcp_listen_inode_in(
+    port: u16,
+    tcp: &std::path::Path,
+    tcp6: &std::path::Path,
+) -> Option<String> {
     let want = format!(":{port:04X}");
-    for file in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        let raw = std::fs::read_to_string(file).ok()?;
+    for file in [tcp, tcp6] {
+        let raw = match std::fs::read_to_string(file) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
         for line in raw.lines().skip(1) {
             let f: Vec<&str> = line.split_whitespace().collect();
             if f.len() < 10 {
@@ -1018,6 +1038,51 @@ mod tests {
                 entry.as_str().unwrap().chars().count()
             );
         }
+    }
+
+    #[test]
+    fn tcp_listen_inode_falls_back_to_tcp6() {
+        // /proc-style tables with a loopback LISTEN row (port 8080 = 0x1F90).
+        let header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+        let row = |ip: &str, port: u16, inode: &str| {
+            format!("   0: {ip}:{port:04X} 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 {inode}\n")
+        };
+        let dir = tmpdir("tcp-fallback");
+        let tcp = dir.join("tcp");
+        let tcp6 = dir.join("tcp6");
+        // Missing tcp file entirely: tcp6 still answers (the pre-fix `.ok()?`
+        // returned None here without ever trying tcp6).
+        std::fs::write(
+            &tcp6,
+            format!(
+                "{header}{}",
+                row("00000000000000000000000001000000", 8080, "424242")
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            tcp_listen_inode_in(8080, &tcp, &tcp6),
+            Some("424242".to_string())
+        );
+        // Present-but-useless tcp (no match) also falls through.
+        std::fs::write(&tcp, format!("{header}{}", row("0100007F", 9999, "111"))).unwrap();
+        assert_eq!(
+            tcp_listen_inode_in(8080, &tcp, &tcp6),
+            Some("424242".to_string())
+        );
+        // tcp answers when it holds the row.
+        std::fs::write(&tcp, format!("{header}{}", row("0100007F", 8080, "777"))).unwrap();
+        assert_eq!(
+            tcp_listen_inode_in(8080, &tcp, &tcp6),
+            Some("777".to_string())
+        );
+        // Neither file has it: None (no fabrication).
+        assert_eq!(tcp_listen_inode_in(1234, &tcp, &tcp6), None);
+        assert_eq!(
+            tcp_listen_inode_in(8080, &dir.join("missing-a"), &dir.join("missing-b")),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

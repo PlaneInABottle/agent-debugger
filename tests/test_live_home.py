@@ -105,6 +105,37 @@ class LiveHomeHelperTests(unittest.TestCase):
             Fake.dump_failure_bundle()  # must not raise
         self.assertIn("ghost", buf.getvalue())
 
+    def test_setup_home_copies_dependency_dirs_without_symlinks(self):
+        # Regression for M3's symlink refusal: setup_home must provide real
+        # adapter/dependency directories while retaining the existing
+        # dependency prerequisite and never installing or mutating it.
+        class Fake(_live_home.LiveHomeMixin, unittest.TestCase):
+            pass
+
+        with tempfile.TemporaryDirectory(prefix="live-home-origin-") as origin_tmp:
+            origin = Path(origin_tmp)
+            for lang, entry, marker in [
+                ("python", "venv", "bin/python"),
+                ("node", "node_modules", "ws/package.json"),
+            ]:
+                source = origin / ".agent-debugger" / "adapters" / lang / entry
+                (source / Path(marker).parent).mkdir(parents=True)
+                (source / marker).write_text("fixture dependency")
+            with mock.patch.object(Path, "home", return_value=origin):
+                Fake.setup_home("live-home-copy-", "fixture")
+            try:
+                for lang, entry, marker in [
+                    ("python", "venv", "bin/python"),
+                    ("node", "node_modules", "ws/package.json"),
+                ]:
+                    copied = Fake.home / ".agent-debugger" / "adapters" / lang / entry
+                    self.assertTrue(copied.is_dir())
+                    self.assertFalse(copied.is_symlink())
+                    self.assertTrue((copied / marker).is_file())
+                    self.assertFalse((copied / marker).is_symlink())
+            finally:
+                Fake.cleanup()
+
 
 class _StubResult:
     """Minimal unittest-result double (check_live_nonzero reads .skipped

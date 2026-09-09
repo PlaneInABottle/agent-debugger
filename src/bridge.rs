@@ -8,6 +8,9 @@
 //! All bridges run as per-session daemons (see `session`).
 
 use std::path::PathBuf;
+use std::time::Duration;
+
+use crate::session::agent_home;
 
 /// Java bridge sources, embedded at compile time. The bridge is split into
 /// one file per concern (same default package); all are written to the
@@ -79,22 +82,226 @@ const JS_SHARED: &[(&str, &str)] = &[
 /// True when `path` already holds exactly `source` (stale-write-if-changed
 /// seam: every `ensure_*` below rewrites only on mismatch, so a fresh
 /// adapter dir is never touched and a stale/damaged one always converges).
+/// Callers lstat `path` (refusing planted links) BEFORE this read — the
+/// read itself would follow a swapped-in link.
 fn file_matches(path: &std::path::Path, source: &str) -> bool {
     std::fs::read_to_string(path)
         .map(|existing| existing == source)
         .unwrap_or(false)
 }
 
-/// Write the shared JS core into a bridge dir when changed.
+// ---- provisioning guards (M3) ----
+
+/// How long a contended provision waits for a live holder before bailing
+/// retryably (`adapter provisioning in progress; retry shortly`): covers
+/// the 180s pip/npm timeout below plus javac margin. Never spins forever,
+/// never steals.
+pub(crate) const PROVISION_LOCK_WAIT: Duration = Duration::from_secs(200);
+
+/// Poll interval while a live holder provisions: prompt entry without hot
+/// spinning. Pacing only — exclusion never depends on it.
+pub(crate) const PROVISION_LOCK_POLL: Duration = Duration::from_millis(20);
+
+/// Owns the open lock-file handle: the kernel exclusive lock is held as
+/// long as this guard lives and releases on handle close — guard drop or
+/// whole-process death alike (crash-safe, no mtime/steal protocol). The
+/// lock file is never deleted, replaced, or truncated, so every holder
+/// rendezvous on the same inode.
+#[derive(Debug)]
+pub(crate) struct ProvisionGuard {
+    _file: std::fs::File,
+}
+
+pub(crate) fn provision_lock_path(adapters: &std::path::Path, adapter: &str) -> PathBuf {
+    adapters.join(format!("{adapter}.lock"))
+}
+
+/// Claim one adapter's provisioning lock, waiting briefly for a live
+/// holder. `WouldBlock` polls to the bound, then bails retryably; any
+/// other lock error, a symlink, or a non-regular file bails as a
+/// provisioning error. The file is opened read+write+create (never
+/// truncate/exclusive/create_new) and is never deleted — first creator
+/// and concurrent openers land on one inode. `wait`/`poll` are injectable
+/// so tests use short bounds while production uses the 200s/20ms pair.
+pub(crate) fn acquire_provision_lock(
+    path: &std::path::Path,
+    wait: Duration,
+    poll: Duration,
+) -> anyhow::Result<ProvisionGuard> {
+    refuse_provision_link(path, "provisioning lock")?;
+    if let Ok(m) = std::fs::symlink_metadata(path) {
+        if !m.file_type().is_file() {
+            anyhow::bail!(
+                "provisioning lock must be a regular file: {}",
+                path.display()
+            );
+        }
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("cannot open provisioning lock {}: {e}", path.display()))?;
+    // Re-verify the opened handle (closes the check-then-open swap window
+    // short of a swap-back race, accepted as best-effort — same stance as
+    // the session-dir and breaks-lock checks).
+    if !file
+        .metadata()
+        .map(|m| m.file_type().is_file())
+        .unwrap_or(false)
+    {
+        anyhow::bail!(
+            "provisioning lock must be a regular file: {}",
+            path.display()
+        );
+    }
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(ProvisionGuard { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("adapter provisioning in progress; retry shortly");
+                }
+                std::thread::sleep(poll);
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                anyhow::bail!("cannot lock {}: {e}", path.display())
+            }
+        }
+    }
+}
+
+/// Refuse a planted symlink at `path` (absent is fine — the caller
+/// creates). Every provisioning write/lock path lstates before use so a
+/// swapped-in link is never followed by create/write/rename.
+fn refuse_provision_link(path: &std::path::Path, what: &str) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            anyhow::bail!("{what} must not be a symlink: {}", path.display())
+        }
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => anyhow::bail!("cannot stat {what} {}: {e}", path.display()),
+    }
+}
+
+/// Leaf check for a provisioning path: symlinks refuse; an existing
+/// adapter dir must be a real dir, an existing bridge dest a regular file
+/// (absent is fine — the caller creates). Runs BEFORE any
+/// `file_matches`/`read_to_string`, which would follow a link.
+fn check_provision_path(path: &std::path::Path, want_dir: bool, what: &str) -> anyhow::Result<()> {
+    refuse_provision_link(path, what)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if want_dir && !m.file_type().is_dir() => {
+            anyhow::bail!("{what} must be a real directory: {}", path.display())
+        }
+        Ok(m) if !want_dir && !m.file_type().is_file() => {
+            anyhow::bail!("{what} must be a regular file: {}", path.display())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Create `dir` (plus missing ancestors) after refusing a planted symlink
+/// on the managed path. Trust boundary: `anchor` itself is trusted (the
+/// user's own HOME root or a test-owned dir); every EXISTING component
+/// strictly below it down to `dir` must not be a link. Components at/above
+/// the anchor (system prefixes like /tmp or /var, legitimately links on
+/// macOS) are never judged. Absent components are created; a swap between
+/// check and create is accepted as best-effort (same stance as the
+/// session-dir checks). Callers pass `(dir, dir)` for a leaf-only check.
+fn ensure_real_dir_all(anchor: &std::path::Path, dir: &std::path::Path) -> anyhow::Result<()> {
+    let mut chain: Vec<&std::path::Path> = vec![dir];
+    let mut cur = dir;
+    loop {
+        if cur == anchor {
+            break;
+        }
+        match cur.parent() {
+            Some(p) if p != cur => {
+                cur = p;
+                chain.push(cur);
+            }
+            _ => break, // filesystem root without meeting anchor
+        }
+    }
+    if chain.last() == Some(&anchor) {
+        // Managed pair: verify top-down from below the anchor, stopping
+        // at the first absent component (create covers the rest).
+        for p in chain[..chain.len() - 1].iter().rev() {
+            refuse_provision_link(p, "provisioning dir")?;
+            if std::fs::symlink_metadata(p).is_err() {
+                break;
+            }
+        }
+    } else {
+        // Test seam (dir outside the anchor): leaf only.
+        refuse_provision_link(dir, "provisioning dir")?;
+    }
+    std::fs::create_dir_all(dir)
+        .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.to_string_lossy()))?;
+    Ok(())
+}
+
+/// Provisioning mkdir for canonical flows (anchor = the fail-closed HOME)
+/// and test seams (unresolvable HOME degrades to a leaf-only check — the
+/// test owns its dir outright, so there is no ancestor to protect).
+fn ensure_provision_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+    let anchor = agent_home().unwrap_or_else(|_| PathBuf::from("/nonexistent-agent-home"));
+    ensure_real_dir_all(&anchor, dir)
+}
+
+/// Unique tmp name in `dir` for one atomic bridge write (never a fixed
+/// name, so concurrent holders never share it).
+fn provision_tmp_name(dest: &std::path::Path) -> PathBuf {
+    static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    dest.with_extension(format!("tmp.{}.{n}", std::process::id()))
+}
+
+/// Write `source` to `dest` atomically: exclusive create-new tmp in the
+/// same dir + rename. The caller lstates `dest` first and holds the
+/// adapter lock; only this call's own tmp is ever removed (never the dest,
+/// never a lock inode).
+fn atomic_write_provisioned(dest: &std::path::Path, source: &str) -> anyhow::Result<()> {
+    let tmp = provision_tmp_name(dest);
+    let written = (|| -> anyhow::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", tmp.to_string_lossy()))?;
+        use std::io::Write as _;
+        f.write_all(source.as_bytes())
+            .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", tmp.to_string_lossy()))?;
+        f.sync_all()
+            .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", tmp.to_string_lossy()))?;
+        drop(f);
+        std::fs::rename(&tmp, dest)
+            .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", dest.to_string_lossy()))?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+/// Write the shared JS core into a bridge dir when changed. Runs under the
+/// caller's adapter lock (node.lock for the node dir, browser.lock for the
+/// browser dir — see the wrappers below); this helper takes no lock
+/// itself. Symlink-guarded + atomic like every bridge write.
 fn ensure_js_shared(dir: &std::path::Path) -> anyhow::Result<bool> {
+    check_provision_path(dir, true, "bridge dir")?;
     let mut changed = false;
     for (name, source) in JS_SHARED {
         let dest = dir.join(name);
+        check_provision_path(&dest, false, "bridge file")?;
         if !file_matches(&dest, source) {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.to_string_lossy()))?;
-            std::fs::write(&dest, source)
-                .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", dest.to_string_lossy()))?;
+            ensure_provision_dir(dir)?;
+            atomic_write_provisioned(&dest, source)?;
             changed = true;
         }
     }
@@ -110,17 +317,32 @@ pub(crate) fn prepend_node_path(ws_dir: &str, existing: Option<&str>) -> String 
     }
 }
 
-pub fn adapter_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home)
-        .join(".agent-debugger")
-        .join("adapters")
-        .join("java")
+/// Adapter roots live under the fail-closed HOME (no `/tmp` fallback):
+/// `<agent_home>/.agent-debugger/adapters`.
+fn adapters_dir() -> anyhow::Result<PathBuf> {
+    Ok(agent_home()?.join(".agent-debugger").join("adapters"))
+}
+
+pub fn adapter_dir() -> anyhow::Result<PathBuf> {
+    Ok(adapters_dir()?.join("java"))
 }
 
 /// Ensure the bridge is compiled; return the classes dir for `java -cp`.
+/// Single-flights on java.lock; the locked inner assumes it is held.
 pub fn ensure_compiled() -> anyhow::Result<PathBuf> {
-    let dir = adapter_dir();
+    let adapters = adapters_dir()?;
+    ensure_provision_dir(&adapters)?;
+    let _guard = acquire_provision_lock(
+        &provision_lock_path(&adapters, "java"),
+        PROVISION_LOCK_WAIT,
+        PROVISION_LOCK_POLL,
+    )?;
+    ensure_compiled_locked()
+}
+
+fn ensure_compiled_locked() -> anyhow::Result<PathBuf> {
+    let dir = adapter_dir()?;
+    check_provision_path(&dir, true, "adapter dir")?;
     let classes = dir.join("classes");
     let marker = classes.join("JdiBridge.class");
 
@@ -136,18 +358,20 @@ pub fn ensure_compiled() -> anyhow::Result<PathBuf> {
     }
     for (name, source) in JAVA_SOURCES {
         let dest = dir.join(name);
+        // Lstat before the stale read (file_matches would follow a link).
+        check_provision_path(&dest, false, "bridge file")?;
         if !file_matches(&dest, source) {
             stale = true;
         }
     }
     if stale {
-        std::fs::create_dir_all(&classes)
-            .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", classes.to_string_lossy()))?;
+        // `classes/` is compiler-managed output: guard the dir itself
+        // (symlink refusal + ancestors), not each generated file.
+        ensure_provision_dir(&classes)?;
         let mut sources = Vec::with_capacity(JAVA_SOURCES.len());
         for (name, source) in JAVA_SOURCES {
             let dest = dir.join(name);
-            std::fs::write(&dest, source)
-                .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", dest.to_string_lossy()))?;
+            atomic_write_provisioned(&dest, source)?;
             sources.push(dest);
         }
         let out = std::process::Command::new("javac")
@@ -168,32 +392,29 @@ pub fn ensure_compiled() -> anyhow::Result<PathBuf> {
     Ok(classes)
 }
 
-pub fn python_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home)
-        .join(".agent-debugger")
-        .join("adapters")
-        .join("python")
+pub fn python_dir() -> anyhow::Result<PathBuf> {
+    Ok(adapters_dir()?.join("python"))
 }
 
-fn venv_python() -> PathBuf {
-    python_dir().join("venv").join("bin").join("python")
+fn venv_python() -> anyhow::Result<PathBuf> {
+    Ok(python_dir()?.join("venv").join("bin").join("python"))
 }
 
 /// Program + args used to install debugpy into the isolated venv.
 /// Always the venv interpreter itself (`<venv>/bin/python -m pip ...`);
 /// a `<venv>/bin/pip` path would resolve through the interpreter file
 /// (`<venv>/bin/python/bin/pip`, ENOTDIR on fresh HOME).
-fn debugpy_install_command() -> (PathBuf, Vec<String>) {
-    (
-        venv_python(),
+fn debugpy_install_command() -> anyhow::Result<(PathBuf, Vec<String>)> {
+    let venv = venv_python()?;
+    Ok((
+        venv,
         vec![
             "-m".to_string(),
             "pip".to_string(),
             "install".to_string(),
             "debugpy".to_string(),
         ],
-    )
+    ))
 }
 
 fn has_debugpy(interp: &str) -> bool {
@@ -206,17 +427,49 @@ fn has_debugpy(interp: &str) -> bool {
 
 /// Resolve a Python interpreter with debugpy: isolated venv first (created on
 /// first use), then system python3. Returns the interpreter path.
+/// Single-flights venv creation + debugpy install on python.lock; pure
+/// probes stay outside the lock, and the locked section rechecks them so a
+/// waiter never repeats a finished provision.
 pub fn ensure_py() -> anyhow::Result<String> {
-    let venv = venv_python();
-    let venv_str = venv.to_string_lossy().to_string();
+    if let Some(hit) = ensure_py_fast()? {
+        return Ok(hit);
+    }
+    let adapters = adapters_dir()?;
+    ensure_provision_dir(&adapters)?;
+    let _guard = acquire_provision_lock(
+        &provision_lock_path(&adapters, "python"),
+        PROVISION_LOCK_WAIT,
+        PROVISION_LOCK_POLL,
+    )?;
+    ensure_py_locked()
+}
+
+/// Probe-only fast path (no writes, no lock): venv interpreter, then
+/// system python3 — both with debugpy importable.
+fn ensure_py_fast() -> anyhow::Result<Option<String>> {
+    let venv_str = venv_python()?.to_string_lossy().to_string();
     if has_debugpy(&venv_str) {
-        return Ok(venv_str);
+        return Ok(Some(venv_str));
     }
     if has_debugpy("python3") {
-        return Ok("python3".to_string());
+        return Ok(Some("python3".to_string()));
     }
+    Ok(None)
+}
+
+fn ensure_py_locked() -> anyhow::Result<String> {
+    // Another holder may have finished while we waited: recheck before
+    // creating anything (and guard the adapter dir itself).
+    if let Some(hit) = ensure_py_fast()? {
+        return Ok(hit);
+    }
+    let dir = python_dir()?;
+    check_provision_path(&dir, true, "adapter dir")?;
+    let venv_str = venv_python()?.to_string_lossy().to_string();
     // First use: isolated venv so we never touch the system Python (PEP 668).
-    let venv_dir = python_dir().join("venv");
+    // `venv/` is tool-managed output: guard the dir, not each generated file.
+    let venv_dir = python_dir()?.join("venv");
+    ensure_provision_dir(&venv_dir)?;
     let out = std::process::Command::new("python3")
         .args(["-m", "venv"])
         .arg(&venv_dir)
@@ -230,7 +483,7 @@ pub fn ensure_py() -> anyhow::Result<String> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let (pip_program, pip_args) = debugpy_install_command();
+    let (pip_program, pip_args) = debugpy_install_command()?;
     let pip = run_with_timeout(pip_program, &pip_args, std::time::Duration::from_secs(180))
         .map_err(|e| anyhow::anyhow!("pip failed to start: {e}"))?;
     if !pip.status.success() || !has_debugpy(&venv_str) {
@@ -280,35 +533,40 @@ fn run_with_timeout(
 }
 
 /// Write the embedded pybridge when it changed; return its path.
+/// Single-flights on python.lock (same scope as `ensure_py`).
 pub fn ensure_pybridge() -> anyhow::Result<PathBuf> {
-    ensure_pybridge_in(&python_dir())
+    let adapters = adapters_dir()?;
+    ensure_provision_dir(&adapters)?;
+    let _guard = acquire_provision_lock(
+        &provision_lock_path(&adapters, "python"),
+        PROVISION_LOCK_WAIT,
+        PROVISION_LOCK_POLL,
+    )?;
+    ensure_pybridge_in(&python_dir()?)
 }
 
 /// `ensure_pybridge` against an explicit dir (temp-HOME test seam; the
-/// public entry pins the canonical adapter dir).
+/// public entry pins the canonical adapter dir). Lock-free: the caller
+/// holds the adapter lock (or the test owns the dir outright).
 fn ensure_pybridge_in(dir: &std::path::Path) -> anyhow::Result<PathBuf> {
+    check_provision_path(dir, true, "adapter dir")?;
     let dest = dir.join("pybridge.py");
+    check_provision_path(&dest, false, "bridge file")?;
     if !file_matches(&dest, PYBRIDGE_SOURCE) {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.to_string_lossy()))?;
-        std::fs::write(&dest, PYBRIDGE_SOURCE)
-            .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", dest.to_string_lossy()))?;
+        ensure_provision_dir(dir)?;
+        atomic_write_provisioned(&dest, PYBRIDGE_SOURCE)?;
     }
     Ok(dest)
 }
 
-pub fn node_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home)
-        .join(".agent-debugger")
-        .join("adapters")
-        .join("node")
+pub fn node_dir() -> anyhow::Result<PathBuf> {
+    Ok(adapters_dir()?.join("node"))
 }
 
 /// Shared node_modules holding the `ws` client (provisioned once by the
 /// node adapter, reused by the browser bridge via NODE_PATH).
-pub fn node_modules_dir() -> PathBuf {
-    node_dir().join("node_modules")
+pub fn node_modules_dir() -> anyhow::Result<PathBuf> {
+    Ok(node_dir()?.join("node_modules"))
 }
 
 /// Resolve the node binary running the bridge (explicit --node reaches the
@@ -329,14 +587,41 @@ pub fn ensure_node() -> anyhow::Result<String> {
 
 /// Ensure the tiny `ws` client lives in the isolated adapter dir
 /// (first use runs `npm install ws` once; reused afterwards).
+/// Single-flights on node.lock; the locked inner assumes it is held.
 pub fn ensure_ws() -> anyhow::Result<()> {
-    let dir = node_dir();
-    let marker = dir.join("node_modules").join("ws").join("package.json");
-    if marker.exists() {
+    let dir = node_dir()?;
+    if ensure_ws_marker_ok(&dir) {
         return Ok(());
     }
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.to_string_lossy()))?;
+    let adapters = adapters_dir()?;
+    ensure_provision_dir(&adapters)?;
+    let _guard = acquire_provision_lock(
+        &provision_lock_path(&adapters, "node"),
+        PROVISION_LOCK_WAIT,
+        PROVISION_LOCK_POLL,
+    )?;
+    ensure_ws_locked(&node_dir()?)
+}
+
+/// Marker probe (no writes, no lock): the installed `ws` package manifest.
+fn ensure_ws_marker_ok(dir: &std::path::Path) -> bool {
+    dir.join("node_modules")
+        .join("ws")
+        .join("package.json")
+        .exists()
+}
+
+/// Non-acquiring inner: caller holds node.lock. Rechecks the marker (a
+/// waiter never repeats a finished install), then installs.
+fn ensure_ws_locked(dir: &std::path::Path) -> anyhow::Result<()> {
+    if ensure_ws_marker_ok(dir) {
+        return Ok(());
+    }
+    check_provision_path(&dir, true, "adapter dir")?;
+    // `node_modules/` is npm-managed output: guard the dir, not each
+    // generated file.
+    ensure_provision_dir(&dir)?;
+    let marker = dir.join("node_modules").join("ws").join("package.json");
     let out = run_with_timeout(
         PathBuf::from("npm"),
         &[
@@ -360,13 +645,24 @@ pub fn ensure_ws() -> anyhow::Result<()> {
 }
 
 /// Write the embedded nodebridge (+ shared core) when changed; return path.
+/// Single-flights on node.lock.
 pub fn ensure_nodebridge() -> anyhow::Result<PathBuf> {
-    ensure_nodebridge_in(&node_dir())
+    let adapters = adapters_dir()?;
+    ensure_provision_dir(&adapters)?;
+    let _guard = acquire_provision_lock(
+        &provision_lock_path(&adapters, "node"),
+        PROVISION_LOCK_WAIT,
+        PROVISION_LOCK_POLL,
+    )?;
+    ensure_nodebridge_in(&node_dir()?)
 }
 
 /// `ensure_nodebridge` against an explicit dir (temp-HOME test seam).
+/// Lock-free: the caller holds the adapter lock (or the test owns the dir).
 fn ensure_nodebridge_in(dir: &std::path::Path) -> anyhow::Result<PathBuf> {
+    check_provision_path(dir, true, "adapter dir")?;
     let dest = dir.join("nodebridge.js");
+    check_provision_path(&dest, false, "bridge file")?;
     // Independent checks: `||` would short-circuit and skip the shared
     // write exactly when the bridge itself is stale (observed live: new
     // bridge with requires, shared files missing, startup crash).
@@ -374,41 +670,64 @@ fn ensure_nodebridge_in(dir: &std::path::Path) -> anyhow::Result<PathBuf> {
     let shared_stale = ensure_js_shared(dir)?;
     let stale = bridge_stale || shared_stale;
     if stale {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.to_string_lossy()))?;
-        std::fs::write(&dest, NODEBRIDGE_SOURCE)
-            .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", dest.to_string_lossy()))?;
+        ensure_provision_dir(dir)?;
+        atomic_write_provisioned(&dest, NODEBRIDGE_SOURCE)?;
     }
     Ok(dest)
 }
 
-pub fn browser_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home)
-        .join(".agent-debugger")
-        .join("adapters")
-        .join("browser")
+pub fn browser_dir() -> anyhow::Result<PathBuf> {
+    Ok(adapters_dir()?.join("browser"))
 }
 
 /// Write the embedded browserbridge when it changed; return its path.
 /// The bridge itself runs on Node (shared provisioning); Chrome is the
 /// *target* and is never installed by us — see find_chrome().
+///
+/// Locking (fixed global order `node → browser`, never reverse): acquires
+/// node.lock then browser.lock ONCE, then runs the non-acquiring inners —
+/// it never calls the locking `ensure_ws()` wrapper while holding
+/// node.lock (that would self-deadlock on the re-acquire).
 pub fn ensure_browserbridge() -> anyhow::Result<PathBuf> {
-    ensure_browserbridge_in(&browser_dir())
+    let adapters = adapters_dir()?;
+    ensure_provision_dir(&adapters)?;
+    let _node = acquire_provision_lock(
+        &provision_lock_path(&adapters, "node"),
+        PROVISION_LOCK_WAIT,
+        PROVISION_LOCK_POLL,
+    )?;
+    let _browser = acquire_provision_lock(
+        &provision_lock_path(&adapters, "browser"),
+        PROVISION_LOCK_WAIT,
+        PROVISION_LOCK_POLL,
+    )?;
+    ensure_browserbridge_under(&node_dir()?, &browser_dir()?)
+}
+
+/// Non-acquiring inner: caller holds node.lock + browser.lock (in that
+/// order). Shared `ws` first (via NODE_PATH, no second install), then the
+/// browser bridge + shared core.
+fn ensure_browserbridge_under(
+    ws_dir: &std::path::Path,
+    dir: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
+    ensure_ws_locked(ws_dir)?;
+    ensure_browserbridge_in(dir)
 }
 
 /// `ensure_browserbridge` against an explicit dir (temp-HOME test seam).
+/// Lock-free: the caller holds the adapter locks (or the test owns the dir).
 fn ensure_browserbridge_in(dir: &std::path::Path) -> anyhow::Result<PathBuf> {
+    check_provision_path(dir, true, "adapter dir")?;
     let dest = dir.join("browserbridge.js");
+    check_provision_path(&dest, false, "bridge file")?;
     // Same no-short-circuit rule as ensure_nodebridge (see above).
     let bridge_stale = !file_matches(&dest, BROWSERBRIDGE_SOURCE);
     let shared_stale = ensure_js_shared(dir)?;
     let stale = bridge_stale || shared_stale;
     if stale {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.to_string_lossy()))?;
-        std::fs::write(&dest, BROWSERBRIDGE_SOURCE)
-            .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", dest.to_string_lossy()))?;
+        ensure_provision_dir(dir)?;
+        atomic_write_provisioned(&dest, BROWSERBRIDGE_SOURCE)?;
     }
     Ok(dest)
 }
@@ -440,6 +759,7 @@ pub fn find_chrome() -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::with_home;
 
     fn tmpdir(name: &str) -> PathBuf {
         // Unique per test (Rust tests run in parallel): pid + name.
@@ -450,6 +770,294 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(unix)]
+    fn ino_of(p: &std::path::Path) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(p).unwrap();
+        (m.dev(), m.ino())
+    }
+
+    #[test]
+    fn provision_roots_fail_closed_without_home() {
+        // No /tmp fallback anywhere: every root and derived helper
+        // propagates the actionable HOME error.
+        with_home(None, || {
+            for r in [
+                adapters_dir(),
+                adapter_dir(),
+                python_dir(),
+                node_dir(),
+                browser_dir(),
+                venv_python(),
+                node_modules_dir(),
+            ] {
+                let err = format!("{:#}", r.unwrap_err());
+                assert!(err.contains("HOME is unset or empty"), "{err}");
+            }
+        });
+        with_home(Some(std::path::Path::new("")), || {
+            assert!(python_dir().is_err());
+            assert!(node_dir().is_err());
+        });
+    }
+
+    #[test]
+    fn provision_lock_contention_serializes_and_retains_inode() {
+        let dir = tmpdir("provision-lock");
+        let lock = provision_lock_path(&dir, "python");
+        let holder =
+            acquire_provision_lock(&lock, Duration::from_secs(5), Duration::from_millis(5))
+                .unwrap();
+        // A rival with a short (injectable) bound bails retryably instead
+        // of waiting forever.
+        let t0 = std::time::Instant::now();
+        let err = format!(
+            "{:#}",
+            acquire_provision_lock(&lock, Duration::from_millis(100), Duration::from_millis(5))
+                .unwrap_err()
+        );
+        assert!(err.contains("in progress; retry shortly"), "{err}");
+        assert!(t0.elapsed() < Duration::from_secs(5), "short bound honored");
+        assert!(lock.exists(), "lock file retained on contention");
+        #[cfg(unix)]
+        let before = ino_of(&lock);
+        drop(holder);
+        // Release admits the next holder on the same inode.
+        let _next = acquire_provision_lock(&lock, Duration::from_secs(5), Duration::from_millis(5))
+            .unwrap();
+        assert!(lock.exists(), "lock file never deleted");
+        #[cfg(unix)]
+        assert_eq!(ino_of(&lock), before, "inode rendezvous retained");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provision_locks_are_not_reentrant() {
+        // Same-holder re-acquire with a short bound fails retryably. This
+        // pins the _locked split load-bearing: a wrapper calling a locking
+        // wrapper would surface "in progress", never silently double-hold.
+        let dir = tmpdir("provision-reentrant");
+        let lock = provision_lock_path(&dir, "node");
+        let _held = acquire_provision_lock(&lock, Duration::from_secs(5), Duration::from_millis(5))
+            .unwrap();
+        let err = format!(
+            "{:#}",
+            acquire_provision_lock(&lock, Duration::from_millis(100), Duration::from_millis(5))
+                .unwrap_err()
+        );
+        assert!(err.contains("in progress; retry shortly"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provision_lock_releases_on_holder_death() {
+        // True cross-process evidence: python3 holds a BSD flock on the
+        // lock file (the same mechanism as File::try_lock); killing it
+        // must release, and the next Rust holder proceeds on the same inode.
+        let dir = tmpdir("provision-crash");
+        let lock = provision_lock_path(&dir, "python");
+        std::fs::write(&lock, "").unwrap();
+        #[cfg(unix)]
+        let before = ino_of(&lock);
+        let prog = lock.to_string_lossy().to_string();
+        let mut child = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import fcntl,sys,time; f=open(sys.argv[1],'r+'); \
+                 fcntl.flock(f.fileno(), fcntl.LOCK_EX); time.sleep(30)",
+                &prog,
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("python3 is required (canonical gate dependency)");
+        std::thread::sleep(Duration::from_secs(1)); // let the child lock
+        let err = format!(
+            "{:#}",
+            acquire_provision_lock(&lock, Duration::from_millis(200), Duration::from_millis(5))
+                .unwrap_err()
+        );
+        assert!(
+            err.contains("in progress; retry shortly"),
+            "live foreign holder blocks: {err}"
+        );
+        child.kill().expect("kill foreign holder");
+        child.wait().expect("reap foreign holder");
+        let _next = acquire_provision_lock(&lock, Duration::from_secs(5), Duration::from_millis(5))
+            .unwrap();
+        assert!(lock.exists(), "lock file retained across holder death");
+        #[cfg(unix)]
+        assert_eq!(ino_of(&lock), before, "inode retained across death");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn provision_symlink_plants_refused() {
+        // Canonical-scope plants under an isolated HOME: adapter-dir link,
+        // bridge-dest link, and lock link all bail with the link intact
+        // and the outside target untouched (never followed, never deleted).
+        let home = tmpdir("provision-home-links");
+        let outside = tmpdir("provision-outside");
+        std::fs::write(outside.join("sentinel.txt"), "do-not-touch").unwrap();
+        with_home(Some(home.as_path()), || {
+            let adapters = adapters_dir().unwrap();
+            std::fs::create_dir_all(&adapters).unwrap();
+            // Lock link planted BEFORE any ensure call (the wrapper
+            // creates the real file on first acquire, so plant first).
+            let lock = provision_lock_path(&adapters, "python");
+            std::os::unix::fs::symlink(outside.join("sentinel.txt"), &lock).unwrap();
+            let err = format!(
+                "{:#}",
+                acquire_provision_lock(&lock, Duration::from_millis(50), Duration::from_millis(5))
+                    .unwrap_err()
+            );
+            assert!(err.contains("must not be a symlink"), "{err}");
+            std::fs::remove_file(&lock).unwrap();
+            // Adapter dir symlink: the wrapper acquires the lock, then the
+            // inner refuses the dir (lock retained, dir never followed).
+            let adir = python_dir().unwrap();
+            std::os::unix::fs::symlink(&outside, &adir).unwrap();
+            let err = format!("{:#}", ensure_pybridge().unwrap_err());
+            assert!(err.contains("must not be a symlink"), "{err}");
+        });
+        let home2 = tmpdir("provision-home-links2");
+        with_home(Some(home2.as_path()), || {
+            let adir = python_dir().unwrap();
+            std::fs::create_dir_all(&adir).unwrap();
+            std::os::unix::fs::symlink(outside.join("sentinel.txt"), adir.join("pybridge.py"))
+                .unwrap();
+            let err = format!("{:#}", ensure_pybridge().unwrap_err());
+            assert!(err.contains("must not be a symlink"), "{err}");
+        });
+        assert_eq!(
+            std::fs::read_to_string(outside.join("sentinel.txt")).unwrap(),
+            "do-not-touch",
+            "outside target intact"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&home2);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn provision_nested_generated_dir_symlink_refused() {
+        // Tool-managed nested dirs (venv/, node_modules/, classes/) get
+        // the same symlink refusal as adapter roots — realistically scoped:
+        // the generated files inside stay tool-managed, only the dirs are
+        // judged, and system prefixes above the anchor never are.
+        let base = tmpdir("provision-nested");
+        let outside = tmpdir("provision-nested-out");
+        std::fs::write(outside.join("sentinel.txt"), "x").unwrap();
+        let venv = base.join("venv");
+        std::os::unix::fs::symlink(&outside, &venv).unwrap();
+        let err = format!("{:#}", ensure_provision_dir(&venv).unwrap_err());
+        assert!(err.contains("must not be a symlink"), "{err}");
+        assert!(
+            std::fs::symlink_metadata(&venv)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "plant intact, never followed"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn browser_provisioning_single_flights_without_self_deadlock() {
+        // Pre-seeded ws marker so no npm/network runs; the composition
+        // (node.lock then browser.lock, locked inners only) must complete
+        // and converge on repeat. Locks release immediately after.
+        let home = tmpdir("provision-home-browser");
+        with_home(Some(home.as_path()), || {
+            let ws_marker = node_dir().unwrap().join("node_modules").join("ws");
+            std::fs::create_dir_all(&ws_marker).unwrap();
+            std::fs::write(
+                ws_marker.join("package.json"),
+                r#"{"name":"ws","version":"9.0.0"}"#,
+            )
+            .unwrap();
+            let dest = ensure_browserbridge().unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&dest).unwrap(),
+                BROWSERBRIDGE_SOURCE
+            );
+            for (name, source) in JS_SHARED {
+                assert_eq!(
+                    std::fs::read_to_string(browser_dir().unwrap().join(name)).unwrap(),
+                    *source,
+                    "shared {name} provisioned"
+                );
+            }
+            let dest2 = ensure_browserbridge().unwrap();
+            assert_eq!(dest, dest2, "second run converges");
+            let adapters = adapters_dir().unwrap();
+            let _n = acquire_provision_lock(
+                &provision_lock_path(&adapters, "node"),
+                Duration::from_secs(5),
+                Duration::from_millis(5),
+            )
+            .unwrap();
+            let _b = acquire_provision_lock(
+                &provision_lock_path(&adapters, "browser"),
+                Duration::from_secs(5),
+                Duration::from_millis(5),
+            )
+            .unwrap();
+        });
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn concurrent_pybridge_provision_serializes() {
+        // Eight racers on one adapter: all succeed with identical content,
+        // and the lock file survives (never deleted/replaced).
+        let home = tmpdir("provision-home-concurrent");
+        with_home(Some(home.as_path()), || {
+            std::thread::scope(|s| {
+                for _ in 0..8 {
+                    s.spawn(|| {
+                        let dest = ensure_pybridge().unwrap();
+                        assert_eq!(std::fs::read_to_string(&dest).unwrap(), PYBRIDGE_SOURCE);
+                    });
+                }
+            });
+            let adapters = adapters_dir().unwrap();
+            let lock = provision_lock_path(&adapters, "python");
+            assert!(lock.exists(), "lock file retained");
+            #[cfg(unix)]
+            {
+                let a = ino_of(&lock);
+                let _g =
+                    acquire_provision_lock(&lock, Duration::from_secs(5), Duration::from_millis(5))
+                        .unwrap();
+                assert_eq!(ino_of(&lock), a, "inode stable across contention");
+            }
+        });
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn provision_atomic_write_leaves_no_tmp() {
+        // Exclusive unique tmp + atomic rename: success leaves no tmp
+        // droppings beside the dest, and a second run converges.
+        let dir = tmpdir("provision-atomic");
+        let dest = ensure_pybridge_in(&dir).unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), PYBRIDGE_SOURCE);
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "no tmp droppings: {leftovers:?}");
+        ensure_pybridge_in(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Every contract fixture must parse (a malformed edit breaks all
@@ -531,18 +1139,25 @@ mod tests {
 
     #[test]
     fn debugpy_install_uses_venv_interpreter_with_m_pip() {
-        let (program, args) = debugpy_install_command();
-        // Program is exactly the venv interpreter, never `<...>/bin/python/bin/pip`.
-        assert_eq!(program, venv_python());
-        assert_eq!(program.file_name().and_then(|s| s.to_str()), Some("python"));
-        assert_eq!(
-            program
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|s| s.to_str()),
-            Some("bin")
+        // Pinned HOME: other tests swap HOME process-wide; path derivation
+        // must observe one stable root.
+        with_home(
+            Some(std::path::Path::new("/tmp/agent-debugger-home-stable")),
+            || {
+                let (program, args) = debugpy_install_command().unwrap();
+                // Program is exactly the venv interpreter, never `<...>/bin/python/bin/pip`.
+                assert_eq!(program, venv_python().unwrap());
+                assert_eq!(program.file_name().and_then(|s| s.to_str()), Some("python"));
+                assert_eq!(
+                    program
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .and_then(|s| s.to_str()),
+                    Some("bin")
+                );
+                assert_eq!(args, vec!["-m", "pip", "install", "debugpy"]);
+            },
         );
-        assert_eq!(args, vec!["-m", "pip", "install", "debugpy"]);
     }
 
     #[test]
@@ -552,9 +1167,19 @@ mod tests {
         // adapter dir, never the system PATH. A missing interpreter reads
         // as "no debugpy" (the check the order logic branches on), never
         // an error — this test pins the seam, not the order itself.
-        assert_eq!(
-            venv_python(),
-            python_dir().join("venv").join("bin").join("python")
+        // Pinned HOME: derivation must observe one stable root.
+        with_home(
+            Some(std::path::Path::new("/tmp/agent-debugger-home-stable")),
+            || {
+                assert_eq!(
+                    venv_python().unwrap(),
+                    python_dir()
+                        .unwrap()
+                        .join("venv")
+                        .join("bin")
+                        .join("python")
+                );
+            },
         );
         // A missing interpreter is "no debugpy" (fallback proceeds),
         // never an error: proves the order check degrades, not fails.

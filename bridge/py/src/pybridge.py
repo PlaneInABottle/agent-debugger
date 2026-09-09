@@ -1302,6 +1302,12 @@ class Session:
         # added bypass; see architecture-map §6).
         self._stop_seq = 0       # monotonic park clock for auto-select
         self._main_seq = 0       # seq of the main park (0 = never parked)
+        # Per-target park clock for the waiter handoff (M2): target id ->
+        # _stop_seq of its latest park, stamped in _park_stop alongside
+        # _stop_seq/_last_park_target. A park consumed by a rival pump
+        # (idle or concurrent waiter) still satisfies the owning waiter via
+        # _shared_park_hit; entries are bounded by lifetime target count.
+        self._park_seq = {}
         self._pending_target = None  # resume-wait owner for error attribution
         # -- M3 narrow owners (retained): TargetRegistry owns the roster
         # lifecycle (table/order/seen/history/counters/serving/staging/
@@ -1487,7 +1493,13 @@ class Session:
     def _note_exit(self, tid, last_stop=None):
         """Move a live child to the bounded exited history (canonical state:
         TargetRegistry.note_exit; socket/close semantics unchanged)."""
-        return self.targets_reg.note_exit(tid, last_stop)
+        with self._gate:
+            entry = self.targets_reg.note_exit(tid, last_stop)
+            # Park epochs are handoff metadata for live targets only. Drop
+            # the child entry at retirement so the map stays bounded by the
+            # live roster and an old epoch cannot satisfy a later waiter.
+            self._park_seq.pop(tid, None)
+            return entry
 
     def dap_request(self, command, args=None, timeout=30, semantic=False):
         try:
@@ -3110,6 +3122,67 @@ class Session:
             return True
         return getattr(self._park_local, "parked", None) == want
 
+    def _pump_start_seq(self):
+        """Shared park clock at wait start: the epoch for the handoff
+        below. Read under _gate, the same lock _park_stop stamps
+        (_stop_seq, _park_seq, _last_park_target) under — so a wait never
+        mistakes a pre-existing park for a fresh one. Callers capture this
+        BEFORE issuing their resume (or before waiting, when no resume is
+        issued): a park stamped between the resume and the capture is fresh
+        for this wait and must satisfy it."""
+        with self._gate:
+            return self._stop_seq
+
+    def _take_wait_epoch(self):
+        """One-shot park epoch for pump(): a pre-resume capture stashed on
+        this thread's thread-local by the resume caller (same thread runs
+        caller then pump synchronously, so the stash is always ours),
+        else a fresh entry capture — exact when no resume precedes the
+        wait. Popped either way, so a later pump on this thread never
+        reuses a stale epoch."""
+        start_seq = getattr(self._park_local, "wait_start_seq", None)
+        try:
+            del self._park_local.wait_start_seq
+        except AttributeError:
+            pass
+        if start_seq is None:
+            return self._pump_start_seq()
+        return start_seq
+
+    def _shared_park_hit(self, start_seq, want):
+        """Handoff for a park consumed by a RIVAL pump (idle or concurrent
+        waiter): the consumer's thread-local took the arrival, but
+        _park_stop published the park's epoch shared, so the owning waiter
+        still observes it instead of running to StopTimeout. Same filter as
+        _pump_hit_ok (omitted waits take any fresh park; explicit waits take
+        only their own target's fresh park — per-target epochs, so a later
+        foreign park never shadows an earlier matching one), and the hit is
+        recorded on THIS thread's thread-local so attribution below reads
+        our own stop. Other targets' parks stay parked (visible via
+        context/roster, never consumed). Unknown/gone targets never hit."""
+        with self._gate:
+            if want is None:
+                seq, target = self._stop_seq, self._last_park_target
+            else:
+                seq, target = self._park_seq.get(want, 0), want
+            if target == "main":
+                suspended = self.suspended
+                target_exists = True
+            else:
+                parked_target = self.targets.get(target)
+                suspended = parked_target is not None and parked_target.suspended
+                target_exists = parked_target is not None
+        if seq <= start_seq:
+            return None
+        if not target_exists:
+            return None
+        if not suspended:
+            return None
+        self._park_local.parked = target
+        # Dispatch-result shape (like _dispatch_pumped's "stopped"): the
+        # target rides on this thread's thread-local for attribution.
+        return "stopped"
+
     def _pump_for(self, timeout, want):
         """Target-scoped pump entry: single-arg call for any-target waits
         (legacy fake_pump(timeout) doubles stay compatible), two-arg only
@@ -3127,12 +3200,17 @@ class Session:
         _last_park_target) or raises. Concurrent pumps (M5: independent
         resumes on different targets) share every connection: stash pops
         and wire reads are mu-protected, dispatch is gate-protected, and
-        each message is consumed exactly once — but only the pump that
-        consumes a stop parks it, so a rival pump keeps waiting.
+        each message is consumed exactly once — and a park consumed by a
+        rival pump still satisfies the owning waiter via the shared
+        target+epoch handoff (_shared_park_hit below), so no waiter starves
+        on another thread's consumption.
         Timeouts carry no context here: wait/capture attach their honest
         trigger-unknown context at their own call sites (continue/step
-        timeouts stay bare)."""
+        timeouts stay bare). The wait's park epoch comes from
+        _take_wait_epoch (a pre-resume capture stashed by the resume caller,
+        else a fresh entry capture — exact when no resume precedes)."""
         deadline = time.time() + timeout
+        start_seq = self._take_wait_epoch()
         for tid, conn, _sock in self._conn_entries():
             while True:
                 msg = self._pop_stash(conn)
@@ -3197,6 +3275,14 @@ class Session:
                         return r
             if progressed:
                 continue  # re-check deadline/owner before selecting
+            # Rival-consumed parks satisfy us here (shared target+epoch
+            # handoff): our own drains found nothing, but another pump may
+            # have parked our target since our epoch. Checked every tick
+            # before blocking, so a handed-off stop waits at most one
+            # select/sleep window.
+            r = self._shared_park_hit(start_seq, want)
+            if r:
+                return r
             socks = [s for _, _, s in entries if s is not None]
             if not socks:
                 if not self.live_targets():
@@ -3352,16 +3438,23 @@ class Session:
                 "changed lists only certain value changes")
         self.count_hits(reason)
         self.publish_state(True)
-        self._stop_seq += 1
-        if eff == "main":
-            self._main_seq = self._stop_seq
-        else:
-            t = self.targets.get(eff)
-            if t is not None:
-                t.stop_seq = self._stop_seq
-                t.state = "stopped"
-        self._last_park_target = eff
         self._park_local.parked = eff
+        # Publish every shared park field atomically. `_park_stop` is usually
+        # reached under `_dispatch_pumped`'s gate, but suspect fallback can
+        # reach it from `pump` without that outer section. The RLock makes
+        # both paths equivalent and keeps the lock order `_gate -> mu`; all
+        # blocking DAP work above remains outside this short section.
+        with self._gate:
+            self._stop_seq += 1
+            if eff == "main":
+                self._main_seq = self._stop_seq
+            else:
+                t = self.targets.get(eff)
+                if t is not None:
+                    t.stop_seq = self._stop_seq
+                    t.state = "stopped"
+            self._last_park_target = eff
+            self._park_seq[eff] = self._stop_seq
         # Diagnostics: monotonic id + previous-park comparison (never
         # fabricate: DAP stopped events carry no breakpoint ids).
         try:
@@ -3710,7 +3803,9 @@ class Session:
         fresh park when omitted (stale pre-existing parks never satisfy —
         the resume unparked our target first). The response names the
         target that actually parked (which may differ from the resumed one
-        only for omitted waits)."""
+        only for omitted waits). The park epoch was captured by the caller
+        BEFORE the resume was issued (see cmd_step/cmd_continue) — a park
+        stamped between the resume and the wait is fresh for this wait."""
         self._pending_target = tid
         try:
             with self._TargetScope(self, tid):
@@ -3764,6 +3859,10 @@ class Session:
 
     def cmd_step(self, req, timeout):
         tid = self.resolve_target(req)
+        # Epoch before the resume below (stashed thread-locally for the
+        # wait): a stop parked between the resume issue and the wait is
+        # fresh for this wait, never stale.
+        self._park_local.wait_start_seq = self._pump_start_seq()
         with self._TargetScope(self, tid):
             self.require_live()
             # Stepping needs a stopped thread to step from (uniform contract
@@ -3781,6 +3880,8 @@ class Session:
 
     def cmd_continue(self, req, timeout):
         tid = self.resolve_target(req)
+        # Epoch before the resume below (same reason as cmd_step).
+        self._park_local.wait_start_seq = self._pump_start_seq()
         with self._TargetScope(self, tid):
             self.require_live()
             if self.suspended:
@@ -3871,7 +3972,9 @@ class Session:
         # Not parked: wait without issuing any resume. The honest timeout
         # context attaches here (wait only — continue/step timeouts stay
         # bare); a stubbed pump's bare StopTimeout is enriched, never
-        # replaced, so the typed prefix is unchanged either way.
+        # replaced, so the typed prefix is unchanged either way. No resume
+        # precedes the wait: stash the entry epoch for the pump.
+        self._park_local.wait_start_seq = self._pump_start_seq()
         self._park_local.parked = None
         started = time.time()
         try:
@@ -4132,6 +4235,9 @@ class Session:
                 raise
         started = time.time()
         try:
+            # No resume precedes this wait (the ephemeral only plants):
+            # stash the entry epoch for the pump.
+            self._park_local.wait_start_seq = self._pump_start_seq()
             self._park_local.parked = None
             want = tid if isinstance(req, dict) and req.get("target") is not None else None
             self._pump_for(timeout, want)

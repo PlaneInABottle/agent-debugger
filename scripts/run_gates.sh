@@ -117,14 +117,15 @@ run_unit() {
   javac -cp "$JTMP/classes" -d "$JTMP/checks" \
     tests/BJavaCheck.java tests/CJavaCheck.java \
     tests/M4JavaCheck.java tests/M5JavaCheck.java \
-    tests/M6JavaCheck.java tests/M7JavaCheck.java || fail "javac checks"
+    tests/M6JavaCheck.java tests/M7JavaCheck.java \
+    tests/SaturationJavaCheck.java tests/FramingJavaCheck.java || fail "javac checks"
   passed "javac"
 
-  section "java checks (execute B/C/M4-M7)"
+  section "java checks (execute B/C/M4-M7 + saturation + framing)"
   # Compiled checks are fail-fast by construction (each prints its own
   # ok-lines and System.exit(1) on any failure), so the gate just runs
   # every check class against the freshly compiled bridge above.
-  for c in BJavaCheck CJavaCheck M4JavaCheck M5JavaCheck M6JavaCheck M7JavaCheck; do
+  for c in BJavaCheck CJavaCheck M4JavaCheck M5JavaCheck M6JavaCheck M7JavaCheck SaturationJavaCheck FramingJavaCheck; do
     java -cp "$JTMP/classes:$JTMP/checks" "$c" || fail "java $c"
   done
   rm -rf "$JTMP"

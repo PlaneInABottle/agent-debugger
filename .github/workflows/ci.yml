@@ -27,16 +27,37 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cargo fmt check
-        run: cargo fmt --check
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
 
-      - name: Cargo test
-        run: cargo test
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-      - name: Bridge owner gates
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Canonical unit gates
         shell: bash
-        run: |
-          ./scripts/check_nodebridge_owners.sh
-          ./scripts/check_browserbridge_owners.sh
-          ./scripts/check_pybridge_owners.sh
-          ./scripts/check_java_owners.sh
+        run: scripts/run_gates.sh --unit
+
+  msrv:
+    name: MSRV (1.89)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.89 toolchain
+        uses: dtolnay/rust-toolchain@1.89
+
+      - name: Cargo test on the MSRV floor
+        run: cargo test

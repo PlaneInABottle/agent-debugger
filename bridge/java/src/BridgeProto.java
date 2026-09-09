@@ -93,8 +93,14 @@ class BridgeProto {
         for (String line : header.toString("US-ASCII").split("\r\n")) {
             int colon = line.indexOf(':');
             if (colon > 0 && line.substring(0, colon).trim().equalsIgnoreCase("Content-Length")) {
+                // Strict parity with the Python/JS readers: ASCII digits
+                // only (no `+`/unicode/whitespace-inside), and a second
+                // Content-Length rejects instead of overwriting.
+                String raw = line.substring(colon + 1).trim();
+                if (length != -1) throw new BridgeException("bad Content-Length");
+                if (!raw.matches("[0-9]+")) throw new BridgeException("bad Content-Length");
                 try {
-                    length = Integer.parseInt(line.substring(colon + 1).trim());
+                    length = Integer.parseInt(raw);
                 } catch (NumberFormatException e) {
                     throw new BridgeException("bad Content-Length");
                 }

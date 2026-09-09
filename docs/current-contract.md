@@ -4,6 +4,11 @@ Single layered `targetIdentity` everywhere; every sidecar carries
 `schemaVersion: 2`. No migration framework, no dual schema: old (v1) dirs
 are rejected with actionable errors except safe `close`/`status`.
 
+Breaking roots rule: `HOME` unset or blank fails closed with an actionable
+error (`set HOME to a writable private directory`) — there is no `/tmp`
+fallback and no silent shared root. Every sessions/adapter/lock path
+derives from it; `doctor` reports the HOME error as its whole payload.
+
 ## Sidecars (`~/.agent-debugger/sessions/<name>/`)
 
 All four files are JSON objects written atomically (tmp+rename in the
@@ -53,6 +58,11 @@ own tab identity from `/json/list`.
   No `logs` exemption: copy `logs.jsonl` aside manually before `close`.
 - `close`: no version gate ever — old live/dead dirs clean via the
   version-agnostic framed `{"cmd":"close"}` + port-death check + remove.
+  Breaking lifecycle rule: only a missing `session.json` with no live
+  starter cleans the stale unpublished dir; unreadable/corrupt
+  `session.json` and missing/invalid `port` preserve the dir with an
+  actionable error (`check <dir>/session.json`, fix or remove it
+  explicitly, then retry) — never an automatic delete.
 - `status`: no gate, never errors a row, sorted by name.
   Current: all existing keys, no `observedTarget`, plus
   `stale:false, unsupported:false, hint:null`.
@@ -130,3 +140,18 @@ Display-independent and bounded: `vars`/frame-0 locals stay capped at 20
 stays old code until closed; `close` uses only `port` + the generic close
 frame, so closing old sessions after upgrade is safe. Installed-binary
 smoke runs only after review, never mid-implementation.
+
+## Deferred limitations (documented, not fixed)
+
+- Script-identity memory: the node/browser bridges keep an insert-only
+  in-memory `url → scriptId` map per session daemon. Risk is unbounded
+  per-session growth while the session lives (many distinct script URLs);
+  no cross-session persistence was found. No eviction is implemented —
+  dropping an identity could break a live frame/breakpoint, and no test
+  proves an eviction safe, so this stays a known limitation.
+- Installer checksum verification: releases already publish per-archive
+  `.sha256` files plus a unified `SHA256SUMS.txt` (see
+  `.github/workflows/release.yml`), but neither `install.sh` nor
+  `scripts/postinstall.js` verifies downloads against them yet. Adding
+  verification (without changing artifact URLs) is future installer work;
+  no enforcement was added here and no new publication is required.

@@ -8,7 +8,7 @@ test_wait_capture.py, test_breaks_concurrency_matrix.py,
 test_error_attribution.py) keep their own tmpdirs untouched.
 
 Ownership/cleanup contract (ai-native-workflow isolated runtime):
-- owns a temp HOME, symlinks of the REAL venv/node_modules (never
+- owns a temp HOME, isolated copies of the REAL venv/node_modules (never
   installs), one fixture dir, tracked sessions, and task-owned
   chrome/http/log processes only;
 - never collects target env, never kills unrelated processes:
@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import shutil
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -264,13 +265,19 @@ class LiveHomeMixin:
         cls.log = (cls.home / "runtime.log").open("w")
         cls.addClassCleanup(cls.cleanup)
         adapters = cls.home / ".agent-debugger/adapters"
+        # The production provisioner deliberately rejects symlinked adapter
+        # roots and generated dependency dirs. Copy the existing disposable
+        # dependencies into the temp HOME instead of linking the real home:
+        # the copied venv's internal links remain valid on the same machine,
+        # while its adapter root and `venv`/`node_modules` leaves are real
+        # directories. No package installation or real-home mutation.
         for lang, entry in [("python", "venv"), ("node", "node_modules")]:
             origin = Path.home() / ".agent-debugger/adapters" / lang / entry
             if not origin.exists():
                 raise unittest.SkipTest(f"existing dependency required: {origin}")
             dest = adapters / lang / entry
             dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.symlink_to(origin, target_is_directory=True)
+            shutil.copytree(origin, dest, symlinks=True)
         cls.fixture = cls.home / fixture_name
         cls.fixture.mkdir()
 

@@ -64,18 +64,28 @@ child.on('error', (err) => {
   process.exit(1);
 });
 
+let childExited = false;
+
 child.on('close', (code, signal) => {
+  // The child is gone: stop forwarding signals into it. Re-raising the
+  // signal on ourselves (process.kill(process.pid, signal)) would hit our
+  // own forwarding listener below and exit 0 — a signal death must exit
+  // nonzero, using the 128+signo convention (INT 130, TERM 143, HUP 129).
+  // Normal exits still preserve the child code.
+  childExited = true;
   if (signal) {
-    process.kill(process.pid, signal);
+    const sigExit = { SIGINT: 130, SIGTERM: 143, SIGHUP: 129 };
+    process.exit(sigExit[signal] ?? 128);
   } else {
     process.exit(code ?? 0);
   }
 });
 
-// Forward common termination signals to the child process
+// Forward common termination signals to the child process, but only while
+// it is still alive — after close the forwarding stops (see above).
 ['SIGINT', 'SIGTERM', 'SIGHUP'].forEach((signal) => {
   process.on(signal, () => {
-    if (child && !child.killed) {
+    if (!childExited && child && child.exitCode === null && !child.killed) {
       child.kill(signal);
     }
   });
