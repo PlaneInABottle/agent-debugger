@@ -1,6 +1,8 @@
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const http = require('http');
+const crypto = require('crypto');
 const { execSync } = require('child_process');
 
 const pkg = require('../package.json');
@@ -70,6 +72,7 @@ async function main() {
   const archiveExt = isWin ? 'zip' : 'tar.gz';
   const assetName = `agent-debugger-${targetTriple}.${archiveExt}`;
   const downloadUrl = `https://github.com/${REPO}/releases/download/${VERSION}/${assetName}`;
+  const checksumUrl = `${downloadUrl}.sha256`;
 
   console.log(`[agent-debugger] Downloading pre-built binary for ${targetTriple} (${VERSION})...`);
 
@@ -81,6 +84,7 @@ async function main() {
     }
 
     await downloadFile(downloadUrl, tmpArchive);
+    await verifyChecksum(tmpArchive, checksumUrl);
 
     console.log(`[agent-debugger] Extracting binary to ${binDir}...`);
     if (isWin) {
@@ -117,7 +121,8 @@ function downloadFile(url, dest, maxRedirects = 5) {
       return reject(new Error('Too many redirects'));
     }
 
-    const req = https.get(url, { headers: { 'User-Agent': 'agent-debugger-npm-installer' } }, (res) => {
+    const mod = url.startsWith('http://') ? http : https;
+    const req = mod.get(url, { headers: { 'User-Agent': 'agent-debugger-npm-installer' } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         return resolve(downloadFile(res.headers.location, dest, maxRedirects - 1));
       }
@@ -144,6 +149,68 @@ function downloadFile(url, dest, maxRedirects = 5) {
   });
 }
 
-main().catch((err) => {
-  console.warn(`[agent-debugger] Postinstall error: ${err.message}`);
-});
+// Verify a downloaded archive against its published .sha256 sidecar
+// (same "<hash>  <filename>" format release.yml writes via shasum).
+// Checksum unfetchable (old release without sidecar): warn, continue.
+// Mismatch: throw (caller aborts install, archive deleted by finally).
+async function verifyChecksum(archivePath, checksumUrl) {
+  let text;
+  try {
+    text = await downloadText(checksumUrl);
+  } catch (err) {
+    console.warn('[agent-debugger] No published checksum found; skipping verification.');
+    return;
+  }
+  const expected = text.trim().split(/\s+/)[0].toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(expected)) {
+    console.warn('[agent-debugger] Published checksum unparseable; skipping verification.');
+    return;
+  }
+  const actual = sha256File(archivePath);
+  if (actual !== expected) {
+    throw new Error(`Checksum mismatch for ${path.basename(archivePath)} (download may be corrupt or tampered)`);
+  }
+  console.log('[agent-debugger] Checksum verified.');
+}
+
+function sha256File(filePath) {
+  const hash = crypto.createHash('sha256');
+  hash.update(fs.readFileSync(filePath));
+  return hash.digest('hex');
+}
+
+function downloadText(url, maxRedirects = 5) {
+  return new Promise((resolve, reject) => {
+    if (maxRedirects <= 0) {
+      return reject(new Error('Too many redirects'));
+    }
+    const mod = url.startsWith('http://') ? http : https;
+    const req = mod.get(url, { headers: { 'User-Agent': 'agent-debugger-npm-installer' } }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return resolve(downloadText(res.headers.location, maxRedirects - 1));
+      }
+      if (res.statusCode !== 200) {
+        return reject(new Error(`HTTP ${res.statusCode}: ${res.statusMessage}`));
+      }
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => resolve(body));
+    });
+    req.on('error', (err) => reject(err));
+  });
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { verifyChecksum, sha256File, TARGET_MAP };
+}
+
+// Only auto-run when executed as the npm postinstall script, never on
+// require() (unit tests require this file for verifyChecksum/sha256File;
+// an unconditional main() would trigger a real network download attempt
+// on fresh checkouts without bin/ or target/release).
+if (typeof require !== 'undefined' && require.main === module) {
+  main().catch((err) => {
+    console.warn(`[agent-debugger] Postinstall error: ${err.message}`);
+  });
+}

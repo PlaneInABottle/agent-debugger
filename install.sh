@@ -20,6 +20,36 @@ log_error() {
   printf "\033[31m[agent-debugger error]\033[0m %s\n" "$1" >&2
 }
 
+# Verify a downloaded archive against its published .sha256 sidecar.
+# Args: <archive_path> <checksum_url>
+# - Checksum file missing/unfetchable (old release): warn, continue.
+# - Checksum present but mismatch: error, return nonzero (caller aborts).
+# - Uses sha256sum when available, else shasum -a 256 (macOS).
+verify_checksum() {
+  ARCHIVE_PATH="$1"
+  CHECKSUM_URL="$2"
+  CHECKSUM_FILE="${ARCHIVE_PATH}.sha256"
+  if ! curl -fsSL "$CHECKSUM_URL" -o "$CHECKSUM_FILE" 2>/dev/null; then
+    log_info "No published checksum found; skipping verification."
+    return 0
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$(dirname "$ARCHIVE_PATH")" && sha256sum -c "$(basename "$CHECKSUM_FILE")") || {
+      log_error "Checksum mismatch for $(basename "$ARCHIVE_PATH"); download may be corrupt or tampered."
+      return 1
+    }
+  elif command -v shasum >/dev/null 2>&1; then
+    (cd "$(dirname "$ARCHIVE_PATH")" && shasum -a 256 -c "$(basename "$CHECKSUM_FILE")") || {
+      log_error "Checksum mismatch for $(basename "$ARCHIVE_PATH"); download may be corrupt or tampered."
+      return 1
+    }
+  else
+    log_info "No sha256 tool found; skipping verification."
+    return 0
+  fi
+  log_info "Checksum verified."
+}
+
 # 1. Detect OS
 OS="$(uname -s)"
 case "$OS" in
@@ -90,6 +120,7 @@ mkdir -p "$DEST_DIR"
 # 5. Download and Extract
 ASSET_NAME="agent-debugger-${TARGET}.tar.gz"
 DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET_NAME}"
+CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -101,6 +132,9 @@ if ! curl -fSL "$DOWNLOAD_URL" -o "${TMP_DIR}/${ASSET_NAME}" 2>/dev/null; then
   log_error "  cargo install --path ."
   exit 1
 fi
+
+log_info "Verifying checksum..."
+verify_checksum "${TMP_DIR}/${ASSET_NAME}" "$CHECKSUM_URL" || exit 1
 
 log_info "Extracting binary..."
 tar -xzf "${TMP_DIR}/${ASSET_NAME}" -C "$TMP_DIR"

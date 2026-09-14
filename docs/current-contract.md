@@ -149,9 +149,10 @@ smoke runs only after review, never mid-implementation.
   no cross-session persistence was found. No eviction is implemented —
   dropping an identity could break a live frame/breakpoint, and no test
   proves an eviction safe, so this stays a known limitation.
-- Installer checksum verification: releases already publish per-archive
+- Installer checksum verification: releases publish per-archive
   `.sha256` files plus a unified `SHA256SUMS.txt` (see
-  `.github/workflows/release.yml`), but neither `install.sh` nor
-  `scripts/postinstall.js` verifies downloads against them yet. Adding
-  verification (without changing artifact URLs) is future installer work;
-  no enforcement was added here and no new publication is required.
+  `.github/workflows/release.yml`), and both installers verify against
+  the per-archive sidecar (`install.sh: verify_checksum`,
+  `scripts/postinstall.js: verifyChecksum`): mismatch aborts the
+  install, a missing sidecar (old release) warns and continues, and an
+  unparseable sidecar skips. No artifact URL changed, no new publication.

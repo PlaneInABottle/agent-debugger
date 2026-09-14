@@ -1,8 +1,9 @@
 #!/bin/sh
 # Canonical gate runner (M2 test architecture, no new framework).
 #
-# Invokes EXACTLY the docs/architecture-map.md section 7 sequence with the
-# native commands below (fail fast). Safe to call from any directory:
+# Invokes the docs/architecture-map.md section 7 sequence plus the
+# installer checksum gate, with the native commands below (fail fast).
+# Safe to call from any directory:
 # the script resolves the repository root itself; the caller need not cd.
 #
 # Usage:
@@ -89,6 +90,10 @@ run_unit() {
   section "node --test tests/*.test.js"
   node --test tests/*.test.js || fail "node --test"
   passed "node --test"
+
+  section "installer checksum (sh)"
+  sh tests/test_install_checksum.sh || fail "test_install_checksum.sh"
+  passed "installer checksum"
 
   section "nodebridge owner routing"
   scripts/check_nodebridge_owners.sh || fail "check_nodebridge_owners"
