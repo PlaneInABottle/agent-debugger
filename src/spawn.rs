@@ -263,10 +263,9 @@ fn requested_target(target: &Target<'_>, kind: &str) -> Value {
         } => {
             let mut m = serde_json::Map::new();
             m.insert("program".to_string(), Value::String(program.to_string()));
-            m.insert(
-                "node".to_string(),
-                Value::String(node.unwrap_or("node").to_string()),
-            );
+            if let Some(n) = node {
+                m.insert("node".to_string(), Value::String(n.to_string()));
+            }
             if *workers {
                 m.insert("workers".to_string(), Value::Bool(true));
             }
@@ -380,5 +379,36 @@ mod tests {
             "attach",
         );
         assert_eq!(v["tab"], json!("shop"));
+    }
+
+    #[test]
+    fn requested_target_omits_unset_optionals() {
+        // Omitted selectors stay absent, never fabricated defaults
+        // (architecture-map §5.3): no --node means no "node" key.
+        let v = requested_target(
+            &Target::NodeLaunch {
+                program: "app.js",
+                node: None,
+                workers: false,
+            },
+            "launch",
+        );
+        assert_eq!(v["program"], json!("app.js"));
+        assert!(
+            v.get("node").is_none(),
+            "unset --node must stay absent: {v}"
+        );
+        assert!(v.get("workers").is_none());
+        assert!(v["pid"].is_null());
+        let v = requested_target(
+            &Target::NodeLaunch {
+                program: "app.js",
+                node: Some("/usr/local/bin/node"),
+                workers: true,
+            },
+            "launch",
+        );
+        assert_eq!(v["node"], json!("/usr/local/bin/node"));
+        assert_eq!(v["workers"], json!(true));
     }
 }
