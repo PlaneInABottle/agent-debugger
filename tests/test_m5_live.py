@@ -21,10 +21,10 @@ import unittest
 import urllib.request
 
 try:
-    from _live_home import LiveHomeMixin, free_port, load_tests
+    from _live_home import LiveHomeMixin, find_chrome, free_port, load_tests
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _live_home import LiveHomeMixin, free_port, load_tests
+    from _live_home import LiveHomeMixin, find_chrome, free_port, load_tests
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "target/debug/agent-debugger"
@@ -124,8 +124,8 @@ class M5LiveTests(LiveHomeMixin, unittest.TestCase):
                                          "--cp", str(self.fixture)])
 
     def test_m5_browser_held_resume_and_detach(self):
-        chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        if not Path(chrome).exists():
+        chrome = find_chrome()
+        if chrome is None:
             self.skipTest("Chrome unavailable")
 
         class QuietHandler(http.server.SimpleHTTPRequestHandler):

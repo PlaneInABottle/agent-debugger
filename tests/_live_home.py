@@ -38,6 +38,28 @@ def free_port():
         return sock.getsockname()[1]
 
 
+MACOS_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+LINUX_CHROME_BINS = ("google-chrome", "google-chrome-stable",
+                     "chromium", "chromium-browser")
+
+
+def find_chrome():
+    """Chrome binary for live browser tests, or None (caller skips).
+
+    macOS app path first (historical priority, unchanged behavior there),
+    then Linux PATH binaries (google-chrome on GitHub runners, chromium
+    variants on distros). No guessing beyond these well-known names:
+    unknown setups keep skipping instead of failing.
+    """
+    if Path(MACOS_CHROME).exists():
+        return MACOS_CHROME
+    for name in LINUX_CHROME_BINS:
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
 # TEST_LANG=py|node|java|browser (comma-separated, or unset/"all" for the
 # full file). A test belongs to a language when its method name carries the
 # token (live names embed _py_/_node_/_java_/_browser_ or the full word);

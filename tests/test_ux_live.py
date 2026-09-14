@@ -27,10 +27,10 @@ import unittest
 import urllib.request
 
 try:
-    from _live_home import LiveHomeMixin, free_port, load_tests
+    from _live_home import LiveHomeMixin, find_chrome, free_port, load_tests
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _live_home import LiveHomeMixin, free_port, load_tests
+    from _live_home import LiveHomeMixin, find_chrome, free_port, load_tests
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "target/debug/agent-debugger"
@@ -596,8 +596,8 @@ class UxLiveTests(LiveHomeMixin, unittest.TestCase):
     # ---- browser: interval-driven capture + parked wait ----
 
     def test_42_browser_wait_capture(self):
-        chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        if not Path(chrome).exists():
+        chrome = find_chrome()
+        if chrome is None:
             self.skipTest("Chrome unavailable")
         webdir = self.fixture / "web"
         line = break_line(webdir / "tick.js", "// BREAK")

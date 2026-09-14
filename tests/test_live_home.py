@@ -18,6 +18,26 @@ import _live_home
 
 
 class LiveHomeHelperTests(unittest.TestCase):
+    def test_find_chrome_prefers_which_hit(self):
+        # Hermetic on every OS: macOS path absent, PATH lookup stubbed.
+        with mock.patch("pathlib.Path.exists", return_value=False), \
+             mock.patch("shutil.which", return_value="/usr/bin/chromium"):
+            self.assertEqual(_live_home.find_chrome(), "/usr/bin/chromium")
+
+    def test_find_chrome_none_when_nothing_found(self):
+        with mock.patch("pathlib.Path.exists", return_value=False), \
+             mock.patch("shutil.which", return_value=None):
+            self.assertIsNone(_live_home.find_chrome())
+
+    def test_find_chrome_macos_path_first(self):
+        # macOS path present beats a PATH binary (historical priority).
+        with mock.patch("pathlib.Path.exists", return_value=True), \
+             mock.patch("shutil.which",
+                        return_value="/usr/bin/google-chrome") as which:
+            self.assertEqual(_live_home.find_chrome(),
+                             _live_home.MACOS_CHROME)
+            which.assert_not_called()
+
     def test_wanted_lang_tokens(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TEST_LANG", None)

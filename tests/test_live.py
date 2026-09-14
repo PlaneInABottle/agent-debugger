@@ -18,10 +18,10 @@ import unittest
 import urllib.request
 
 try:
-    from _live_home import LiveHomeMixin, free_port, load_tests
+    from _live_home import LiveHomeMixin, find_chrome, free_port, load_tests
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _live_home import LiveHomeMixin, free_port, load_tests
+    from _live_home import LiveHomeMixin, find_chrome, free_port, load_tests
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "target/debug/agent-debugger"
@@ -193,8 +193,8 @@ class LiveTests(LiveHomeMixin, unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
     def test_04_browser_and_all_bridge_partial_clients(self):
-        chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        if not Path(chrome).exists():
+        chrome = find_chrome()
+        if chrome is None:
             self.skipTest("Chrome unavailable")
         class QuietHandler(http.server.SimpleHTTPRequestHandler):
             def log_message(self, *args):
@@ -583,8 +583,8 @@ class LiveTests(LiveHomeMixin, unittest.TestCase):
     def test_08_breaks_add_browser(self):
         """M2 browser: add on an idle tab, dup/conflict/invalid-batch
         semantics, reload-triggered stop, paused add, convergence."""
-        chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        if not Path(chrome).exists():
+        chrome = find_chrome()
+        if chrome is None:
             self.skipTest("Chrome unavailable")
 
         class QuietHandler(http.server.SimpleHTTPRequestHandler):
@@ -1316,8 +1316,8 @@ class LiveTests(LiveHomeMixin, unittest.TestCase):
     def test_22_m3_browser_catch_and_step_smoke(self):
         """M3 browser (Chrome only): catch bindings in vars+eval, step
         lands on the next line, status truth after the stop."""
-        chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        if not Path(chrome).exists():
+        chrome = find_chrome()
+        if chrome is None:
             self.skipTest("Chrome unavailable")
 
         class QuietHandler(http.server.SimpleHTTPRequestHandler):
@@ -1685,8 +1685,8 @@ class LiveTests(LiveHomeMixin, unittest.TestCase):
     def test_27_browser_remove_clear_and_identity(self):
         """M2+M-I browser: tab identity in attach/status, add->remove,
         reload never restores removed breaks, clear empties stops.json."""
-        chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        if not Path(chrome).exists():
+        chrome = find_chrome()
+        if chrome is None:
             self.skipTest("Chrome unavailable")
 
         class QuietHandler(http.server.SimpleHTTPRequestHandler):

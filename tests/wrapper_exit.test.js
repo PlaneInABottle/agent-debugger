@@ -33,7 +33,16 @@ function runWrapper(dir) {
   });
 }
 
-test('normal exits preserve the child code', () => {
+// Windows has no POSIX signals, no shebang exec, and resolves the wrapper
+// binary as agent-debugger.exe: the exit/signal contract below is pinned
+// on unix and skipped on win32 with reason (skips are green in
+// node --test; the Windows wrapper path is covered by postinstall smoke).
+const it =
+  process.platform === 'win32'
+    ? (name, fn) => test(name, { skip: 'POSIX signal/shebang contract is unix-only' }, fn)
+    : test;
+
+it('normal exits preserve the child code', () => {
   for (const code of [0, 42]) {
     const dir = fixture(`#!/bin/sh\nexit ${code}\n`);
     const r = runWrapper(dir);
@@ -42,7 +51,7 @@ test('normal exits preserve the child code', () => {
   }
 });
 
-test('signal-terminated child exits nonzero (never 0)', () => {
+it('signal-terminated child exits nonzero (never 0)', () => {
   for (const [sig, want] of [['TERM', 143], ['INT', 130], ['HUP', 129]]) {
     const dir = fixture(`#!/bin/sh\nkill -${sig} $$\n`);
     const r = runWrapper(dir);

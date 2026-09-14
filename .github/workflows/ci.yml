@@ -18,7 +18,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # Windows runs the same canonical unit gate under Git Bash
+        # (.gitattributes pins LF for *.sh; unix-only tests self-gate
+        # via #[cfg(unix)] / win32-skip with reason).
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
       - name: Checkout repository
@@ -46,6 +49,42 @@ jobs:
       - name: Canonical unit gates
         shell: bash
         run: scripts/run_gates.sh --unit
+
+  live:
+    name: Live (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Daemon-backed integration across py/node/java/browser on the
+    # runner's toolchains (Chrome is preinstalled on ubuntu images;
+    # find_chrome() discovers google-chrome there, macOS path locally).
+    # First run provisions venv/debugpy + ws over the network, then the
+    # suites run isolated HOME copies — never the real ~/.agent-debugger.
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Canonical live gates
+        shell: bash
+        run: scripts/run_gates.sh --live
 
   msrv:
     name: MSRV (1.89)

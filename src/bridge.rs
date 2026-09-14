@@ -867,11 +867,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// True cross-process evidence on unix: python3 holds a BSD flock on
+    /// the lock file (the same mechanism as File::try_lock); killing it
+    /// must release, and the next Rust holder proceeds on the same inode.
+    /// Unix-only: the holder needs fcntl.flock, which does not exist on
+    /// Windows. Death-release on Windows is OS-guaranteed like everywhere
+    /// (LockFileEx releases on process death) and the Windows kill path
+    /// itself (taskkill) is covered by run_with_timeout_kills_slow_child,
+    /// which runs on every platform including Windows CI.
     #[test]
+    #[cfg(unix)]
     fn provision_lock_releases_on_holder_death() {
-        // True cross-process evidence: python3 holds a BSD flock on the
-        // lock file (the same mechanism as File::try_lock); killing it
-        // must release, and the next Rust holder proceeds on the same inode.
         let dir = tmpdir("provision-crash");
         let lock = provision_lock_path(&dir, "python");
         std::fs::write(&lock, "").unwrap();
