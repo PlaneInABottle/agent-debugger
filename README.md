@@ -83,6 +83,52 @@ agent-debugger doctor
 
 `agent-debugger doctor` checks available system runtimes (Python, Node.js, Java JDK, Google Chrome) and reports debugging readiness.
 
+### 2-Minute Quickstart (verified transcript)
+
+No setup beyond the install — the bundled example debugs as-is.
+First run provisions the adapter once (isolated venv + debugpy here),
+then every stop is a single snapshot:
+
+```bash
+agent-debugger --session demo py start examples/py-demo/app.py --break 'examples/py-demo/app.py:26'
+```
+
+```json
+{
+  "ok": true,
+  "command": "start",
+  "data": {
+    "location": { "file": "examples/py-demo/app.py", "line": 26, "method": "checkout" },
+    "snippet": [
+      {"current": false, "line": 24, "text": "discount = subtotal * 0.10 if coupon == ..."},
+      {"current": true,  "line": 26, "text": "return total  # <-- breakpoint here"}
+    ],
+    "frames": [
+      {"index": 0, "method": "checkout", "line": 26, "locals": [
+        {"name": "coupon", "type": "str", "value": "'WELCOME10'"},
+        {"name": "subtotal", "type": "float", "value": "12600.0"},
+        {"name": "total", "type": "float", "value": "11340.0"}
+      ]}
+    ],
+    "threads": [{"id": 1, "name": "MainThread", "current": true}]
+  }
+}
+```
+
+```bash
+agent-debugger --session demo eval "total"
+# -> {"value": "11340.0", "target": "main"}
+
+agent-debugger --session demo continue --timeout 10
+# -> {"ok": false, "error": "target exited"}  (ran to completion — signal, not flake)
+
+agent-debugger --session demo close
+# -> {"closed": "demo", "confirmed": true}
+```
+
+(Transcript trimmed for readability; real output carries `diag`,
+`targetIdentity`, and full frame/snippet arrays.)
+
 ---
 
 ## Core Workflow
@@ -141,6 +187,9 @@ When execution hits a stop, `agent-debugger` immediately returns a complete snap
 ```
 
 *Note: You do not need follow-up calls to fetch the stack trace or local variables.*
+*(Shapes above are simplified for readability — `locals` arrive as
+`[{name, type, value}]` and snippet lines as `[{current, line, text}]`.
+See the verified quickstart transcript under Installation for real output.)*
 
 ### 3. Inspect & Step
 
@@ -304,6 +353,24 @@ Succeeds immediately if already stopped, or long-polls until the target stops at
    - `stops.json` stores user intent.
    - `breaks.lock` uses kernel-level file locks (`flock`) for atomic read-modify-write without stale file deletion races.
 3. **Embedded Adapters**: Bridges for Python, Node, Browser, and Java are embedded in the compiled binary via `include_str!` and materialized to `~/.agent-debugger/adapters/` on demand.
+
+---
+
+## How Is This Different?
+
+| | agent-debugger | pdb / `node inspect` / jdb | VS Code / IntelliJ / Chrome DevTools | print debugging |
+|---|---|---|---|---|
+| Interface | Headless CLI, JSON by default | Interactive REPL per runtime | GUI, mouse-driven | Edit → rebuild → rerun |
+| Round-trips per stop | 1 (location + snippet + stack + locals) | 5+ (threads, frames, scopes, variables…) | 1 click, but a human must drive | N rebuild cycles |
+| Multi-runtime | One protocol for Py/Node/Browser/Java | A different tool per runtime | One IDE per ecosystem | Same everywhere (slow everywhere) |
+| Agent reorientation | `status` + `breaks` + `context` after compaction | No persisted session state | Workspace state, not scriptable | Logs, if you kept them |
+| Price of a wrong breakpoint | One `--timeout` wait, session stays live | Restart the session, re-arm by hand | Re-click, relaunch | Another rebuild cycle |
+
+What it is **not**: a replacement for your IDE's variable rendering depth,
+a profiler, a time-travel debugger, or zero-setup — each adapter still needs
+its runtime's debug hook (`debugpy`, `--inspect`, JDWP agent, or Chrome with
+`--remote-debugging-port`). See `docs/feature-roadmap.md` for deferred work
+(caught exceptions, `justMyCode` flag, cross-adapter watches).
 
 ---
 
