@@ -519,16 +519,32 @@ fn run_with_timeout(
         Ok(Ok(out)) => Ok(out),
         Ok(Err(e)) => Err(anyhow::anyhow!("{program_dbg} failed: {e}")),
         Err(_) => {
-            // Best-effort kill (Unix `kill`; ignored elsewhere — the waiter
-            // thread reaps the child whenever it actually exits).
-            let _ = std::process::Command::new("kill")
-                .arg(child_id.to_string())
-                .output();
+            // Best-effort kill so a timed-out pip/npm never orphans: the
+            // waiter thread still reaps the child whenever it exits.
+            kill_child(child_id);
             Err(anyhow::anyhow!(
                 "{program_dbg} timed out after {}s",
                 timeout.as_secs()
             ))
         }
+    }
+}
+
+/// Best-effort kill of a timed-out provision child by pid.
+/// Unix: `kill` (SIGTERM). Windows: `taskkill /PID /F` (`kill` does not
+/// exist there — the old code silently leaked the child).
+fn kill_child(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .output();
     }
 }
 
@@ -1191,6 +1207,28 @@ mod tests {
         assert_eq!(prepend_node_path("/ws", None), "/ws");
         assert_eq!(prepend_node_path("/ws", Some("")), "/ws");
         assert_eq!(prepend_node_path("/ws", Some("/u/lib")), "/ws:/u/lib");
+    }
+
+    #[test]
+    fn run_with_timeout_kills_slow_child() {
+        // A 30s sleeper with a 1s bound must fail fast with the timeout
+        // error (not hang 30s), on every OS — the kill path above must
+        // fire portably (taskkill on Windows, kill elsewhere).
+        let start = std::time::Instant::now();
+        let err = run_with_timeout(
+            PathBuf::from("python3"),
+            &["-c".to_string(), "import time; time.sleep(30)".to_string()],
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("timed out after 1s"),
+            "timeout error names the bound: {err:#}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "must return near the bound, not after the sleeper"
+        );
     }
 
     #[test]
