@@ -66,19 +66,36 @@ pub(crate) fn require_schema_v2(dir: &std::path::Path, name: &str) -> anyhow::Re
     anyhow::bail!("unsupported session '{name}' (schema v1; close it and recreate)")
 }
 
-/// Atomic sidecar write (tmp+rename in the same dir): a concurrent `status`
-/// never reads a torn file.
+/// Atomic sidecar write (unique tmp+rename in the same dir): a concurrent
+/// `status` never reads a torn file, and concurrent writers never share a
+/// tmp name (the old fixed `{file}.tmp` could collide across racing
+/// writers; the lock serializes today but the name must not rely on it).
+/// Only this call's own tmp is ever removed, never the dest.
 pub(crate) fn write_sidecar_atomic(
     dir: &std::path::Path,
     file: &str,
     content: &str,
 ) -> anyhow::Result<()> {
-    let tmp = dir.join(format!("{file}.tmp"));
-    std::fs::write(&tmp, content)
-        .map_err(|e| anyhow::anyhow!("cannot write session {file}: {e}"))?;
-    std::fs::rename(&tmp, dir.join(file))
-        .map_err(|e| anyhow::anyhow!("cannot write session {file}: {e}"))?;
-    Ok(())
+    let tmp = atomic_tmp_name(dir, file);
+    let written = (|| -> anyhow::Result<()> {
+        std::fs::write(&tmp, content)
+            .map_err(|e| anyhow::anyhow!("cannot write session {file}: {e}"))?;
+        std::fs::rename(&tmp, dir.join(file))
+            .map_err(|e| anyhow::anyhow!("cannot write session {file}: {e}"))?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+/// Unique tmp sibling for one atomic write in `dir` (never a fixed name,
+/// so concurrent holders never share it). Same-dir rename stays atomic.
+pub(crate) fn atomic_tmp_name(dir: &std::path::Path, file: &str) -> std::path::PathBuf {
+    static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    dir.join(format!("{file}.tmp.{}.{n}", std::process::id()))
 }
 
 #[cfg(test)]
@@ -152,6 +169,32 @@ mod tests {
             assert!(text.contains("close it and recreate"), "{tag}: {text}");
             let _ = std::fs::remove_dir_all(&d);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_uses_unique_tmp_and_leaves_none() {
+        // Success leaves the content + no tmp droppings; names are unique
+        // per call so racing writers never share one.
+        let dir = tmpdir("sidecar-tmp-unique");
+        let a = atomic_tmp_name(&dir, "lang.json");
+        let b = atomic_tmp_name(&dir, "lang.json");
+        assert_ne!(a, b, "tmp names must be unique");
+        write_sidecar_atomic(&dir, "lang.json", r#"{"lang":"py"}"#).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("lang.json")).unwrap(),
+            r#"{"lang":"py"}"#
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("lang.json.tmp.")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "no tmp droppings: {leftovers:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

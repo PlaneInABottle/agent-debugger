@@ -1,7 +1,7 @@
 // See `mod.rs` for the one-way dependency DAG.
 use super::forward::{bridge_failure, normalize_target_for_lang_opt, stamp_main};
 use super::paths::{check_name, checked_session_dir, session_port};
-use super::sidecar::{require_schema_v2, session_lang_opt};
+use super::sidecar::{atomic_tmp_name, require_schema_v2, session_lang_opt};
 use crate::client;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -325,15 +325,21 @@ pub(crate) fn append_confirmed_breaks_in(
             list.push(Value::String(r.clone()));
         }
     }
-    let tmp = dir.join("stops.json.tmp");
-    std::fs::write(
-        &tmp,
-        serde_json::to_string_pretty(&intent).unwrap_or_else(|_| "{}".to_string()),
-    )
-    .map_err(|e| anyhow::anyhow!("cannot persist session intent: {e}"))?;
-    std::fs::rename(&tmp, &path)
+    let tmp = atomic_tmp_name(dir, "stops.json");
+    let written = (|| -> anyhow::Result<()> {
+        std::fs::write(
+            &tmp,
+            serde_json::to_string_pretty(&intent).unwrap_or_else(|_| "{}".to_string()),
+        )
         .map_err(|e| anyhow::anyhow!("cannot persist session intent: {e}"))?;
-    Ok(())
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| anyhow::anyhow!("cannot persist session intent: {e}"))?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// Drop confirmed-removed raws from stops.json's breaks list. Exact-string
@@ -362,15 +368,21 @@ pub(crate) fn remove_confirmed_breaks_in(
     for r in raws {
         list.retain(|v| v.as_str() != Some(r.as_str()));
     }
-    let tmp = dir.join("stops.json.tmp");
-    std::fs::write(
-        &tmp,
-        serde_json::to_string_pretty(&intent).unwrap_or_else(|_| "{}".to_string()),
-    )
-    .map_err(|e| anyhow::anyhow!("cannot persist session intent: {e}"))?;
-    std::fs::rename(&tmp, &path)
+    let tmp = atomic_tmp_name(dir, "stops.json");
+    let written = (|| -> anyhow::Result<()> {
+        std::fs::write(
+            &tmp,
+            serde_json::to_string_pretty(&intent).unwrap_or_else(|_| "{}".to_string()),
+        )
         .map_err(|e| anyhow::anyhow!("cannot persist session intent: {e}"))?;
-    Ok(())
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| anyhow::anyhow!("cannot persist session intent: {e}"))?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 #[cfg(test)]
@@ -492,7 +504,7 @@ mod tests {
         assert_eq!(v["timeout"], json!(7));
         assert_eq!(v["target"]["program"], json!("a.py"));
         assert_eq!(v["futureField"]["nested"], json!(true));
-        assert!(!dir.join("stops.json.tmp").exists());
+        assert_no_temp_orphans(&dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -528,7 +540,7 @@ mod tests {
         assert_eq!(v["timeout"], json!(7));
         assert_eq!(v["target"]["program"], json!("a.py"));
         assert!(v.get("requestedTarget").is_some());
-        assert!(!dir.join("stops.json.tmp").exists());
+        assert_no_temp_orphans(&dir);
         // Unknown raws are a no-op, not an error.
         remove_confirmed_breaks_in(&dir, &["nope.py:1".to_string()]).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -575,18 +587,34 @@ mod tests {
     }
 
     /// Success-path temp hygiene: no quarantine or tmp sibling may linger
-    /// (the kernel lock needs no quarantine files; the stops.json tmp is
-    /// consumed by its rename on every success).
+    /// (the kernel lock needs no quarantine files; the unique stops.json
+    /// tmp is consumed by its rename on every success).
     fn assert_no_temp_orphans(dir: &std::path::Path) {
         let leftovers: Vec<_> = std::fs::read_dir(dir)
             .unwrap()
             .flatten()
             .filter(|e| {
                 let n = e.file_name().to_string_lossy().to_string();
-                n.starts_with(".q-") || n == "stops.json.tmp"
+                n.starts_with(".q-") || n.starts_with("stops.json.tmp.")
+                // Legacy fixed-name tmp from pre-unique-tmp versions: a
+                // crashed old binary could have left exactly this file.
+                || n == "stops.json.tmp"
             })
             .collect();
         assert!(leftovers.is_empty(), "temp files must not linger");
+    }
+
+    #[test]
+    fn atomic_tmp_names_are_unique_per_call() {
+        // Two names for the same file must differ (pid + counter): racing
+        // writers never share a tmp, unlike the old fixed stops.json.tmp.
+        let dir = tmpdir("breaks-tmp-unique");
+        let a = atomic_tmp_name(&dir, "stops.json");
+        let b = atomic_tmp_name(&dir, "stops.json");
+        assert_ne!(a, b, "tmp names must be unique");
+        assert!(a.parent() == Some(dir.as_path()));
+        assert!(b.parent() == Some(dir.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
