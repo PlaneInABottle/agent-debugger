@@ -34,6 +34,10 @@ pub(super) fn doctor() -> anyhow::Result<Value> {
             json!({"found": false, "version": "", "hint": "install Chrome/Chromium or start it with --remote-debugging-port=9222"})
         }
     };
+    // Browser needs BOTH: node runs the bridge, Chrome is the target.
+    // Reporting ready on node alone lied on Chrome-less machines.
+    let node_found = node["found"].as_bool().unwrap_or(false);
+    let chrome_found = chrome["found"].as_bool().unwrap_or(false);
     let ws_pkg = bridge::node_dir()?
         .join("node_modules")
         .join("ws")
@@ -68,7 +72,7 @@ pub(super) fn doctor() -> anyhow::Result<Value> {
             "java": {"via": "embedded JDI bridge (persistent session)", "ready": java_ready},
             "python": {"via": "embedded pybridge + debugpy (isolated venv)", "ready": debugpy["found"]},
             "node": {"via": "embedded nodebridge + CDP", "ready": node["found"]},
-            "browser": {"via": "embedded browserbridge + CDP", "ready": node["found"]},
+            "browser": {"via": "embedded browserbridge + CDP", "ready": node_found && chrome_found},
         },
     }))
 }
@@ -131,6 +135,11 @@ mod tests {
             v["adapters"]["node"]["ready"].as_bool().unwrap(),
             v["node"]["found"].as_bool().unwrap(),
             "node ready reflects the node probe"
+        );
+        assert_eq!(
+            v["adapters"]["browser"]["ready"].as_bool().unwrap(),
+            v["node"]["found"].as_bool().unwrap() && v["chrome"]["found"].as_bool().unwrap(),
+            "browser ready needs node AND chrome"
         );
     }
 }
