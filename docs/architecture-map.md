@@ -380,6 +380,9 @@ untouched. Zero protocol/sidecar/schema delta; Python/Rust/Node untouched.
 | Review regressions | `cargo test` full | `tests/review_fixes.test.js` | `tests/test_live.py` (4 adapters, isolated `HOME`, installed binary `target/debug/agent-debugger`) |
 | Contract fixtures (frozen strings) | `bridge::tests::contract_fixtures_match_cli_constants` | `tests/contract_fixtures.test.js`, `tests/test_contract_fixtures.py` | — (fixtures only, no live) |
 | Provisioning (daemon-free) | `bridge::tests` (stale rewrite, shared-JS no-short-circuit, `NODE_PATH`, venv paths, `JAVA_CLASSES` markers) | — | `tests/_live_home.py` setup (symlink real venv/node_modules, never install) + `tests/test_live_home.py` |
+| Installer checksum (.sha256 verify-or-skip) | — | `tests/install_checksum.test.js` + `tests/test_install_checksum.sh` (sh gate section in `run_gates.sh`) | — (verified at release time per `docs/release-checklist.md`) |
+| Release asset matrix | — | `tests/test_release_assets.py` (py gate section; matrix parsed from `release.yml`) | `scripts/check_release.sh <tag>` (manual, release time) |
+| Provision timeout kill + tmp hygiene | `run_with_timeout_kills_slow_child`, `atomic_tmp_names_are_unique_per_call`, `atomic_write_uses_unique_tmp_and_leaves_none` | — | — |
 
 Latest matrices live in: `tests/breaks_concurrency_matrix.test.js` (+
 `tests/test_breaks_concurrency_matrix.py`), `tests/m5_concurrency.test.js` (+
@@ -389,7 +392,7 @@ canonical runner `scripts/run_gates.sh` (the command list below is
 informative — the script is normative; do not copy this prose into new
 runners): unit = `cargo test` + `cargo fmt --check` + every
 `tests/test_*.py` except the three live suites (auto-discovered, sorted) +
-`node --test tests/*.test.js` + owner-routing gates
+`node --test tests/*.test.js` + `tests/test_install_checksum.sh` + owner-routing gates
 (`check_nodebridge_owners` + `check_browserbridge_owners` +
 `check_pybridge_owners` + `check_java_owners`, each incl. `--self-test`) + `javac` bridge/checks + executed
  java checks (B/C/M4-M7); live = `cargo build`
@@ -516,7 +519,8 @@ the script is normative:
 
 - Fast unit gate (no daemons/browsers): `scripts/run_gates.sh --unit`
   (`cargo test` + `cargo fmt --check` + Python unit minus the three live
-  suites + `node --test tests/*.test.js` + owner-routing gates
+  suites + `node --test tests/*.test.js` + `tests/test_install_checksum.sh`
+  + owner-routing gates
   `scripts/check_nodebridge_owners.sh`,
   `scripts/check_browserbridge_owners.sh`,
   `scripts/check_pybridge_owners.sh`,
