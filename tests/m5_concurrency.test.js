@@ -216,6 +216,25 @@ test('m5 node: frame reads fail fast while running', async () => {
   }
 });
 
+test('m5 node: unstopped context names parked workers (vanish diagnosis)', async () => {
+  // Bare context landing on running main must inventory worker parks:
+  // a parked worker is named (serve it by target), an empty list proves
+  // the pump-observed park vanished before this read (entry race/detach).
+  const dir = tmpdir('m5-node-nosuchpark-');
+  const st = nodeSession(dir);
+  st.paused = null;
+  const w = addWorker(st, 's1');
+  w.state = 'stopped';
+  w.paused = { frames: [workerFrame()], stopInfo: null };
+  await assert.rejects(st.dispatch({ cmd: 'context', target: 'main' }),
+    /no stopped thread.*parked workers: worker:s1/);
+  const dir2 = tmpdir('m5-node-nopark-');
+  const st2 = nodeSession(dir2);
+  st2.paused = null;
+  await assert.rejects(st2.dispatch({ cmd: 'context', target: 'main' }),
+    /no stopped thread.*no worker parked/);
+});
+
 test('m5 node: close is accepted despite an outstanding resume', async () => {
   const dir = tmpdir('m5-node-close-');
   const st = nodeSession(dir);

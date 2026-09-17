@@ -110,6 +110,20 @@ test('node parseLogpoint rejects empty template (Java parity)', () => {
   assert.equal(cfg.logpoints[0].template, 'hit {x}');
 });
 
+test('node parseLogpoint skips a Windows drive colon (py parity)', () => {
+  // Drive-absolute specs must split path=`C:\...\app.js`, never path=`C`.
+  // No such drive exists here, so the failure must name the FULL drive
+  // path (proving the split skipped index 1), not a bare `C`.
+  const cfg = { breaks: [], logpoints: [], wantExc: false, srcs: [] };
+  assert.throws(() => node.parseLogpoint('C:\\Users\\R\\Temp\\app.js:3:x=1', cfg),
+    /C:\\Users\\R\\Temp\\app\.js/);
+  const dir = tmpdir('strict-logdrive-');
+  const file = writeJs(dir);
+  const cfg2 = { breaks: [], logpoints: [], wantExc: false, srcs: [] };
+  node.parseLogpoint(`${file}:3:a:b`, cfg2);
+  assert.equal(cfg2.logpoints[0].template, 'a:b');
+});
+
 test('browser parseLogpoint rejects empty template (Java parity)', () => {
   const cfg = { breaks: [], logpoints: [], wantExc: false, srcs: [] };
   assert.throws(() => browser.parseLogpoint('app.js:3:', cfg), /template is empty/);

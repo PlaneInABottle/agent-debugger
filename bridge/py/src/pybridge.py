@@ -19,6 +19,7 @@ Snapshot shapes intentionally match the Java bridge (location/threads/
 frames/locals/changed/stopInfo) so agents see one uniform surface.
 """
 
+import csv
 import json
 import math
 import os
@@ -471,10 +472,21 @@ def parse_break(spec, cfg):
     cfg.breaks.append((resolved, lineno, cond))
 
 
+def _logpoint_sep(spec, start=0):
+    """Index of the next `:` separator at/after `start`, skipping a
+    Windows drive prefix (`C:\\...` / `C:/...`): the colon at index 1 of
+    a drive-absolute path never separates fields. Plain `C:4:t` (no
+    slash: drive-relative or a one-char file) keeps legacy behavior."""
+    if (start == 0 and len(spec) >= 3 and spec[1] == ":"
+            and spec[0].isalpha() and spec[2] in "/\\"):
+        start = 2
+    return spec.find(":", start)
+
+
 def parse_logpoint(spec, cfg):
     # Class:line:template with {expr} holes (paths split like Class files).
-    first = spec.find(":")
-    second = spec.find(":", first + 1) if first >= 0 else -1
+    first = _logpoint_sep(spec)
+    second = _logpoint_sep(spec, first + 1) if first >= 0 else -1
     if first <= 0 or second <= 0:
         raise Usage("--logpoint must look like path:line:template")
     path = resolve_source_path(spec[:first], cfg.src_dirs)
@@ -707,6 +719,56 @@ def redact_identity_argv(argv):
             if _is_secret_flag(a):
                 skip_next = True
     return out
+
+
+def _windows_process_argv(pid):
+    """Best-effort argv for a native Windows pid (stdlib only, no psutil).
+    tasklist reports the image name only, so argv is [image]: liveness +
+    identity corroboration, never a full command line. None when unreadable
+    (dead pid, tasklist missing, non-Windows) — callers keep best-effort."""
+    if os.name != "nt":
+        return None
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {int(pid)}", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return None
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith('"'):
+            continue  # INFO: no matching task — pid is gone
+        try:
+            row = next(csv.reader([line]))
+        except Exception:
+            continue
+        if len(row) > 1 and row[1].strip() == str(int(pid)) and row[0]:
+            return [row[0]]
+    return None
+
+
+def _windows_process_image(pid):
+    """Full exe path of a native Windows pid via stdlib ctypes only.
+    None when unreadable (dead/reused pid, access denied, non-Windows)."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        kernel = ctypes.windll.kernel32
+        handle = kernel.OpenProcess(0x1000, False, int(pid))
+        if not handle:
+            return None
+        try:
+            buf = ctypes.create_unicode_buffer(32768)
+            size = ctypes.c_ulong(len(buf))
+            if kernel.QueryFullProcessImageNameW(handle, 0, buf,
+                                                 ctypes.byref(size)):
+                return buf.value or None
+            return None
+        finally:
+            kernel.CloseHandle(handle)
+    except Exception:
+        return None
 
 
 def _cap_str(s, limit=IDENT_FIELD_CAP):
@@ -2239,6 +2301,17 @@ class Session:
                     os_source = "os-ps"
             except Exception:
                 argv = None
+        if argv is None and os.name == "nt":
+            # No /proc and MSYS `ps` is blind to native pids: ask the OS
+            # directly (stdlib only, no psutil). tasklist corroborates
+            # liveness + image name; the full exe path comes from Win32.
+            argv = _windows_process_argv(pid)
+            if argv is not None:
+                os_source = "os-tasklist"
+        if exe is None and os.name == "nt":
+            exe = _windows_process_image(pid)
+            if exe is not None and os_source is None:
+                os_source = "os-proc-win"
         if argv is None and cwd is None and exe is None:
             return None
         details = {"source": os_source or "os-proc",

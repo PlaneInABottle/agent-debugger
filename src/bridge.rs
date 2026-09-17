@@ -412,7 +412,12 @@ fn debugpy_install_command() -> anyhow::Result<(PathBuf, Vec<String>)> {
             "-m".to_string(),
             "pip".to_string(),
             "install".to_string(),
-            "debugpy".to_string(),
+            // Pinned: debugpy 1.8.22 loses a breakpoint stop racing
+            // another thread's stop on Python 3.12 (thread B parks, thread
+            // A's hit never arrives — live test_16 fails 6/6 on CI while
+            // 1.8.21 delivers both). Floating `debugpy` silently adopts
+            // such regressions on every fresh runner provision.
+            "debugpy==1.8.21".to_string(),
         ],
     ))
 }
@@ -1177,7 +1182,7 @@ mod tests {
                         .and_then(|s| s.to_str()),
                     Some("bin")
                 );
-                assert_eq!(args, vec!["-m", "pip", "install", "debugpy"]);
+                assert_eq!(args, vec!["-m", "pip", "install", "debugpy==1.8.21"]);
             },
         );
     }

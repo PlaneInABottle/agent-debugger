@@ -1,4 +1,5 @@
 """Deterministic regressions for DAP ordering and stopped-state handling."""
+import contextlib
 import importlib.util
 import json
 import os
@@ -21,6 +22,20 @@ class BridgeTests(unittest.TestCase):
     def session(self):
         cfg = bridge.Config()
         return bridge.Session(cfg)
+
+    @contextlib.contextmanager
+    def chdir_tmp(self, tmp):
+        """chdir into `tmp`, restoring BEFORE the enclosing
+        TemporaryDirectory body exits. Plain addCleanup(os.chdir) runs
+        after __exit__ — Windows cannot rmtree the process cwd
+        (WinError 32), so every chdir-into-tmp test must use this as
+        `with tempfile.TemporaryDirectory() as tmp, self.chdir_tmp(tmp):`."""
+        old = os.getcwd()
+        os.chdir(tmp)
+        try:
+            yield tmp
+        finally:
+            os.chdir(old)
 
     def test_running_continue_never_resumes_historical_thread(self):
         st = self.session()
@@ -126,6 +141,27 @@ class BridgeTests(unittest.TestCase):
                 bridge.parse_logpoint(f + ":2:", cfg)
             bridge.parse_logpoint(f + ":2:hit {x}", cfg)
             self.assertEqual(cfg.logpoints[0][2], "hit {x}")
+
+    def test_parse_logpoint_skips_windows_drive_colon(self):
+        # A drive-absolute spec splits path=`C:\...\app.py`, never
+        # path=`C` (Windows CI builds these from real tmp paths; the
+        # drive itself never exists here, so the failure must name the
+        # FULL drive path — proving the split skipped index 1).
+        with self.assertRaises(bridge.Usage) as cm:
+            bridge.parse_logpoint("C:\\Users\\R\\Temp\\app.py:3:x=1",
+                                  bridge.Config())
+        self.assertIn("C:\\Users\\R\\Temp\\app.py", str(cm.exception))
+        self.assertNotIn("no such file: C ", str(cm.exception))
+        # Templates keep their colons; legacy drive-relative/one-char
+        # specs keep legacy behavior.
+        with tempfile.TemporaryDirectory() as tmp:
+            f = os.path.join(tmp, "a.py")
+            Path(f).write_text("x = 1\n" * 5)
+            cfg = bridge.Config()
+            bridge.parse_logpoint(f + ":2:a:b", cfg)
+            self.assertEqual(cfg.logpoints[0][2], "a:b")
+        with self.assertRaises(bridge.Usage):
+            bridge.parse_logpoint("C:4:t", bridge.Config())
 
     def test_malformed_event_body_is_contained(self):
         st = self.session()
@@ -398,23 +434,17 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(st.stop_states, [])
 
     def test_resolve_cwd_existing_wins_over_src(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, self.chdir_tmp(tmp):
             root = Path(tmp) / "root"
             (root / "deep").mkdir(parents=True)
             (root / "deep" / "probe.py").write_text("x = 1\n")
             cwd_file = Path(tmp) / "probe.py"
             cwd_file.write_text("y = 2\n")
-            old = os.getcwd()
-            os.chdir(tmp)
-            self.addCleanup(os.chdir, old)
             got = bridge.resolve_source_path("probe.py", [str(root)])
             self.assertEqual(got, os.path.realpath(str(cwd_file)))
 
     def test_resolve_missing_basename_no_src_fails_fast(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            old = os.getcwd()
-            os.chdir(tmp)
-            self.addCleanup(os.chdir, old)
+        with tempfile.TemporaryDirectory() as tmp, self.chdir_tmp(tmp):
             with self.assertRaises(bridge.Usage) as cm:
                 bridge.resolve_source_path("ghost.py", [])
             msg = str(cm.exception)
@@ -423,25 +453,19 @@ class BridgeTests(unittest.TestCase):
             self.assertIn("no --src roots given", msg)
 
     def test_resolve_basename_unique_under_src(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, self.chdir_tmp(tmp):
             target = Path(tmp) / "root" / "a" / "b" / "only.py"
             target.parent.mkdir(parents=True)
             target.write_text("x = 1\n")
-            old = os.getcwd()
-            os.chdir(tmp)
-            self.addCleanup(os.chdir, old)
             got = bridge.resolve_source_path("only.py", [str(Path(tmp) / "root")])
             self.assertEqual(got, os.path.realpath(str(target)))
 
     def test_resolve_basename_ambiguous_under_src(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, self.chdir_tmp(tmp):
             for sub in ("a", "b"):
                 d = Path(tmp) / "root" / sub
                 d.mkdir(parents=True)
                 (d / "dup.py").write_text("x = 1\n")
-            old = os.getcwd()
-            os.chdir(tmp)
-            self.addCleanup(os.chdir, old)
             with self.assertRaises(bridge.Usage) as cm:
                 bridge.resolve_source_path("dup.py", [str(Path(tmp) / "root")])
             msg = str(cm.exception)
@@ -451,13 +475,10 @@ class BridgeTests(unittest.TestCase):
             self.assertIn(os.path.join("b", "dup.py"), msg)
 
     def test_resolve_nested_relative_under_src(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, self.chdir_tmp(tmp):
             target = Path(tmp) / "root" / "tests" / "wf" / "nested.py"
             target.parent.mkdir(parents=True)
             target.write_text("x = 1\n")
-            old = os.getcwd()
-            os.chdir(tmp)
-            self.addCleanup(os.chdir, old)
             got = bridge.resolve_source_path(
                 os.path.join("tests", "wf", "nested.py"), [str(Path(tmp) / "root")])
             self.assertEqual(got, os.path.realpath(str(target)))
@@ -470,7 +491,7 @@ class BridgeTests(unittest.TestCase):
             self.assertIn(missing, str(cm.exception))
 
     def test_resolve_symlink_canonical_dedup(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, self.chdir_tmp(tmp):
             real = Path(tmp) / "root" / "a"
             real.mkdir(parents=True)
             (real / "same.py").write_text("x = 1\n")
@@ -480,20 +501,14 @@ class BridgeTests(unittest.TestCase):
                 os.symlink(str(real), str(Path(tmp) / "root" / "blink"))
             except OSError:
                 self.skipTest("symlinks unavailable")
-            old = os.getcwd()
-            os.chdir(tmp)
-            self.addCleanup(os.chdir, old)
             got = bridge.resolve_source_path("same.py", [str(Path(tmp) / "root")])
             self.assertEqual(got, os.path.realpath(str(real / "same.py")))
 
     def test_logpoint_uses_same_resolver(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, self.chdir_tmp(tmp):
             target = Path(tmp) / "root" / "lp.py"
             target.parent.mkdir(parents=True)
             target.write_text("".join(f"line {n}\n" for n in range(6)))
-            old = os.getcwd()
-            os.chdir(tmp)
-            self.addCleanup(os.chdir, old)
             cfg = bridge.Config()
             cfg.src_dirs = [str(Path(tmp) / "root")]
             bridge.parse_logpoint("lp.py:3:val={x}", cfg)
@@ -503,15 +518,12 @@ class BridgeTests(unittest.TestCase):
                 bridge.parse_logpoint("ghost.py:3:val={x}", cfg)
 
     def test_parse_args_resolves_break_before_src_flag(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, self.chdir_tmp(tmp):
             target = Path(tmp) / "root" / "deep" / "early.py"
             target.parent.mkdir(parents=True)
             target.write_text("x = 1\n")
             prog = Path(tmp) / "app.py"
             prog.write_text("print('hi')\n")
-            old = os.getcwd()
-            os.chdir(tmp)
-            self.addCleanup(os.chdir, old)
             cfg = bridge.parse_args(["session", "--kind", "launch",
                                      "--dir", str(Path(tmp) / "sess"),
                                      "--program", str(prog),
@@ -541,13 +553,10 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(cfg.prog_args, ["--kind", "--dir", "--break"])
 
     def test_breaks_add_uses_live_src_dirs(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, self.chdir_tmp(tmp):
             target = Path(tmp) / "root" / "sub" / "live.py"
             target.parent.mkdir(parents=True)
             target.write_text("".join(f"line {n}\n" for n in range(12)))
-            old = os.getcwd()
-            os.chdir(tmp)
-            self.addCleanup(os.chdir, old)
             st = self.add_session(tmp)
             st.cfg.src_dirs = [str(Path(tmp) / "root")]
             st.dap_request.return_value = {"breakpoints": [{"verified": True}]}
@@ -583,12 +592,9 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(st.unresolved_summary(), "")
 
     def test_line_range_rejects_zero_negative_and_past_eof(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, self.chdir_tmp(tmp):
             path = os.path.realpath(str(Path(tmp) / "app.py"))
             Path(path).write_text("a = 1\n# note\nb = 2\nprint(b)\n")
-            old = os.getcwd()
-            os.chdir(tmp)
-            self.addCleanup(os.chdir, old)
             for bad in (f"{path}:0", f"{path}:-3", f"{path}:5",
                         f"{path}:99999"):
                 cfg = bridge.Config()
@@ -1187,10 +1193,7 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(st.cfg.breaks, [(path, 5, None)])
 
     def test_breaks_remove_different_spelling_matches(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            old = os.getcwd()
-            os.chdir(tmp)
-            self.addCleanup(os.chdir, old)
+        with tempfile.TemporaryDirectory() as tmp, self.chdir_tmp(tmp):
             Path("a.py").write_text("".join(f"line {n}\n" for n in range(12)))
             st = self.add_session(tmp)
             st.dap_request.return_value = {"breakpoints": [{"verified": True}]}
@@ -1206,14 +1209,11 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(st.cfg.breaks, [])
 
     def test_breaks_remove_src_spelling_and_deleted_file(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, self.chdir_tmp(tmp):
             root = Path(tmp) / "srcroot"
             (root / "pkg").mkdir(parents=True)
             target = root / "pkg" / "mod.py"
             target.write_text("".join(f"line {n}\n" for n in range(12)))
-            old = os.getcwd()
-            os.chdir(tmp)
-            self.addCleanup(os.chdir, old)
             st = self.session()
             st.cfg.dir = tmp
             st.cfg.src_dirs = [str(root)]
@@ -2476,6 +2476,57 @@ class TargetIdentityTests(unittest.TestCase):
         self.assertIsNotNone(det)
         self.assertEqual(det["confidence"], "os-corroborated")
         self.assertNotIn("environ", json.dumps(det))
+
+    def test_windows_os_helpers_degrade_gracefully_off_windows(self):
+        # No windll/tasklist here: both helpers must return None, never
+        # raise, so non-Windows behavior is byte-identical to before.
+        self.assertIsNone(bridge._windows_process_argv(os.getpid()))
+        self.assertIsNone(bridge._windows_process_image(os.getpid()))
+        self.assertIsNone(bridge._windows_process_argv(999999999))
+
+    def test_debuggee_os_windows_fallback_wiring(self):
+        from unittest.mock import patch
+        st = self.session()
+        # No /proc here and ps is forced to fail: the nt branch alone
+        # must corroborate.
+        no_ps = OSError("no ps on windows")
+        with patch.object(os, "name", "nt"), \
+                patch.object(bridge.subprocess, "run",
+                             side_effect=no_ps), \
+                patch.object(bridge, "_windows_process_argv",
+                             return_value=["python.exe"]), \
+                patch.object(bridge, "_windows_process_image",
+                             return_value="C:\\Py\\python.exe"):
+            det = st._debuggee_os_details(os.getpid())
+        self.assertIsNotNone(det)
+        self.assertEqual(det["confidence"], "os-corroborated")
+        self.assertEqual(det["source"], "os-tasklist")
+        self.assertEqual(det["argv"], ["python.exe"])
+        self.assertEqual(det["executable"], "C:\\Py\\python.exe")
+        self.assertNotIn("environ", json.dumps(det))
+        # Dead pid on Windows stays None (liveness check intact).
+        with patch.object(os, "name", "nt"), \
+                patch.object(bridge, "_windows_process_argv",
+                             return_value=None), \
+                patch.object(bridge, "_windows_process_image",
+                             return_value=None):
+            self.assertIsNone(st._debuggee_os_details(999999999))
+
+    def test_windows_tasklist_csv_parsing(self):
+        from unittest.mock import patch
+        fake = ('"Image Name","PID","Session Name","Session#","Mem Usage"\r\n'
+                '"python.exe","1234","Console","1","45,000 K"\r\n')
+        run = Mock(return_value=SimpleNamespace(stdout=fake))
+        with patch.object(os, "name", "nt"), patch.object(
+                bridge.subprocess, "run", run):
+            self.assertEqual(bridge._windows_process_argv(1234),
+                             ["python.exe"])
+            self.assertIsNone(bridge._windows_process_argv(9999))
+        with patch.object(os, "name", "nt"), patch.object(
+                bridge.subprocess, "run",
+                Mock(return_value=SimpleNamespace(
+                    stdout="INFO: No tasks are running\r\n"))):
+            self.assertIsNone(bridge._windows_process_argv(1234))
 
     # ---- setup-failure phase (error.json `phase`) ----
     # Typed, never message-matched: Usage/ConfigErr read as config, every

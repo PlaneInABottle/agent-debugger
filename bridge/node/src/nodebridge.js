@@ -273,9 +273,21 @@ function parseBreak(spec, cfg) {
   cfg.breaks.push({ path: resolved, line: lineno, cond });
 }
 
+function logpointSep(spec, start = 0) {
+  // Next `:` separator at/after `start`, skipping a Windows drive prefix
+  // (`C:\...` / `C:/...`): the colon at index 1 of a drive-absolute path
+  // never separates fields. (Browser frags have no drive concept; this
+  // helper stays Node-local.)
+  if (start === 0 && spec.length >= 3 && spec[1] === ':'
+      && /[A-Za-z]/.test(spec[0]) && (spec[2] === '/' || spec[2] === '\\')) {
+    start = 2;
+  }
+  return spec.indexOf(':', start);
+}
+
 function parseLogpoint(spec, cfg) {
-  const first = spec.indexOf(':');
-  const second = first >= 0 ? spec.indexOf(':', first + 1) : -1;
+  const first = logpointSep(spec);
+  const second = first >= 0 ? logpointSep(spec, first + 1) : -1;
   if (first <= 0 || second <= 0) throw new Usage('--logpoint must look like path:line:template');
   const resolved = resolveSourcePath(spec.slice(0, first), cfg.srcs || []);
   const lineno = strictInt(spec.slice(first + 1, second));
@@ -3095,7 +3107,21 @@ class Session {
       throw new BridgeErr('target main has exited — close this session');
     }
     if (this.exited) throw new BridgeErr('target VM has exited — close this session');
-    if (!this.paused) throw new BridgeErr('no stopped thread (target is running — continue first)');
+    if (!this.paused) {
+      // Park inventory (diagnostic suffix, never a verdict change): with
+      // --workers the first park can belong to a worker while main runs,
+      // so a bare `context` that lands on main must say which worker
+      // parks exist. An empty list here after session.json reported
+      // stopped:true means the park vanished between the pump return and
+      // this read (entry-resume race or worker detach), not that nothing
+      // ever parked.
+      const parked = this.workers.liveWorkers()
+        .filter((w) => w.paused).map((w) => w.id);
+      const suffix = parked.length > 0
+        ? `; parked workers: ${parked.join(',')}`
+        : '; no worker parked';
+      throw new BridgeErr(`no stopped thread (target is running — continue first)${suffix}`);
+    }
     if (((this.paused && this.paused.frames) || []).length === 0) {
       throw new BridgeErr('no stopped thread yet in this session');
     }
