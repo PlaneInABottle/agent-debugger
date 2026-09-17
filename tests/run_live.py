@@ -22,6 +22,67 @@ import _live_home
 
 LIVE_MODULES = ("test_live", "test_m5_live", "test_ux_live")
 
+# Spike-flake absorption: shared CI runners stall individual integration
+# tests past their budgets (varying set per run, green locally and on
+# retry). Failed/errored tests rerun ONCE; a test failing twice stays red,
+# so genuine regressions still fail the gate. Strict timeout asserts are
+# deliberately NOT loosened — the retry absorbs spikes, the asserts keep
+# their signal. Disable with LIVE_RETRY=0.
+
+
+def _retry_enabled():
+    return os.environ.get("LIVE_RETRY", "1").strip().lower() not in ("0", "false", "no")
+
+
+def _rerun_failed_once(loader, runner, result):
+    """Rerun exactly the failed/errored test ids once; drop entries for
+    tests that pass on retry. Returns the (possibly new) result to judge."""
+    bad_ids = []
+    for t, _ in list(result.failures) + list(result.errors):
+        try:
+            tid = t.id()
+        except Exception:
+            continue
+        if tid not in bad_ids:
+            bad_ids.append(tid)
+    retry_suite = unittest.TestSuite()
+    unloadable = []
+    for tid in bad_ids:
+        try:
+            retry_suite.addTests(loader.loadTestsFromName(tid))
+        except Exception:
+            unloadable.append(tid)
+    if unloadable:
+        print(f"live retry: cannot reload {unloadable}; keeping original verdicts",
+              flush=True)
+    retry_tests = list(_live_home.iter_suite_tests(retry_suite))
+    if not retry_tests:
+        return result
+    # Collect ids BEFORE running: CPython replaces executed suite entries
+    # with None after the run, so post-run iteration finds nothing.
+    retry_ids = [t.id() for t in retry_tests]
+    print(f"live retry: rerunning {len(retry_tests)} failed test(s) once: "
+          f"{retry_ids}", flush=True)
+    retry_result = runner.run(retry_suite)
+    still_bad = {t.id() for t, _ in list(retry_result.failures) + list(retry_result.errors)}
+    skipped_on_retry = {t.id() for t, _ in list(getattr(retry_result, "skipped", []))}
+    # Heal only tests that actually ran green on retry: a failure that
+    # skips on retry never passed, so its original verdict stands.
+    healed = set(retry_ids) - still_bad - skipped_on_retry
+    # A retried test that errored at setUpClass level may surface under a
+    # placeholder id; only drop entries whose exact id healed.
+    result.failures = [(t, tr) for t, tr in result.failures if t.id() not in healed]
+    result.errors = [(t, tr) for t, tr in result.errors if t.id() not in healed]
+    result.testsRun += retry_result.testsRun
+    result.skipped = list(getattr(result, "skipped", [])) + list(
+        getattr(retry_result, "skipped", []))
+    if healed:
+        print(f"live retry: healed by retry (spike flakes): {sorted(healed)}", flush=True)
+    still = sorted({t.id() for t, _ in list(result.failures) + list(result.errors)})
+    if still:
+        print(f"live retry: still failing after retry (genuine): {still}", flush=True)
+    return result
+
 
 def main():
     unknown = _live_home.unknown_test_langs()
@@ -41,7 +102,10 @@ def main():
           f"SKIP_BROWSER={os.environ.get('SKIP_BROWSER', '')!r} "
           f"required={list(required)} selected={len(selected_ids)}",
           flush=True)
-    result = unittest.TextTestRunner(verbosity=1).run(suite)
+    runner = unittest.TextTestRunner(verbosity=1)
+    result = runner.run(suite)
+    if _retry_enabled() and (result.failures or result.errors):
+        result = _rerun_failed_once(loader, runner, result)
     ok, message, summary = _live_home.check_live_nonzero(
         selected_ids, result, required)
     per = ", ".join(

@@ -162,6 +162,14 @@ pub(crate) fn probe_session_bridge(port: u16, timeout: Duration) -> Probe {
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
             return Probe::NotOurs("connection refused");
         }
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+            // An RST answering our SYN is active rejection — no listener,
+            // just like a refusal (some stacks/firewalls reset instead of
+            // refusing closed loopback ports). It can never be a live
+            // bridge: a live bridge completes the handshake, and resets
+            // after accept surface on reads/writes, never here.
+            return Probe::NotOurs("connection reset");
+        }
         Err(_) => return Probe::Unclear,
     };
     if sock.set_read_timeout(Some(timeout)).is_err()
@@ -883,26 +891,61 @@ mod tests {
             ),
             Probe::Ours
         );
-        // Nothing listens: definitively gone. Even a proven-free port can
-        // be grabbed in the microsecond gap before the probe lands, so
-        // retry with fresh dead ports — a real refused-mapping regression
-        // still fails every attempt and trips the assert below (which
-        // logs every verdict seen, so a repeat failure diagnoses itself
-        // as mapping-vs-grab).
+        // Nothing listens: the verdict must be definitive fast-failure.
+        // Closed loopback surfaces per-platform (unix: refused; some
+        // stacks reset instead; filtered hosts drop the SYN and time
+        // out — genuinely ambiguous at TCP level, like a blackhole).
+        // The raw connect pins which world we're in, so a repeat
+        // failure diagnoses itself instead of guessing mapping-vs-grab.
         let mut seen = Vec::new();
-        let mut refused = false;
+        let mut ok = false;
         for _ in 0..10 {
             let dead = fresh_dead_port();
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{dead}").parse().unwrap();
+            let start = std::time::Instant::now();
+            let raw = std::net::TcpStream::connect_timeout(&addr, t);
+            let raw_dt = start.elapsed();
             let verdict = probe_session_bridge(dead, t);
-            if verdict == Probe::NotOurs("connection refused") {
-                refused = true;
-                break;
+            let raw_kind = match &raw {
+                Ok(_) => "connected!".to_string(),
+                Err(e) => format!("{:?}", e.kind()),
+            };
+            match (&raw, &verdict) {
+                // Unix fast path, pinned exactly (guards the mapping).
+                (Err(e), Probe::NotOurs("connection refused"))
+                    if e.kind() == std::io::ErrorKind::ConnectionRefused =>
+                {
+                    ok = true;
+                    break;
+                }
+                // Reset rejection, pinned exactly too.
+                (Err(e), Probe::NotOurs("connection reset"))
+                    if e.kind() == std::io::ErrorKind::ConnectionReset =>
+                {
+                    ok = true;
+                    break;
+                }
+                // Filtered environment: the raw connect itself burns the
+                // budget, so the probe's Unclear is the honest verdict (a
+                // fast raw error paired with Unclear would be a new,
+                // undiagnosed shape — keep failing loudly on that).
+                (Err(e), Probe::Unclear)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) && raw_dt >= t / 2 =>
+                {
+                    ok = true;
+                    break;
+                }
+                _ => seen.push(format!(
+                    "{dead}:raw={raw_kind}/{raw_dt:?} probe={verdict:?}"
+                )),
             }
-            seen.push(format!("{dead}:{verdict:?}"));
         }
         assert!(
-            refused,
-            "a genuinely closed port must probe as refused; saw {seen:?}"
+            ok,
+            "a genuinely closed port must probe definitively; saw {seen:?}"
         );
         // Blackhole (accepts, never answers): ambiguous, never a verdict.
         assert_eq!(
