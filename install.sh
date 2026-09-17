@@ -7,7 +7,7 @@
 #   VERSION      - Specific version tag to install (e.g. v0.2.0, default: latest)
 #   INSTALL_DIR  - Directory to place binary (default: ~/.local/bin or /usr/local/bin)
 
-set -e
+set -eu
 
 REPO="PlaneInABottle/agent-debugger"
 DEFAULT_VERSION="v0.2.0"
@@ -105,9 +105,9 @@ log_info "Installing agent-debugger ${VERSION} for ${TARGET}..."
 # 4. Determine Install Directory
 if [ -n "${INSTALL_DIR:-}" ]; then
   DEST_DIR="$INSTALL_DIR"
-elif [ -d "$HOME/.cargo/bin" ] && echo "$PATH" | grep -q "$HOME/.cargo/bin"; then
+elif [ -d "$HOME/.cargo/bin" ] && echo "$PATH" | tr ':' '\n' | grep -F -qx "$HOME/.cargo/bin"; then
   DEST_DIR="$HOME/.cargo/bin"
-elif [ -d "$HOME/.local/bin" ] && echo "$PATH" | grep -q "$HOME/.local/bin"; then
+elif [ -d "$HOME/.local/bin" ] && echo "$PATH" | tr ':' '\n' | grep -F -qx "$HOME/.local/bin"; then
   DEST_DIR="$HOME/.local/bin"
 elif [ -w "/usr/local/bin" ]; then
   DEST_DIR="/usr/local/bin"
@@ -150,11 +150,14 @@ chmod +x "${DEST_DIR}/agent-debugger"
 log_info "agent-debugger was installed successfully to ${DEST_DIR}/agent-debugger"
 
 # 6. Verify PATH and Installation
-if ! echo "$PATH" | tr ':' '\n' | grep -qx "$DEST_DIR"; then
+if ! echo "$PATH" | tr ':' '\n' | grep -F -qx "$DEST_DIR"; then
   printf "\n\033[33m[Warning]\033[0m %s is not in your PATH.\n" "$DEST_DIR"
   printf "Add it to your shell configuration (e.g. ~/.zshrc or ~/.bashrc):\n"
   printf "  export PATH=\"%s:\$PATH\"\n\n" "$DEST_DIR"
 fi
 
-"${DEST_DIR}/agent-debugger" --version || true
+if ! "${DEST_DIR}/agent-debugger" --version; then
+  log_error "Installed binary failed to run; check ${DEST_DIR}/agent-debugger"
+  exit 1
+fi
 printf "\nRun '\033[1magent-debugger doctor\033[0m' to check your debugging environment.\n"

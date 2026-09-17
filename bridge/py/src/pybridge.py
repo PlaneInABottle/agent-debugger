@@ -88,6 +88,16 @@ class StopTimeout(BridgeErr):
         self.wait_context = wait_context
 
 
+def is_framing_error_text(msg):
+    """True for malformed-adapter-frame texts (never target death): the
+    framing layer raises plain BridgeErr for these, and the idle pump must
+    not translate them into `exited` (contrast "closed"-family transport
+    losses, which do mean the connection died)."""
+    low = msg.lower()
+    return ("header too large" in low or "frame too large" in low
+            or "invalid dap" in low or "invalid content-length" in low)
+
+
 # ---------------------------------------------------------------- framing
 
 def read_frame(conn):
@@ -473,6 +483,8 @@ def parse_logpoint(spec, cfg):
     except ValueError:
         raise Usage(f"bad line in --logpoint: {spec}")
     _check_line_range(path, lineno, spec)
+    if not spec[second + 1:]:
+        raise Usage(f"--logpoint template is empty: {spec}")
     cfg.logpoints.append((path, lineno, spec[second + 1:]))
 
 
@@ -2426,10 +2438,15 @@ class Session:
         port = self.free_port()
         self.adapter_port = port
         log = open(os.path.join(self.cfg.dir, "adapter.log"), "w")
-        self.adapter = subprocess.Popen(
-            [self.cfg.python, "-m", "debugpy.adapter",
-             "--host", "127.0.0.1", "--port", str(port)],
-            stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        try:
+            self.adapter = subprocess.Popen(
+                [self.cfg.python, "-m", "debugpy.adapter",
+                 "--host", "127.0.0.1", "--port", str(port)],
+                stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        finally:
+            # The child holds its own dup of the fd; the parent side must
+            # close (previously leaked one fd per session daemon).
+            log.close()
         deadline = time.time() + 20
         while time.time() < deadline:
             if self.adapter.poll() is not None:
@@ -5274,7 +5291,12 @@ class Session:
         return spec
 
     def cmd_logs(self, req):
-        tail = max(1, min(500, int(req.get("tail", 50))))
+        try:
+            tail = max(1, min(500, int(req.get("tail", 50))))
+        except (TypeError, ValueError):
+            # Non-numeric tail degrades to the default (Node/Browser/JS
+            # parity) instead of surfacing as an internal error.
+            tail = 50
         # Flush recently arrived output first: in logpoints-only sessions
         # nothing else ever pumps the queue. Skipped while a resume is
         # outstanding (M5: no second DAP reader — the pump owns the wire;
@@ -5771,6 +5793,13 @@ def idle_pump(st):
                             sys.stderr.write(f"dap: {fatal}\n")
                             return
                         continue
+                    if is_framing_error_text(str(e)):
+                        # Malformed adapter frame: never target death.
+                        # Warn and stop pumping; the next command's pump
+                        # surfaces the same error to its caller instead of
+                        # a fabricated session exit.
+                        sys.stderr.write(f"dap: {e}\n")
+                        break
                     st.exited = True
                     try:
                         st.publish_state(False)
@@ -5976,6 +6005,11 @@ def main(argv):
     try:
         os.makedirs(cfg.dir, exist_ok=True)
         nonce = write_owner(cfg.dir)
+        if not am_owner(cfg.dir, nonce):
+            # A silent owner-write failure would surface later as a
+            # baffling instant self-reap (Node/Browser verify the same
+            # claim explicitly) — fail fast instead.
+            die("session owner claim not visible; refusing to start", 1)
         server = socket.socket()
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind(("127.0.0.1", 0))
@@ -6049,7 +6083,9 @@ def main(argv):
                 server.close()
             except Exception:
                 pass
-    except (Usage, BridgeErr) as e:
+    except Usage as e:
+        die(str(e), 2)
+    except BridgeErr as e:
         die(str(e), 1)
     except Exception as e:
         if cfg_dir is not None:

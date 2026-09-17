@@ -90,6 +90,22 @@ pub(crate) fn real_dir_for_delete(dir: &std::path::Path, context: &str) -> anyho
     }
 }
 
+/// Refuse a planted symlink at a file path that the caller is about to
+/// create/truncate (absent is fine). `File::create` follows links, so
+/// without this a swapped-in `bridge.log` link redirects bridge output
+/// (and truncates the link target). Best-effort like every other planting
+/// check — callers invoke it immediately before the create.
+pub(crate) fn refuse_symlink(path: &std::path::Path, what: &str) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            anyhow::bail!("{what} must not be a symlink: {}", path.display())
+        }
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => anyhow::bail!("cannot stat {what} {}: {e}", path.display()),
+    }
+}
+
 pub(crate) fn read_session(name: &str) -> anyhow::Result<Value> {
     let file = checked_session_dir(name)?.join("session.json");
     let raw = std::fs::read_to_string(&file)
@@ -253,11 +269,15 @@ pub fn normalize_attach_host(host: &str) -> String {
 
 /// True for IPv4 loopback (all of 127/8), IPv6 `::1`, and IPv4-mapped or
 /// IPv4-compatible forms wrapping a loopback v4 (`::ffff:127.0.0.1`).
-/// Anything unparseable is not loopback — never a guess.
+/// Also covers `inet_aton`-style aliases the strict parser rejects but the
+/// OS resolves to loopback (`127.1`, `127.0.1`, `0x7f000001`,
+/// `017700000001`): without this, the same debug endpoint attached via two
+/// spellings escapes the exclusivity scan. Anything unparseable is not
+/// loopback — never a guess.
 pub(crate) fn ip_is_loopback(s: &str) -> bool {
     let ip: std::net::IpAddr = match s.parse() {
         Ok(ip) => ip,
-        Err(_) => return false,
+        Err(_) => return inet_aton_loopback(s),
     };
     if ip.is_loopback() {
         return true;
@@ -266,6 +286,72 @@ pub(crate) fn ip_is_loopback(s: &str) -> bool {
         std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
         std::net::IpAddr::V4(_) => false, // non-loopback v4, already checked
     }
+}
+
+/// `inet_aton` numeric IPv4 forms (`127.1`, `0x7f000001`, `0177.0.0.1`):
+/// 1–4 dot-separated parts, each decimal, `0x`-hex, or leading-`0` octal.
+/// True only when the resulting 32-bit value is in 127/8.
+fn inet_aton_loopback(s: &str) -> bool {
+    if s.contains(':') || s.is_empty() {
+        return false; // IPv6 (or empty) is the strict parser's job
+    }
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() > 4 || parts.iter().any(|p| p.is_empty() || p.len() > 18) {
+        return false;
+    }
+    let mut nums: Vec<u32> = Vec::with_capacity(parts.len());
+    for p in &parts {
+        let (digits, radix) = if let Some(h) = p.strip_prefix("0x").or_else(|| p.strip_prefix("0X"))
+        {
+            (h, 16)
+        } else if p.len() > 1 && p.starts_with('0') {
+            (*p, 8)
+        } else {
+            (*p, 10)
+        };
+        if digits.is_empty() || digits.len() > 16 {
+            return false;
+        }
+        let valid = match radix {
+            16 => digits.bytes().all(|b| b.is_ascii_hexdigit()),
+            8 => digits.bytes().all(|b| matches!(b, b'0'..=b'7')),
+            _ => digits.bytes().all(|b| b.is_ascii_digit()),
+        };
+        if !valid {
+            return false;
+        }
+        let n = match u32::from_str_radix(digits, radix) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        nums.push(n);
+    }
+    let addr: u64 = match nums.len() {
+        1 => nums[0] as u64,
+        2 => {
+            if nums[0] > 0xff || nums[1] > 0xffffff {
+                return false;
+            }
+            ((nums[0] << 24) | nums[1]) as u64
+        }
+        3 => {
+            if nums[0] > 0xff || nums[1] > 0xff || nums[2] > 0xffff {
+                return false;
+            }
+            ((nums[0] << 24) | (nums[1] << 16) | nums[2]) as u64
+        }
+        4 => {
+            if nums.iter().any(|&n| n > 0xff) {
+                return false;
+            }
+            ((nums[0] << 24) | (nums[1] << 16) | (nums[2] << 8) | nums[3]) as u64
+        }
+        _ => return false,
+    };
+    if addr > 0xffffffff {
+        return false;
+    }
+    (addr >> 24) == 127
 }
 
 /// Unspecified/wildcard destinations can never be attach targets: dialing
@@ -280,7 +366,7 @@ pub(crate) fn is_unspecified_host(host: &str) -> bool {
     };
     matches!(
         inner.to_ascii_lowercase().as_str(),
-        "0.0.0.0" | "::" | "0:0:0:0:0:0:0:0"
+        "0.0.0.0" | "::" | "::0" | "0:0:0:0:0:0:0:0"
     )
 }
 
@@ -327,6 +413,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_session_file(&dir).unwrap()["port"], Value::from(1));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn refuse_symlink_guards_planted_log_link() {
+        // Absent and regular files pass; a symlink refuses with the
+        // canonical text so File::create never follows it. Symlink
+        // creation needs privileges Windows CI may not grant: if the
+        // plant fails, the symlink leg is skipped (the other legs still
+        // assert), never failed.
+        let base = tmpdir("refuse-symlink");
+        let target = base.join("victim.txt");
+        std::fs::write(&target, "do-not-touch").unwrap();
+        let absent = base.join("bridge.log");
+        refuse_symlink(&absent, "bridge log").expect("absent passes");
+        std::fs::write(&absent, "log").unwrap();
+        refuse_symlink(&absent, "bridge log").expect("regular file passes");
+        std::fs::remove_file(&absent).unwrap();
+        #[cfg(unix)]
+        let planted = std::os::unix::fs::symlink(&target, &absent).is_ok();
+        #[cfg(windows)]
+        let planted = std::os::windows::fs::symlink_file(&target, &absent).is_ok();
+        #[cfg(not(any(unix, windows)))]
+        let planted = false;
+        if !planted {
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let err = refuse_symlink(&absent, "bridge log").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("must not be a symlink"),
+            "{err:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "do-not-touch");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -449,8 +569,27 @@ mod tests {
             "::ffff:127.0.0.1", // v4-mapped
             "[::ffff:127.0.0.1]",
             " localhost ",
+            "127.1", // inet_aton shorthand
+            "127.0.1",
+            "0x7f000001", // hex form
+            "0X7F000001",
+            "017700000001", // octal form
+            "0177.0.0.1",
+            "2130706433", // single decimal form
         ] {
             assert_eq!(normalize_attach_host(alias), "loopback", "{alias}");
+        }
+        // Near-misses stay non-loopback: overflow, out-of-range part,
+        // bad octal digit, empty part, and non-127 first byte.
+        for not in [
+            "127.0.0.1.5",
+            "128.0.0.1",
+            "127.0.0.256",
+            "0192.0.0.1",
+            "127..0.1",
+            "0x7f0000010",
+        ] {
+            assert_ne!(normalize_attach_host(not), "loopback", "{not}");
         }
         // Non-loopback compares exact/lowercase, brackets stripped.
         assert_eq!(normalize_attach_host("Example.COM"), "example.com");
@@ -464,6 +603,7 @@ mod tests {
         assert!(is_unspecified_host("0.0.0.0"));
         assert!(is_unspecified_host("::"));
         assert!(is_unspecified_host("[::]"));
+        assert!(is_unspecified_host("::0"));
         assert!(!is_unspecified_host("localhost"));
         assert!(!is_unspecified_host("127.0.0.1"));
         assert!(!is_unspecified_host("example.com"));

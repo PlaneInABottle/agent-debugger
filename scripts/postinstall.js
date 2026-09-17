@@ -100,6 +100,12 @@ async function main() {
       console.warn('[agent-debugger] Warning: Extraction succeeded but binary file not found at expected location.');
     }
   } catch (err) {
+    if (isChecksumMismatch(err)) {
+      // Tamper/corruption signal: never downgrade to a warning (a warn
+      // leaves npm install "successful" with no binary, hiding the
+      // attack). Rethrown to the fatal handler below.
+      throw err;
+    }
     console.warn(`[agent-debugger] Notice: Could not download pre-built binary from ${downloadUrl}`);
     console.warn(`[agent-debugger] Reason: ${err.message}`);
     console.warn('[agent-debugger] If this release has not yet been published to GitHub, or you are offline,');
@@ -179,6 +185,13 @@ function sha256File(filePath) {
   return hash.digest('hex');
 }
 
+// Checksum mismatches (corrupt/tampered download) are fatal: the install
+// must fail loudly, never warn-and-continue with no binary. Fetch-
+// failures (offline, unpublished release) stay warnings.
+function isChecksumMismatch(err) {
+  return !!err && /Checksum mismatch/.test(String((err && err.message) || err));
+}
+
 function downloadText(url, maxRedirects = 5) {
   return new Promise((resolve, reject) => {
     if (maxRedirects <= 0) {
@@ -202,7 +215,7 @@ function downloadText(url, maxRedirects = 5) {
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { verifyChecksum, sha256File, TARGET_MAP };
+  module.exports = { verifyChecksum, sha256File, TARGET_MAP, isChecksumMismatch };
 }
 
 // Only auto-run when executed as the npm postinstall script, never on
@@ -211,6 +224,11 @@ if (typeof module !== 'undefined' && module.exports) {
 // on fresh checkouts without bin/ or target/release).
 if (typeof require !== 'undefined' && require.main === module) {
   main().catch((err) => {
+    if (isChecksumMismatch(err)) {
+      console.error(`[agent-debugger] ${err.message}`);
+      console.error('[agent-debugger] Refusing to finish installation with a corrupt binary.');
+      process.exit(1);
+    }
     console.warn(`[agent-debugger] Postinstall error: ${err.message}`);
   });
 }

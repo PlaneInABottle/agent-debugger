@@ -48,7 +48,7 @@ class BridgeCli {
             switch (a) {
                 case "--": dashdash = true; break;
                 case "--host": cfg.host = next(argv, ++i, "--host"); break;
-                case "--port": cfg.port = Integer.parseInt(next(argv, ++i, "--port")); break;
+                case "--port": cfg.port = parsePort(next(argv, ++i, "--port")); break;
                 case "--main": cfg.mainClass = next(argv, ++i, "--main"); break;
                 case "--cp": case "--classpath": cfg.classpath = next(argv, ++i, a); break;
                 case "--src": cfg.srcDirs.add(next(argv, ++i, "--src")); break;
@@ -139,6 +139,14 @@ class BridgeCli {
     static String next(String[] argv, int i, String flag) throws UsageException {
         if (i >= argv.length) throw new UsageException(flag + " needs a value");
         return argv[i];
+    }
+
+    static int parsePort(String raw) throws UsageException {
+        try {
+            return Integer.parseInt(raw);
+        } catch (NumberFormatException e) {
+            throw new UsageException("--port needs a number (got '" + raw + "')");
+        }
     }
 
     /** Keep only plausible layered seeds (we generate the JSON CLI-side);

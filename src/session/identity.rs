@@ -46,9 +46,41 @@ pub(crate) fn is_secret_flag(flag: &str) -> bool {
         .any(|tok| TOKEN.iter().any(|k| tok == *k || tok.ends_with(k)))
 }
 
+/// True when `s` holds a `?name=`/`&name=`/`;name=` pair whose name is a
+/// secret flag (URL query tokens like `?token=SECRET`). Lets `redact_argv`
+/// fail closed on option values that embed secrets without making the
+/// option itself secret.
+fn value_holds_secret_pair(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if matches!(b[i], b'?' | b'&' | b';') {
+            let mut j = i + 1;
+            while j < b.len()
+                && (b[j].is_ascii_alphanumeric() || matches!(b[j], b'-' | b'_' | b'.'))
+            {
+                j += 1;
+            }
+            if j < b.len() && matches!(b[j], b'=' | b':') && j > i + 1 {
+                if is_secret_flag(&s[i + 1..j]) {
+                    return true;
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 /// Redact an argv for persistence/output: `--token <v>` drops the value,
 /// `--password=<v>` / `key:<v>` mask the value, and the bare secret flag
-/// itself is kept (only values are ever secret). Returns display strings.
+/// itself is kept (only values are ever secret). Option values that embed
+/// secrets (`--url=https://h/?token=SECRET`, or a bare
+/// `https://h/?token=SECRET` word) mask the value too: the head (`--url`)
+/// is not itself secret, but the value carries a `?name=`/`&name=` pair
+/// whose name is. Returns display strings.
 pub fn redact_argv(argv: &[String]) -> Vec<Value> {
     let mut out = Vec::with_capacity(argv.len());
     let mut skip_next = false;
@@ -71,6 +103,12 @@ pub fn redact_argv(argv: &[String]) -> Vec<Value> {
             Some(i) => {
                 let (head, val) = a.split_at(i);
                 if is_secret_flag(head) {
+                    out.push(Value::String(format!(
+                        "{head}{}{}",
+                        &val[..1],
+                        "[redacted]"
+                    )));
+                } else if value_holds_secret_pair(val) {
                     out.push(Value::String(format!(
                         "{head}{}{}",
                         &val[..1],
@@ -384,6 +422,32 @@ pub(crate) fn run_bounded(cmd: &str, args: &[&str]) -> Option<String> {
             None
         }
     }
+}
+
+/// Whether the OS listener source is even readable: when neither
+/// `/proc/net/tcp` nor `/proc/net/tcp6` can be opened (unmounted /proc in
+/// a container), a lookup miss means "unknown", not "nothing listens"
+/// (see `listener_present` in attach.rs). Injectable-input seam below so
+/// the policy is unit-tested without touching /proc.
+#[cfg(target_os = "linux")]
+pub(crate) fn listener_source_readable() -> bool {
+    listener_source_readable_in(
+        std::path::Path::new("/proc/net/tcp"),
+        std::path::Path::new("/proc/net/tcp6"),
+    )
+}
+
+/// Non-Linux (lsof path): lsof ships with the OS and spawn failure already
+/// degrades to `unavailable` downstream, so there is no cheap readability
+/// pre-check worth a subprocess here — keep the old behavior.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn listener_source_readable() -> bool {
+    true
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn listener_source_readable_in(tcp: &std::path::Path, tcp6: &std::path::Path) -> bool {
+    std::fs::read_to_string(tcp).is_ok() || std::fs::read_to_string(tcp6).is_ok()
 }
 
 /// Kernel-observed listener pid for a localhost port. macOS: lsof;
@@ -907,6 +971,36 @@ mod tests {
     }
 
     #[test]
+    fn redact_argv_masks_embedded_url_secrets() {
+        // Option values that embed `?name=`/`&name=` secret pairs mask the
+        // value even though the head itself is not secret; plain URLs and
+        // non-secret query keys pass through untouched.
+        let argv = [
+            "--url=https://h/?a=1&token=S3CR3T",
+            "https://h/?password=hunter2",
+            "--url",
+            "https://h/?a=1&token=S3CR3T",
+            "--url=https://h/?format=json",
+            "app.py",
+        ];
+        let red = redact_argv(&argv.map(|s| s.to_string()));
+        let strs: Vec<&str> = red.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(
+            strs,
+            vec![
+                "--url=[redacted]",
+                "https://h/?password=[redacted]",
+                "--url",
+                "https://h/?a=[redacted]",
+                "--url=https://h/?format=json",
+                "app.py",
+            ]
+        );
+        assert!(!strs.join(" ").contains("S3CR3T"));
+        assert!(!strs.join(" ").contains("hunter2"));
+    }
+
+    #[test]
     fn identity_fields_capped_and_total_bounded() {
         let long = "x".repeat(600);
         let v = cap_identity(json!({
@@ -1082,6 +1176,22 @@ mod tests {
             tcp_listen_inode_in(8080, &dir.join("missing-a"), &dir.join("missing-b")),
             None
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn listener_source_readable_needs_one_file() {
+        // Either table readable means probeable; neither means unknown
+        // (listener_present must answer None, never Some(false)).
+        let dir = tmpdir("listener-readable");
+        let tcp = dir.join("tcp");
+        let tcp6 = dir.join("tcp6");
+        assert!(!listener_source_readable_in(&tcp, &tcp6));
+        std::fs::write(&tcp6, "sl\n").unwrap();
+        assert!(listener_source_readable_in(&tcp, &tcp6));
+        std::fs::remove_file(&tcp6).unwrap();
+        std::fs::write(&tcp, "sl\n").unwrap();
+        assert!(listener_source_readable_in(&tcp, &tcp6));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

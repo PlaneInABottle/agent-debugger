@@ -100,9 +100,17 @@ const NOISE_LINES = new Set([
 
 // ---------------------------------------------------------------- args
 
+function strictInt(text) {
+  const t = String(text).trim();
+  if (!/^-?\d+$/.test(t)) return null;
+  const n = Number(t);
+  if (!Number.isSafeInteger(n)) return null;
+  return n;
+}
+
 function needInt(flag, raw) {
-  const n = parseInt(raw, 10);
-  if (Number.isNaN(n)) throw new Usage(`${flag} needs a number (got '${raw}')`);
+  const n = strictInt(raw);
+  if (n === null) throw new Usage(`${flag} needs a number (got '${raw}')`);
   return n;
 }
 
@@ -259,8 +267,8 @@ function parseBreak(spec, cfg) {
   }
   const colon = head.lastIndexOf(':');
   if (colon <= 0) throw new Usage('--break must look like path:line, exc');
-  const lineno = parseInt(head.slice(colon + 1), 10);
-  if (Number.isNaN(lineno)) throw new Usage(`bad line in --break: ${spec}`);
+  const lineno = strictInt(head.slice(colon + 1));
+  if (lineno === null || lineno < 1) throw new Usage(`bad line in --break: ${spec}`);
   const resolved = resolveSourcePath(head.slice(0, colon), cfg.srcs || []);
   cfg.breaks.push({ path: resolved, line: lineno, cond });
 }
@@ -270,12 +278,14 @@ function parseLogpoint(spec, cfg) {
   const second = first >= 0 ? spec.indexOf(':', first + 1) : -1;
   if (first <= 0 || second <= 0) throw new Usage('--logpoint must look like path:line:template');
   const resolved = resolveSourcePath(spec.slice(0, first), cfg.srcs || []);
-  const lineno = parseInt(spec.slice(first + 1, second), 10);
-  if (Number.isNaN(lineno)) throw new Usage(`bad line in --logpoint: ${spec}`);
+  const lineno = strictInt(spec.slice(first + 1, second));
+  if (lineno === null || lineno < 1) throw new Usage(`bad line in --logpoint: ${spec}`);
+  const template = spec.slice(second + 1);
+  if (!template) throw new Usage(`--logpoint template is empty: ${spec}`);
   cfg.logpoints.push({
     path: resolved,
     line: lineno,
-    template: spec.slice(second + 1),
+    template,
   });
 }
 
@@ -4218,8 +4228,8 @@ class Session {
     }
     const colon = head.lastIndexOf(':');
     if (colon <= 0) throw new BridgeErr(`bad break spec: ${JSON.stringify(raw)}`);
-    const lineno = parseInt(head.slice(colon + 1), 10);
-    if (Number.isNaN(lineno) || lineno < 1) {
+    const lineno = strictInt(head.slice(colon + 1));
+    if (lineno === null || lineno < 1) {
       throw new BridgeErr(`bad break spec: ${JSON.stringify(raw)}`);
     }
     return { path: canon(head.slice(0, colon)), line: lineno, cond };

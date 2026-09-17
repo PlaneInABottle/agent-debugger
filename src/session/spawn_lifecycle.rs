@@ -11,7 +11,8 @@ use super::locks::{
     endpoint_locks_dir_for, startup_lock_path, still_holds_endpoint, EndpointClaim,
 };
 use super::paths::{
-    check_dir_real, check_name, normalize_attach_host, real_dir_for_delete, sessions_dir,
+    check_dir_real, check_name, normalize_attach_host, real_dir_for_delete, refuse_symlink,
+    sessions_dir,
 };
 use super::sidecar::{cli_markers_v2, write_sidecar_atomic, SpawnSpec, SCHEMA_VERSION};
 use crate::bridge;
@@ -44,7 +45,9 @@ pub(crate) fn setup_bridge(
         &serde_json::to_string_pretty(&spec.stops).unwrap_or_else(|_| "{}".to_string()),
     )?;
 
-    let log = std::fs::File::create(dir.join("bridge.log"))
+    let log_path = dir.join("bridge.log");
+    refuse_symlink(&log_path, "bridge log")?;
+    let log = std::fs::File::create(&log_path)
         .map_err(|e| anyhow::anyhow!("cannot create bridge log: {e}"))?;
 
     // Adapter process per language; the session protocol on top is identical.
@@ -1526,9 +1529,22 @@ mod tests {
         );
         let ident = bf.target_identity.as_ref().expect("identity carried");
         assert!(is_layered_identity(ident), "{ident}");
+        // No endpoint claim: structured check (a substring search flaps
+        // when observedAt timestamps happen to contain "5678").
         assert!(
-            !ident.to_string().contains("5678"),
+            ident["endpoint"].get("port").is_none(),
             "no endpoint claim: {ident}"
+        );
+        assert!(
+            ident["endpoint"].get("host").is_none(),
+            "no endpoint claim: {ident}"
+        );
+        assert!(
+            ident["debuggee"]
+                .get("pid")
+                .map(|p| p.is_null())
+                .unwrap_or(false),
+            "no pid claim: {ident}"
         );
         drop(sock);
         let _ = std::fs::remove_dir_all(&root);

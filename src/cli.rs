@@ -331,7 +331,7 @@ pub(crate) enum Commands {
     },
     /// Show collected logpoint lines.
     Logs {
-        /// How many trailing lines to return (max 500).
+        /// How many trailing lines to return (clamped to 500 by every bridge).
         #[arg(long, default_value_t = 50)]
         tail: usize,
     },

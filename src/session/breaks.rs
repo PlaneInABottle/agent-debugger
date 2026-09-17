@@ -716,12 +716,16 @@ mod tests {
             .unwrap();
         let before = std::fs::read(&path).unwrap();
         let _guard = acquire_breaks_lock(&dir).expect("must acquire without stale wait");
+        drop(_guard);
+        // Content is never written by the acquire above; compare after the
+        // release because Windows mandatory locking refuses reads through
+        // a second handle while the exclusive lock is held (Unix allows
+        // them). Nothing else touches the file in between either way.
         assert_eq!(
             std::fs::read(&path).unwrap(),
             before,
             "lock content is never written"
         );
-        drop(_guard);
         assert!(path.exists(), "lock file persists across release");
         // Still acquirable after release (nothing wedged, nothing deleted).
         let _guard2 = acquire_breaks_lock(&dir).unwrap();
@@ -753,6 +757,11 @@ mod tests {
             "second acquisition must report busy while held"
         );
         drop(probe);
+        drop(_holder);
+        // Read back after the release: Windows mandatory locking refuses
+        // reads through a second handle while the exclusive lock is held
+        // (Unix allows them), so the survival check runs uncontended.
+        // Nothing else writes the file in between either way.
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "sentinel",
@@ -767,7 +776,6 @@ mod tests {
                 "inode must survive contention"
             );
         }
-        drop(_holder);
         // Released: immediately acquirable again.
         let _guard2 = acquire_breaks_lock(&dir).unwrap();
         assert_no_temp_orphans(&dir);

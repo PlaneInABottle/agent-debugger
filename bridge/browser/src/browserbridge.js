@@ -91,9 +91,17 @@ const NOISE_LINES = new Set([
 
 // ---------------------------------------------------------------- args
 
+function strictInt(text) {
+  const t = String(text).trim();
+  if (!/^-?\d+$/.test(t)) return null;
+  const n = Number(t);
+  if (!Number.isSafeInteger(n)) return null;
+  return n;
+}
+
 function needInt(flag, raw) {
-  const n = parseInt(raw, 10);
-  if (Number.isNaN(n)) throw new Usage(`${flag} needs a number (got '${raw}')`);
+  const n = strictInt(raw);
+  if (n === null) throw new Usage(`${flag} needs a number (got '${raw}')`);
   return n;
 }
 
@@ -119,8 +127,8 @@ function parseBreak(spec, cfg) {
   }
   const colon = head.lastIndexOf(':');
   if (colon <= 0) throw new Usage('--break must look like frag:line, exc');
-  const lineno = parseInt(head.slice(colon + 1), 10);
-  if (Number.isNaN(lineno)) throw new Usage(`bad line in --break: ${spec}`);
+  const lineno = strictInt(head.slice(colon + 1));
+  if (lineno === null || lineno < 1) throw new Usage(`bad line in --break: ${spec}`);
   const frag = normFrag(head.slice(0, colon));
   if (!frag) throw new Usage(`--break must look like frag:line, exc (got '${spec}')`);
   cfg.breaks.push({ frag, line: lineno, cond });
@@ -130,14 +138,16 @@ function parseLogpoint(spec, cfg) {
   const first = spec.indexOf(':');
   const second = first >= 0 ? spec.indexOf(':', first + 1) : -1;
   if (first <= 0 || second <= 0) throw new Usage('--logpoint must look like frag:line:template');
-  const lineno = parseInt(spec.slice(first + 1, second), 10);
-  if (Number.isNaN(lineno)) throw new Usage(`bad line in --logpoint: ${spec}`);
+  const lineno = strictInt(spec.slice(first + 1, second));
+  if (lineno === null || lineno < 1) throw new Usage(`bad line in --logpoint: ${spec}`);
+  const template = spec.slice(second + 1);
+  if (!template) throw new Usage(`--logpoint template is empty: ${spec}`);
   const lfrag = normFrag(spec.slice(0, first));
   if (!lfrag) throw new Usage(`--logpoint must look like frag:line:template (got '${spec}')`);
   cfg.logpoints.push({
     frag: lfrag,
     line: lineno,
-    template: spec.slice(second + 1),
+    template,
   });
 }
 
@@ -2435,16 +2445,32 @@ class Session {
     // the next stop. Interaction-path code still needs a human click or
     // agent-browser.
     this.requireLive();
+    const saved = this.paused;
+    const savedLocals = this.cachedLocals;
     this.paused = null;
     this.cachedLocals = [];
-    await this.cdp.request('Page.reload', {});
+    try {
+      await this.cdp.request('Page.reload', {});
+    } catch (e) {
+      // Synchronous request failure: restore the park unless a fresh pause
+      // already won the race (same discipline as continue/step).
+      if (!this.paused) {
+        this.paused = saved;
+        this.cachedLocals = savedLocals;
+        this.publishState(!!saved);
+      }
+      throw e;
+    }
+    // Publish running on every path: a prior stopped:true must not linger
+    // on disk while the tab reloads (previously the no-break path skipped
+    // this and the session file lied about a live stop).
+    this.publishState(false);
     // Nothing that can stop: a bare reload is just a refresh — return
     // fast instead of burning the timeout waiting for a stop that cannot
     // come. Logpoints don't count (they auto-resume and never park).
     if (this.cfg.breaks.length === 0 && !this.cfg.wantExc) {
       return { ok: true, reloaded: true };
     }
-    this.publishState(false);
     return this.resumeAndWait(timeout);
   }
 
@@ -2667,8 +2693,8 @@ class Session {
     }
     const colon = head.lastIndexOf(':');
     if (colon <= 0) throw new BridgeErr(`bad break spec: ${JSON.stringify(raw)}`);
-    const lineno = parseInt(head.slice(colon + 1), 10);
-    if (Number.isNaN(lineno) || lineno < 1) {
+    const lineno = strictInt(head.slice(colon + 1));
+    if (lineno === null || lineno < 1) {
       throw new BridgeErr(`bad break spec: ${JSON.stringify(raw)}`);
     }
     const frag = normFrag(head.slice(0, colon));

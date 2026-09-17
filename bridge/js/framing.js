@@ -68,10 +68,14 @@ function readFrame(conn, timeoutMs = 5000) {
   });
 }
 
-function writeFrame(conn, obj) {
+function writeFrame(conn, obj, timeoutMs = 10000) {
   // Never throws synchronously: writing to a dead socket raises sync
   // (writeAfterFIN) instead of calling back with err. A connect+drop health
   // check (e.g. our own `status` probe) used to kill the whole daemon here.
+  // Bounded: a peer that stops reading a large body must not pin a handler
+  // slot forever (the slot releases only in the caller's `finally`). On
+  // timeout the connection is destroyed so the caller observes a normal
+  // write failure instead of hanging.
   return new Promise((resolve, reject) => {
     let msg;
     try {
@@ -81,10 +85,25 @@ function writeFrame(conn, obj) {
       reject(e);
       return;
     }
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      try {
+        conn.destroy();
+      } catch (_) { /* already gone */ }
+      reject(new BridgeErr('frame write timed out'));
+    }, timeoutMs);
+    const settle = (fn) => (arg) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      fn(arg);
+    };
     try {
-      conn.write(msg, (err) => (err ? reject(err) : resolve()));
+      conn.write(msg, (err) => (err ? settle(reject)(err) : settle(resolve)()));
     } catch (e) {
-      reject(e);
+      settle(reject)(e);
     }
   });
 }

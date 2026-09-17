@@ -52,6 +52,12 @@ class BridgeSession {
         BridgeProto.writeFile(dir.resolve("owner.json"),
                 "{\"pid\":" + ProcessHandle.current().pid()
                 + ",\"nonce\":" + JdiBridge.quote(st.ownerNonce) + "}");
+        if (!amOwner(st)) {
+            // A silent owner-write failure would surface later as a
+            // baffling instant self-reap (Node/Browser/Python verify the
+            // same claim explicitly) — fail fast instead.
+            throw new BridgeException("session owner claim not visible; refusing to start");
+        }
         // Setup-failure phase for error.json derives from the exception
         // type (UsageException/ConfigBridgeException read as config; a
         // vanished target stays transport; unexpected crashes report
@@ -1046,7 +1052,7 @@ class BridgeSession {
         } finally {
             try { sock.close(); } catch (Exception ignored) {}
             synchronized (st.sessionLock) {
-                st.activeHandlers--;
+                if (st.activeHandlers > 0) st.activeHandlers--;
             }
         }
     }
@@ -2363,6 +2369,10 @@ class BridgeSession {
             removed.append(",\"state\":").append(JdiBridge.quote(loaded ? "verified" : "pending"));
             removed.append(",\"hits\":").append(hitsOf(st, "break|" + p.cls + "|" + p.line));
             removed.append('}');
+            // The echo above is recorded: drop the counter so repeated
+            // add/remove cycles of distinct lines cannot grow hitCounts
+            // for the life of the daemon (a re-added line restarts at 0).
+            st.hitCounts.remove("break|" + p.cls + "|" + p.line);
             okCount++;
         }
         if (okCount == 0) {

@@ -17,10 +17,15 @@ pub(crate) fn startup_lock_path(sessions_root: &std::path::Path, name: &str) -> 
 /// A lock is stale only when its mtime is provably older than the bound.
 /// Unreadable clocks fail closed (treat as live) — a retry costs one wait,
 /// a wrongful steal costs a live startup its dir.
-pub(crate) const STARTUP_LOCK_STALE: Duration = Duration::from_secs(120);
+///
+/// Bound coupling: this MUST exceed `PROVISION_LOCK_WAIT` (200s in
+/// `src/bridge.rs`) with margin. The startup guard is held across first-use
+/// adapter provisioning, so a shorter bound lets a concurrent retry or
+/// `close` judge a live starter stale and delete its in-progress dir.
+pub(crate) const STARTUP_LOCK_STALE: Duration = Duration::from_secs(300);
 
 /// Stale verdict over an already-read mtime: true only when provably at
-/// least `STARTUP_LOCK_STALE` old. Single source for the 120s policy —
+/// least `STARTUP_LOCK_STALE` old. Single source for the 300s policy —
 /// the acquire path and the close gate both judge snapshotted timestamps
 /// through here, so a vanished lock reads as reclaimable (not live) while
 /// undatable/future ones fail closed.
@@ -189,10 +194,20 @@ pub(crate) fn endpoint_lock_path(
     norm_host: &str,
     port: u16,
 ) -> PathBuf {
-    let safe: String = norm_host
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
+    // Injective escaping over [0-9A-Za-z_]: '_' -> '__', every other
+    // non-alphanumeric byte -> '_hh' (lowercase hex). Without this, "my-host"
+    // and "my.host" collide on the same lock file and unrelated endpoints
+    // over-block each other with a spurious endpoint-already-attached.
+    let mut safe = String::with_capacity(norm_host.len());
+    for b in norm_host.bytes() {
+        if b.is_ascii_alphanumeric() {
+            safe.push(b as char);
+        } else if b == b'_' {
+            safe.push_str("__");
+        } else {
+            safe.push_str(&format!("_{b:02x}"));
+        }
+    }
     locks_dir.join(format!("{lang}-{safe}-{port}.lock"))
 }
 
@@ -259,7 +274,8 @@ pub(crate) enum Liveness {
 }
 
 /// Best-effort holder liveness. Linux reads /proc directly (no
-/// subprocess); elsewhere a bounded `ps` probe answers.
+/// subprocess); Windows uses the native `tasklist` (MSYS `ps` cannot see
+/// native PIDs); elsewhere a bounded `ps` probe answers.
 #[cfg(target_os = "linux")]
 pub(crate) fn holder_alive(pid: u32) -> Liveness {
     let p = std::path::PathBuf::from(format!("/proc/{pid}"));
@@ -276,11 +292,12 @@ pub(crate) fn holder_alive(pid: u32) -> Liveness {
     ps_has_pid(pid)
 }
 
-/// Dedicated bounded `ps` status probe (non-Linux only): the exit status —
-/// not mere output presence — is the signal. `ps -p <dead>` exits nonzero
-/// (dead); spawn failure or timeout means the probe itself failed
-/// (unknown), never "dead". No shell, fixed argv, 5s hard bound.
-#[cfg(not(target_os = "linux"))]
+/// Dedicated bounded `ps` status probe (macOS and other non-Linux,
+/// non-Windows): the exit status — not mere output presence — is the
+/// signal. `ps -p <dead>` exits nonzero (dead); spawn failure or timeout
+/// means the probe itself failed (unknown), never "dead". No shell, fixed
+/// argv, 5s hard bound.
+#[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
 pub(crate) fn ps_has_pid(pid: u32) -> Liveness {
     const PS_TIMEOUT: Duration = Duration::from_secs(5);
     let want = pid.to_string();
@@ -316,6 +333,51 @@ pub(crate) fn ps_has_pid(pid: u32) -> Liveness {
         Ok(Ok(_)) => Liveness::Dead,     // nonzero exit: no such process
         Ok(Err(_)) => Liveness::Unknown, // wait/reap failure: no verdict
         Err(_) => Liveness::Unknown,     // timeout: probe failed, not the holder
+    }
+}
+
+/// Windows-native holder probe. MSYS/Cygwin `ps` cannot see native
+/// Windows PIDs, so the `ps` probe above reads every live holder as dead
+/// (and every live endpoint lock as stealable). `tasklist` ships with the
+/// OS: fixed argv, no shell, 5s hard bound. A successful listing that
+/// names the pid reads as alive; a successful listing without it reads as
+/// dead (`INFO: No tasks ...` is the normal no-match shape, exit 0).
+/// Spawn failure, timeout, or an unexpected exit reads as unknown (fail
+/// closed — never "dead").
+#[cfg(target_os = "windows")]
+pub(crate) fn ps_has_pid(pid: u32) -> Liveness {
+    const PS_TIMEOUT: Duration = Duration::from_secs(5);
+    let want = pid.to_string();
+    let quoted = format!("\"{want}\"");
+    let child = match std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {want}"), "/FO", "CSV", "/NH"])
+        .stdin(Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return Liveness::Unknown, // tasklist missing/unforkable: no verdict
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(PS_TIMEOUT) {
+        Ok(Ok(out)) if out.status.success() => {
+            // CSV rows quote every field (`"img.exe","1234",...`); match
+            // the whole field so pid 12 never matches a `"123",` row.
+            if String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|l| l.split(',').any(|f| f.trim() == quoted))
+            {
+                Liveness::Alive
+            } else {
+                Liveness::Dead
+            }
+        }
+        Ok(_) => Liveness::Unknown, // nonzero exit / reap failure: no verdict
+        Err(_) => Liveness::Unknown, // timeout: probe failed, not the holder
     }
 }
 
@@ -716,6 +778,46 @@ mod tests {
             "replaced rival lock must survive the steal"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn startup_stale_bound_covers_provision_wait() {
+        // The startup guard is held across first-use provisioning: if the
+        // stale bound ever drops below the provision wait, a live starter
+        // in a slow pip/npm install reads as stale and a concurrent retry
+        // or close deletes its in-progress dir.
+        assert!(
+            STARTUP_LOCK_STALE > crate::bridge::PROVISION_LOCK_WAIT,
+            "STARTUP_LOCK_STALE ({STARTUP_LOCK_STALE:?}) must exceed \
+             PROVISION_LOCK_WAIT ({:?})",
+            crate::bridge::PROVISION_LOCK_WAIT,
+        );
+    }
+
+    #[test]
+    fn endpoint_lock_path_escapes_without_collision() {
+        // "my-host" vs "my.host" vs "my_host" must reserve different files;
+        // previously all three mapped to "my_host" and unrelated endpoints
+        // over-blocked each other.
+        let root = std::path::Path::new("/x/locks");
+        let a = endpoint_lock_path(root, "py", "my-host", 5678);
+        let b = endpoint_lock_path(root, "py", "my.host", 5678);
+        let c = endpoint_lock_path(root, "py", "my_host", 5678);
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+        assert_eq!(
+            a.file_name().unwrap().to_string_lossy(),
+            "py-my_2dhost-5678.lock"
+        );
+        assert_eq!(
+            b.file_name().unwrap().to_string_lossy(),
+            "py-my_2ehost-5678.lock"
+        );
+        assert_eq!(
+            c.file_name().unwrap().to_string_lossy(),
+            "py-my__host-5678.lock"
+        );
     }
 
     #[test]

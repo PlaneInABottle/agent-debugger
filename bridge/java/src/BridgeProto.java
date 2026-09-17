@@ -269,7 +269,12 @@ class BridgeProto {
                     case 'r': sb.append('\r'); break;
                     case 't': sb.append('\t'); break;
                     case 'u':
-                        sb.append((char) Integer.parseInt(s.substring(i + 1, i + 5), 16));
+                        if (i + 4 >= s.length()) throw new BridgeException("bad request json");
+                        try {
+                            sb.append((char) Integer.parseInt(s.substring(i + 1, i + 5), 16));
+                        } catch (NumberFormatException | IndexOutOfBoundsException bad) {
+                            throw new BridgeException("bad request json");
+                        }
                         i += 4;
                         break;
                     default: sb.append(e); break;

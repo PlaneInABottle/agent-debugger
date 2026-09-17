@@ -93,13 +93,22 @@ pub fn cmd_context_target(name: &str, target: Option<&str>) -> anyhow::Result<Va
 /// starter claimed the name since the gate: a fresh lock reads as an
 /// active start (retryable, dir intact), never a leftover to reap. This
 /// narrows the gate-to-delete window (which spans the bridge forward) to
-/// the instant before deletion. Published dirs always proceed.
+/// the instant before deletion. Published dirs proceed only when the caller
+/// took the published path (bridge close attempted); a caller on the
+/// unpublished path (`expect_unpublished`) bails if a `session.json`
+/// appeared since — a starter published mid-close and owns the session
+/// now, so deleting would reap a live handshake (retry takes the bridge
+/// path instead).
 pub(crate) fn remove_unpublished_dir(
     sessions_root: &std::path::Path,
     name: &str,
     dir: &std::path::Path,
+    expect_unpublished: bool,
 ) -> anyhow::Result<()> {
     if !dir.join("session.json").exists() && startup_lock_path(sessions_root, name).exists() {
+        anyhow::bail!("session '{name}' is starting; retry shortly");
+    }
+    if expect_unpublished && dir.join("session.json").exists() {
         anyhow::bail!("session '{name}' is starting; retry shortly");
     }
     // Immediate lstat-before-delete (best-effort, not a TOCTOU proof): the
@@ -235,7 +244,7 @@ pub(crate) fn close_in(sessions_root: &std::path::Path, name: &str) -> anyhow::R
     if !dir.exists() {
         anyhow::bail!("no session '{name}'");
     }
-    remove_unpublished_dir(sessions_root, name, &dir)?;
+    remove_unpublished_dir(sessions_root, name, &dir, port.is_none())?;
     Ok(json!({"closed": name, "confirmed": confirmed, "target": "main"}))
 }
 
@@ -581,7 +590,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let lock = startup_lock_path(&root, name);
         std::fs::write(&lock, "fresh-starter").unwrap();
-        let err = remove_unpublished_dir(&root, name, &dir).unwrap_err();
+        let err = remove_unpublished_dir(&root, name, &dir, true).unwrap_err();
         assert!(
             format!("{err:#}").contains("session 'demo' is starting; retry shortly"),
             "{err:#}"
@@ -589,13 +598,26 @@ mod tests {
         assert!(dir.is_dir(), "claimed dir preserved");
         assert!(lock.exists(), "fresh lock preserved");
         std::fs::remove_file(&lock).unwrap();
-        remove_unpublished_dir(&root, name, &dir).expect("lock-free proceeds");
+        remove_unpublished_dir(&root, name, &dir, true).expect("lock-free proceeds");
         assert!(!dir.exists(), "unclaimed dir removed");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("session.json"), r#"{"port":1}"#).unwrap();
         std::fs::write(&lock, "fresh-starter").unwrap();
-        remove_unpublished_dir(&root, name, &dir).expect("published proceeds");
+        remove_unpublished_dir(&root, name, &dir, false).expect("published proceeds");
         assert!(!dir.exists(), "published dir removed");
+        // Just-published dir on the unpublished path: a starter won the
+        // race mid-close — bail retryably, dir and session file intact.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("session.json"), r#"{"port":1}"#).unwrap();
+        let err = remove_unpublished_dir(&root, name, &dir, true).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("session 'demo' is starting; retry shortly"),
+            "{err:#}"
+        );
+        assert!(
+            dir.join("session.json").exists(),
+            "just-published file preserved"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -612,7 +634,7 @@ mod tests {
             fn(&std::path::Path, &str, &std::path::Path) -> anyhow::Result<()>,
         ); 2] = [
             ("remove_unpublished_dir", |root, name, dir| {
-                remove_unpublished_dir(root, name, dir)
+                remove_unpublished_dir(root, name, dir, false)
             }),
             ("remove_dir_after_foreign_probe", |_root, _name, dir| {
                 remove_dir_after_foreign_probe(dir)

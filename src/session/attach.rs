@@ -1,5 +1,5 @@
 // See `mod.rs` for the one-way dependency DAG.
-use super::identity::{is_secret_flag, port_lookup, trunc_chars};
+use super::identity::{is_secret_flag, listener_source_readable, port_lookup, trunc_chars};
 use super::paths::{check_name, is_unspecified_host, normalize_attach_host};
 use super::sidecar::{cli_markers_v2, session_lang_opt, SpawnSpec};
 use crate::dap;
@@ -56,6 +56,13 @@ pub(crate) fn attach_endpoint(spec: &SpawnSpec) -> anyhow::Result<Option<(String
 /// local source: `None` (unknown), never fabricated.
 pub(crate) fn listener_present(host: &str, port: u16) -> Option<bool> {
     if normalize_attach_host(host) != "loopback" {
+        return None;
+    }
+    // An unreadable probe source (no /proc in a container, missing lsof)
+    // is "unknown", never "not listening": collapsing it into Some(false)
+    // misdiagnoses with high confidence (see attach_diagnosis below,
+    // which reads Some(false)+Some(false) as endpoint-not-listening).
+    if !listener_source_readable() {
         return None;
     }
     Some(port_lookup(port).is_some())
@@ -425,7 +432,13 @@ pub(crate) fn display_endpoint(host: &str, port: u16) -> String {
     } else {
         host.to_string()
     };
-    format!("{h}:{port}")
+    // Bracket bare IPv6 literals so `::1:5678` never reads as host `::1`
+    // with a garbage port — `host:port` is only unambiguous for v4/names.
+    if h.contains(':') && !(h.starts_with('[') && h.ends_with(']')) {
+        format!("[{h}]:{port}")
+    } else {
+        format!("{h}:{port}")
+    }
 }
 
 /// Cap (chars) for the sanitized attach-failure `cause` (raw adapter
@@ -433,8 +446,8 @@ pub(crate) fn display_endpoint(host: &str, port: u16) -> String {
 pub const CAUSE_CAP: usize = 2048;
 
 /// Sanitize a raw bridge/adapter message for the additive `cause` field:
-/// bounded secret redaction (URL/query `token=`-style values, `Bearer`
-/// tokens, `--token` argv forms) then a hard char cap. Never fabricates:
+/// bounded secret redaction (URL/query `token=`-style values, `Bearer` /
+/// `Basic` credentials, `--token` argv forms) then a hard char cap. Never fabricates:
 /// an empty input reads as empty, and useful line/class context survives.
 pub(crate) fn sanitize_cause(raw: &str) -> String {
     let redacted = redact_cause_secrets(raw);
@@ -471,6 +484,13 @@ pub(crate) fn mask_keyed_values(s: &str) -> String {
             while j > 0 && matches!(out.as_bytes()[j - 1], b'?' | b'&' | b';' | b'#') {
                 j -= 1;
             }
+            // JSON-quoted keys (`{"password": "x"}`): skip the closing
+            // quote (and any space before the separator) so the name still
+            // classifies — otherwise the head reads empty and the secret
+            // is never masked.
+            while j > 0 && matches!(out.as_bytes()[j - 1], b'"' | b'\'' | b' ' | b'\t') {
+                j -= 1;
+            }
             let mut k = j;
             while k > 0 {
                 let b = out.as_bytes()[k - 1];
@@ -482,12 +502,22 @@ pub(crate) fn mask_keyed_values(s: &str) -> String {
             }
             let head = out[k..j].to_string();
             // Mask the value span: up to the next delimiter (whitespace,
-            // `&`, `;`, `,`, quote). `://` after a bare scheme (`http:`)
-            // is not a secret pair — its "value" starts with `//`, skip it.
+            // `&`, `;`, `,`, quote). A leading quote (`"key": "value"`) is
+            // stepped over so a quoted secret still masks (the quotes stay
+            // in place around `[redacted]`). `://` after a bare scheme
+            // (`http:`) is not a secret pair — its "value" starts with
+            // `//`, skip it.
             let mut v = i + 1;
             while v < bytes.len() && bytes[v].is_whitespace() {
                 v += 1;
             }
+            let quote = if v < bytes.len() && matches!(bytes[v], '"' | '\'') {
+                let q = bytes[v];
+                v += 1;
+                Some(q)
+            } else {
+                None
+            };
             let mut vend = v;
             while vend < bytes.len()
                 && !bytes[vend].is_whitespace()
@@ -496,10 +526,11 @@ pub(crate) fn mask_keyed_values(s: &str) -> String {
                 vend += 1;
             }
             let val: String = bytes[v..vend].iter().collect();
-            // A `Bearer <token>` value belongs to the bearer pass (which
-            // keeps the scheme and masks the token): masking the scheme word
-            // here would orphan the token into the clear.
-            if val.eq_ignore_ascii_case("bearer") {
+            // A `Bearer <token>` / `Basic <credentials>` value belongs to
+            // the scheme pass below (which keeps the scheme and masks the
+            // secret): masking the scheme word here would orphan the
+            // secret into the clear.
+            if val.eq_ignore_ascii_case("bearer") || val.eq_ignore_ascii_case("basic") {
                 out.push(c);
                 i += 1;
                 continue;
@@ -511,9 +542,13 @@ pub(crate) fn mask_keyed_values(s: &str) -> String {
             {
                 out.push(c);
                 // Preserve one skipped whitespace exactly when the input
-                // had `key: value` spacing.
-                if v > i + 1 {
+                // had `key: value` spacing, and the opening quote when the
+                // value was quoted (`"key": "[redacted]"`).
+                if bytes[i + 1..v].iter().any(|b| b.is_whitespace()) {
                     out.push(' ');
+                }
+                if let Some(q) = quote {
+                    out.push(q);
                 }
                 out.push_str("[redacted]");
                 i = vend;
@@ -529,13 +564,23 @@ pub(crate) fn mask_keyed_values(s: &str) -> String {
     out
 }
 
-/// Mask `Bearer <token>` (case-insensitive scheme): the token word becomes
-/// `[redacted]`; the scheme itself is kept.
+/// Mask `Bearer <token>` / `Basic <credentials>` (case-insensitive scheme):
+/// the secret word becomes `[redacted]`; the scheme itself is kept. Without
+/// the Basic arm, `Authorization: Basic dXNlcjpwYXNz` redacted only the
+/// scheme word and left the base64 credential in the clear.
 pub(crate) fn mask_bearer(s: &str) -> String {
+    let mut out = mask_scheme_token(s, "bearer ");
+    out = mask_scheme_token(&out, "basic ");
+    out
+}
+
+/// One scheme pass for `mask_bearer`: keep the scheme casing, mask only a
+/// non-empty token word.
+fn mask_scheme_token(s: &str, scheme: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
-    while let Some(pos) = rest.to_ascii_lowercase().find("bearer ") {
-        let token_start = pos + "bearer ".len();
+    while let Some(pos) = rest.to_ascii_lowercase().find(scheme) {
+        let token_start = pos + scheme.len();
         let mut vend = token_start;
         while vend < rest.len() {
             let b = rest.as_bytes()[vend];
@@ -746,6 +791,35 @@ mod tests {
     }
 
     #[test]
+    fn cause_redaction_covers_basic_and_quoted_keys() {
+        // `Authorization: Basic <b64>` must mask the credential (previously
+        // only the scheme word masked, orphaning the secret); JSON-quoted
+        // keys (`{"password": "x"}`) must mask the value.
+        let basic = sanitize_cause("handshake failed: Authorization: Basic dXNlcjpwYXNz");
+        assert!(basic.contains("Basic [redacted]"), "{basic}");
+        assert!(!basic.contains("dXNlcjpwYXNz"), "{basic}");
+        let bearer = sanitize_cause("denied: Bearer abc123");
+        assert!(bearer.contains("Bearer [redacted]"), "{bearer}");
+        assert!(!bearer.contains("abc123"), "{bearer}");
+        let quoted = sanitize_cause(r#"config {"password": "hunter2"} rejected"#);
+        assert!(!quoted.contains("hunter2"), "{quoted}");
+        assert!(quoted.contains("[redacted]"), "{quoted}");
+        // Non-secrets survive verbatim.
+        let plain = sanitize_cause("connection refused on localhost:5678");
+        assert!(plain.contains("localhost:5678"), "{plain}");
+    }
+
+    #[test]
+    fn display_endpoint_brackets_ipv6() {
+        assert_eq!(display_endpoint("localhost", 5678), "localhost:5678");
+        assert_eq!(display_endpoint("127.0.0.1", 1), "127.0.0.1:1");
+        // Bare IPv6 literals bracket so host:port stays unambiguous.
+        assert_eq!(display_endpoint("::1", 5678), "[::1]:5678");
+        assert_eq!(display_endpoint("2001:db8::1", 9229), "[2001:db8::1]:9229");
+        assert_eq!(display_endpoint("[::1]", 5678), "[::1]:5678");
+    }
+
+    #[test]
     fn probe_session_bridge_classifies_ports() {
         let t = Duration::from_millis(500);
         // HTTP-shaped garbage: framing validation fails outright —
@@ -786,15 +860,23 @@ mod tests {
             ),
             Probe::Ours
         );
-        // Nothing listens: definitively gone.
-        let dead = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
-        assert_eq!(
-            probe_session_bridge(dead, t),
-            Probe::NotOurs("connection refused")
-        );
+        // Nothing listens: definitively gone. The freed port can be
+        // grabbed by another parallel test's listener before our probe
+        // lands (then it reads as Unclear/Ours instead of refused), so
+        // retry with fresh dead ports — a real refused-mapping regression
+        // still fails every attempt and trips the assert below.
+        let mut refused = false;
+        for _ in 0..10 {
+            let dead = {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                l.local_addr().unwrap().port()
+            };
+            if probe_session_bridge(dead, t) == Probe::NotOurs("connection refused") {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "a genuinely closed port must probe as refused");
         // Blackhole (accepts, never answers): ambiguous, never a verdict.
         assert_eq!(
             probe_session_bridge(spawn_blackhole(), Duration::from_millis(200)),
