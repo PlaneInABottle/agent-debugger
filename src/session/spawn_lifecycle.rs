@@ -21,6 +21,20 @@ use std::process::Stdio;
 use std::time::Duration;
 use std::time::Instant;
 
+/// Validation budget for the first post-publish request in `spawn_in`.
+/// The bridge legitimately needs up to the spawn `deadline` (its own
+/// first-stop budget), so a fixed validation timeout shorter than that
+/// inverts the budgets: a slow-but-healthy bridge parks near its deadline
+/// and the CLI kills the session while validating it. Use the time left,
+/// capped so a published-then-wedged bridge cannot hang the CLI past a
+/// minute (the deadline path below still bounds the whole spawn).
+pub(crate) fn first_forward_timeout(deadline: Instant) -> Duration {
+    const VALIDATION_CAP: Duration = Duration::from_secs(60);
+    deadline
+        .saturating_duration_since(Instant::now())
+        .min(VALIDATION_CAP)
+}
+
 /// Write sidecars and spawn the bridge process. Called only from `spawn`,
 /// which removes the session dir if this fails.
 pub(crate) fn setup_bridge(
@@ -552,7 +566,7 @@ pub(crate) fn spawn_in(
             } else {
                 json!({"cmd": "threads"})
             };
-            match forward(name, &first, Duration::from_secs(15)) {
+            match forward(name, &first, first_forward_timeout(deadline)) {
                 Ok(mut data) => {
                     // Immediate start/attach response carries identity:
                     // requested from the CLI flags, layered targetIdentity
@@ -830,6 +844,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn first_forward_timeout_covers_short_deadlines_caps_long_ones() {
+        // The validation request must cover the bridge's own remaining
+        // budget (a fixed 15s expired before a --timeout 10 bridge's 20s
+        // budget on loaded runners, killing healthy sessions mid-park).
+        // Long deadlines cap at a minute so a published-then-wedged
+        // bridge cannot hang the CLI.
+        let short = Instant::now() + Duration::from_secs(20);
+        let got = first_forward_timeout(short);
+        assert!(
+            got >= Duration::from_secs(15),
+            "short budget covered: {got:?}"
+        );
+        assert!(
+            got <= Duration::from_secs(20),
+            "never past the deadline: {got:?}"
+        );
+        let long = Instant::now() + Duration::from_secs(3600);
+        assert_eq!(first_forward_timeout(long), Duration::from_secs(60));
+        let past = Instant::now() - Duration::from_secs(1);
+        assert_eq!(first_forward_timeout(past), Duration::ZERO);
     }
 
     /// One fake session dir: intent names an endpoint, session.json names a

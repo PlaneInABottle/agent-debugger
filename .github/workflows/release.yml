@@ -29,7 +29,7 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             archive_ext: tar.gz
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             archive_ext: tar.gz
           - os: macos-latest
@@ -94,6 +94,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Secret-to-env at JOB level: step-level `env:` is not in context when
+    # that same step's `if:` is evaluated, so the publish gate must read
+    # job-level env (a step `if: secrets...` is rejected as invalid).
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -141,8 +146,6 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       - name: Publish to NPM (if NPM_TOKEN is provided)
-        if: secrets.NPM_TOKEN != ''
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        if: env.NODE_AUTH_TOKEN != ''
         run: |
           npm publish --access public
