@@ -67,6 +67,44 @@ pub(crate) fn release_startup_lock(path: &std::path::Path, nonce: &str) {
     }
 }
 
+/// Transient-tolerant lock-record snapshot: Windows can fail filesystem
+/// reads/metadata/renames spuriously under concurrency (sharing
+/// violations, AV scans). Retry briefly; a vanished file reads as gone
+/// (reclaimable), a persistently unreadable one stays an error so callers
+/// keep their fail-closed behavior. Verdicts never change — every attempt
+/// re-reads fresh state, so a live lock still reads live every time.
+pub(crate) fn read_lock_bytes(path: &std::path::Path) -> std::io::Result<Option<String>> {
+    let mut last = std::io::Error::new(std::io::ErrorKind::Other, "unreadable lock record");
+    for _ in 0..3 {
+        match std::fs::read_to_string(path) {
+            Ok(r) => return Ok(Some(r)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                last = e;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    Err(last)
+}
+
+/// mtime twin of [`read_lock_bytes`]: `Ok(None)` vanished, `Err`
+/// persistently undatable (callers fail closed), same retry policy.
+pub(crate) fn lock_mtime(path: &std::path::Path) -> std::io::Result<Option<std::time::SystemTime>> {
+    let mut last = std::io::Error::new(std::io::ErrorKind::Other, "undatable lock record");
+    for _ in 0..3 {
+        match std::fs::metadata(path).and_then(|m| m.modified()) {
+            Ok(t) => return Ok(Some(t)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                last = e;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    Err(last)
+}
+
 /// Atomically claim the startup lock (single steal retry for a stale lock).
 /// Live locks (fresh or undatable) bail with a retryable "starting" error.
 pub(crate) fn acquire_startup_lock(path: &std::path::Path) -> anyhow::Result<StartupGuard> {
@@ -91,9 +129,9 @@ pub(crate) fn acquire_startup_lock(path: &std::path::Path) -> anyhow::Result<Sta
     // Snapshot the exact bytes with the mtime: a lock reclaimed under us
     // reads as gone (path free — one atomic claim attempt decides), an
     // undatable one as live (fail closed).
-    let raw = match std::fs::read_to_string(path) {
-        Ok(r) => r,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+    let raw = match read_lock_bytes(path) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
             return claim_stale_startup_lock(path);
         }
         Err(_) => {
@@ -103,9 +141,9 @@ pub(crate) fn acquire_startup_lock(path: &std::path::Path) -> anyhow::Result<Sta
             )
         }
     };
-    let mtime = match std::fs::metadata(path).and_then(|m| m.modified()) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+    let mtime = match lock_mtime(path) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
             return claim_stale_startup_lock(path);
         }
         Err(_) => {
@@ -413,14 +451,16 @@ pub(crate) fn lock_snapshot_is_stale(raw: &str, mtime: std::time::SystemTime) ->
 /// NotFound and proceed); the subsequent atomic `create_new` claim still
 /// admits exactly one holder. Returns true when no stale record remains.
 pub(crate) fn reclaim_stale_lock(path: &std::path::Path) -> bool {
-    // Snapshot record + metadata together.
-    let raw = match std::fs::read_to_string(path) {
-        Ok(r) => r,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+    // Snapshot record + metadata together (transient-tolerant; a
+    // persistently unreadable record fails closed below).
+    let raw = match read_lock_bytes(path) {
+        Ok(Some(r)) => r,
+        Ok(None) => return true,
         Err(_) => return false,
     };
-    let mtime = match std::fs::metadata(path).and_then(|m| m.modified()) {
-        Ok(t) => t,
+    let mtime = match lock_mtime(path) {
+        Ok(Some(t)) => t,
+        Ok(None) => return true,
         Err(_) => return false,
     };
     if !lock_snapshot_is_stale(&raw, mtime) {
@@ -432,21 +472,33 @@ pub(crate) fn reclaim_stale_lock(path: &std::path::Path) -> bool {
 /// Detach-and-verify (test seam for interleavings): re-read the exact
 /// bytes, atomically quarantine, and drop only a still-stale match.
 /// Returns false (hands off, fresh record intact) on any deviation.
+/// Transient read faults retry via [`read_lock_bytes`]; a replaced record
+/// still mismatches on every attempt (no touch), a vanished one proceeds.
 pub(crate) fn quarantine_verified(path: &std::path::Path, expected: &str) -> bool {
-    let raw2 = match std::fs::read_to_string(path) {
-        Ok(r) => r,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+    let raw2 = match read_lock_bytes(path) {
+        Ok(Some(r)) => r,
+        Ok(None) => return true,
         Err(_) => return false,
     };
     if raw2 != expected {
         return false; // replaced under us: fresh claim or fellow reclaim
     }
-    let q = match detach_to_quarantine(path) {
-        Ok(q) => q,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
-        Err(_) => return false,
-    };
-    reconcile_quarantine(path, &q, expected)
+    // Detach itself can hit a transient fault under concurrency (a rival
+    // holds the file open for a microsecond read): retry the whole
+    // verify afresh instead of failing a stale verdict on one fault.
+    for _ in 0..3 {
+        match detach_to_quarantine(path) {
+            Ok(q) => return reconcile_quarantine(path, &q, expected),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) => std::thread::sleep(Duration::from_millis(10)),
+        }
+        match read_lock_bytes(path) {
+            Ok(Some(r)) if r == expected => {}
+            Ok(None) => return true,
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Atomically detach the lock file into a unique quarantine sibling (same

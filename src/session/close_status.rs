@@ -33,17 +33,18 @@ pub(crate) fn startup_close_gate(
         return Ok(());
     }
     let lock = startup_lock_path(sessions_root, name);
-    let raw = match std::fs::read_to_string(&lock) {
-        Ok(r) => r,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+    let raw = match super::locks::read_lock_bytes(&lock) {
+        Ok(Some(r)) => r,
+        // Vanished under us: nothing live left to protect — proceed.
+        Ok(None) => return Ok(()),
         Err(_) => anyhow::bail!("session '{name}' is starting; retry shortly"),
     };
     // Snapshot the mtime with the bytes: a lock reclaimed under us reads
     // as gone (nothing live left to protect — proceed), an undatable one
     // as live (fail closed).
-    let mtime = match std::fs::metadata(&lock).and_then(|m| m.modified()) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+    let mtime = match super::locks::lock_mtime(&lock) {
+        Ok(Some(t)) => t,
+        Ok(None) => return Ok(()),
         Err(_) => anyhow::bail!("session '{name}' is starting; retry shortly"),
     };
     let stale = stale_startup_mtime(mtime);
