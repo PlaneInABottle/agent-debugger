@@ -790,6 +790,29 @@ mod tests {
         dap::encode_message(body)
     }
 
+    /// A port that was free an instant ago. Fixed low candidates are bound
+    /// to prove nothing listens there, then released for the probe: they
+    /// sit below the ephemeral range, so the parallel-test allocator
+    /// (which hands the next binder the most recently freed :0 port) can
+    /// essentially never grab one in the microsecond gap. A freed
+    /// ephemeral :0 port, by contrast, is near-certainly re-bound before
+    /// the probe lands on a loaded runner — and then probes Unclear/Ours
+    /// instead of refused. (Binding <1024 fails unprivileged on Unix, so
+    /// there this degrades to the old ephemeral behavior, which is
+    /// reliable enough on those runners.)
+    fn fresh_dead_port() -> u16 {
+        for cand in [9u16, 7, 13, 19, 37, 49] {
+            if std::net::TcpListener::bind(("127.0.0.1", cand)).is_ok() {
+                return cand;
+            }
+        }
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
     #[test]
     fn cause_redaction_covers_basic_and_quoted_keys() {
         // `Authorization: Basic <b64>` must mask the credential (previously
@@ -860,23 +883,27 @@ mod tests {
             ),
             Probe::Ours
         );
-        // Nothing listens: definitively gone. The freed port can be
-        // grabbed by another parallel test's listener before our probe
-        // lands (then it reads as Unclear/Ours instead of refused), so
+        // Nothing listens: definitively gone. Even a proven-free port can
+        // be grabbed in the microsecond gap before the probe lands, so
         // retry with fresh dead ports — a real refused-mapping regression
-        // still fails every attempt and trips the assert below.
+        // still fails every attempt and trips the assert below (which
+        // logs every verdict seen, so a repeat failure diagnoses itself
+        // as mapping-vs-grab).
+        let mut seen = Vec::new();
         let mut refused = false;
         for _ in 0..10 {
-            let dead = {
-                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                l.local_addr().unwrap().port()
-            };
-            if probe_session_bridge(dead, t) == Probe::NotOurs("connection refused") {
+            let dead = fresh_dead_port();
+            let verdict = probe_session_bridge(dead, t);
+            if verdict == Probe::NotOurs("connection refused") {
                 refused = true;
                 break;
             }
+            seen.push(format!("{dead}:{verdict:?}"));
         }
-        assert!(refused, "a genuinely closed port must probe as refused");
+        assert!(
+            refused,
+            "a genuinely closed port must probe as refused; saw {seen:?}"
+        );
         // Blackhole (accepts, never answers): ambiguous, never a verdict.
         assert_eq!(
             probe_session_bridge(spawn_blackhole(), Duration::from_millis(200)),

@@ -1503,7 +1503,9 @@ class LiveTests(LiveHomeMixin, unittest.TestCase):
         # spawned process, so verify it is the debugpy listener itself.
         self.assertTrue(any("debugpy" in a for a in endpoint["argv"]))
         self.assertTrue(any(str(port) in a for a in endpoint["argv"]))
-        self.assertEqual(endpoint["source"], "os-lsof-ps")
+        # Listener-probe source is per-OS (lsof on macOS, /proc on Linux).
+        self.assertEqual(
+            endpoint["source"], "os-lsof-ps" if sys.platform == "darwin" else "os-proc")
         self.assertEqual(endpoint["unavailable"], [])
         listener = subprocess.run(["ps", "-p", str(endpoint["ownerPid"]), "-o", "args="],
                                   capture_output=True, text=True, timeout=10)

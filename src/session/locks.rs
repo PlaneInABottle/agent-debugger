@@ -473,7 +473,20 @@ pub(crate) fn reconcile_quarantine(
     q: &std::path::Path,
     expected: &str,
 ) -> bool {
-    let qb = std::fs::read_to_string(q).unwrap_or_default();
+    let qb = match std::fs::read_to_string(q) {
+        Ok(b) => b,
+        // Transient read failure (Windows AV/indexer momentarily locking
+        // a just-moved file): q is our own uniquely-named temp holding
+        // bytes verified stale an instant before the atomic rename moved
+        // exactly those bytes here — dropping it completes the reclaim.
+        // The old `unwrap_or_default` instead fed "" into the mismatch
+        // branch below, planting an empty record at `path` and cascading
+        // mismatch failures to every sibling racer.
+        Err(_) => {
+            let _ = std::fs::remove_file(q);
+            return true;
+        }
+    };
     if qb == expected {
         let _ = std::fs::remove_file(q);
         return true;
@@ -954,6 +967,26 @@ mod tests {
         backdate(&path, ENDPOINT_LOCK_STALE + Duration::from_secs(5));
         assert!(reclaim_stale_lock(&path));
         assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn reconcile_unreadable_quarantine_drops_without_planting() {
+        // A quarantine temp whose bytes cannot be read (here a directory
+        // stands in for a transiently locked file, as Windows AV/indexer
+        // locks cause) must still complete the reclaim: q is our own
+        // uniquely-named temp holding verified-stale bytes, so dropping it
+        // is correct. The old empty-string fallback instead planted an
+        // empty record at the lock path, cascading mismatch failures to
+        // every sibling racer.
+        let base = tmpdir("endpoint-quarantine-unreadable");
+        let locks = base.join("locks");
+        std::fs::create_dir_all(&locks).unwrap();
+        let path = locks.join("ep.lock");
+        let q = locks.join(".q-unreadable.tmp");
+        std::fs::create_dir(&q).unwrap();
+        assert!(reconcile_quarantine(&path, &q, "stale-bytes"));
+        assert!(!path.exists(), "no empty record may be planted");
         let _ = std::fs::remove_dir_all(&base);
     }
 
