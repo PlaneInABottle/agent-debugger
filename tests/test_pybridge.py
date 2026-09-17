@@ -70,6 +70,63 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(len(seen), 101)
         self.assertEqual(left.gettimeout(), old_timeout)
 
+    def test_idle_pump_framing_error_never_marks_exited(self):
+        # A malformed adapter frame on the select path is not target death:
+        # idle_pump must warn and stop, leaving exited False (the next
+        # command's pump surfaces the error). Pre-fix this set exited=True
+        # with a fabricated session exit.
+        st = self.session()
+        st.exited = False
+        st.dap = object()
+        st.publish_state = Mock()
+        left, right = socket.socketpair()
+        self.addCleanup(left.close)
+        self.addCleanup(right.close)
+        right.send(b"x")
+        fake = SimpleNamespace(
+            _read_msg=Mock(side_effect=bridge.BridgeErr("DAP header too large")))
+        st._conn_entries = Mock(return_value=[("t1", fake, left)])
+        st._pop_stash = Mock(return_value=None)
+        st._try_read = Mock(return_value=None)
+        bridge.idle_pump(st)
+        self.assertFalse(st.exited)
+        st.publish_state.assert_not_called()
+
+    def test_cmd_logs_bad_tail_defaults_instead_of_internal(self):
+        # Node/Browser/Java parity: a non-numeric tail degrades to 50,
+        # never an internal error.
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self.session()
+            st.cfg.dir = tmp
+            st.exited = True  # skip the pending-drain pump
+            st.append_log("hello")
+            for bad in ["xx", None, ""]:
+                resp = st.cmd_logs({"tail": bad})
+                self.assertTrue(resp["ok"])
+                self.assertEqual(resp["lines"], ["hello"])
+            self.assertEqual(st.cmd_logs({})["lines"], ["hello"])
+
+    def test_setup_usage_exits_2(self):
+        # Java/Node parity: CLI-arg failures exit 2 (Usage), never 1.
+        import subprocess
+        import sys
+        r = subprocess.run(
+            [sys.executable, str(ROOT / "bridge/py/src/pybridge.py"), "bogus"],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("usage", r.stdout + r.stderr)
+
+    def test_parse_logpoint_rejects_empty_template(self):        # Java parity: an empty template is a config error, never a
+        # silently-armed empty logpoint.
+        with tempfile.TemporaryDirectory() as tmp:
+            f = os.path.join(tmp, "a.py")
+            Path(f).write_text("x = 1\n" * 5)
+            cfg = bridge.Config()
+            with self.assertRaises(bridge.Usage):
+                bridge.parse_logpoint(f + ":2:", cfg)
+            bridge.parse_logpoint(f + ":2:hit {x}", cfg)
+            self.assertEqual(cfg.logpoints[0][2], "hit {x}")
+
     def test_malformed_event_body_is_contained(self):
         st = self.session()
         for body in [None, "text", [], 3]:

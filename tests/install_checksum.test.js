@@ -98,3 +98,12 @@ describe('postinstall checksum', () => {
     assert.equal(out, '');
   });
 });
+
+describe('postinstall error classification', () => {
+  it('checksum mismatch is fatal, fetch failures are transient', () => {
+    assert.equal(postinstall.isChecksumMismatch(new Error('Checksum mismatch for x (download may be corrupt)')), true);
+    assert.equal(postinstall.isChecksumMismatch(new Error('HTTP 404: Not Found')), false);
+    assert.equal(postinstall.isChecksumMismatch(new Error('getaddrinfo ENOTFOUND github.com')), false);
+    assert.equal(postinstall.isChecksumMismatch(null), false);
+  });
+});

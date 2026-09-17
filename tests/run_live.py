@@ -24,6 +24,11 @@ LIVE_MODULES = ("test_live", "test_m5_live", "test_ux_live")
 
 
 def main():
+    unknown = _live_home.unknown_test_langs()
+    if unknown:
+        print(f"live FAILED: unknown TEST_LANG entries: {', '.join(unknown)} "
+              f"(want py,node,java,browser)", flush=True)
+        return 2
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     for mod in LIVE_MODULES:

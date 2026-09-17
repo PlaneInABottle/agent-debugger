@@ -91,8 +91,23 @@ def _wanted(method_name):
     return not any(t in lname for toks in LANG_TOKENS.values() for t in toks)
 
 
+def unknown_test_langs():
+    """TEST_LANG entries outside py|node|java|browser. Typos fail fast
+    instead of silently running the full scope (an empty filtered set
+    reinterprets as "default full" below)."""
+    wanted = {l.strip().lower()
+              for l in os.environ.get("TEST_LANG", "").split(",")
+              if l.strip()}
+    return sorted(wanted - set(LANG_TOKENS))
+
+
 def load_tests(loader, tests, ignore):
     """unittest hook: honor TEST_LANG / SKIP_BROWSER without a runner."""
+    unknown = unknown_test_langs()
+    if unknown:
+        raise ValueError(
+            f"unknown TEST_LANG entries: {', '.join(unknown)} "
+            f"(want py,node,java,browser)")
     suite = unittest.TestSuite()
 
     def walk(t):

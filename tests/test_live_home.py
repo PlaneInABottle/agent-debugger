@@ -187,6 +187,17 @@ class LiveNonzeroPolicyTests(unittest.TestCase):
             self.assertEqual(_live_home.selected_live_langs(),
                              ("java", "node"))
 
+    def test_unknown_test_langs_fail_fast(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TEST_LANG", None)
+            self.assertEqual(_live_home.unknown_test_langs(), [])
+        with mock.patch.dict(os.environ, {"TEST_LANG": "py,pyhton, java,xx"}):
+            self.assertEqual(_live_home.unknown_test_langs(), ["pyhton", "xx"])
+        with mock.patch.dict(os.environ, {"TEST_LANG": "pyhton"}):
+            with self.assertRaises(ValueError):
+                _live_home.load_tests(unittest.TestLoader(),
+                                      unittest.TestSuite(), None)
+
     def test_lang_of_test_id(self):
         self.assertEqual(
             _live_home.lang_of_test_id(_tid(meth="test_32_py_wait")), "py")
