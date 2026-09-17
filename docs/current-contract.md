@@ -154,5 +154,9 @@ smoke runs only after review, never mid-implementation.
   `.github/workflows/release.yml`), and both installers verify against
   the per-archive sidecar (`install.sh: verify_checksum`,
   `scripts/postinstall.js: verifyChecksum`): mismatch aborts the
-  install, a missing sidecar (old release) warns and continues, and an
-  unparseable sidecar skips. No artifact URL changed, no new publication.
+  install, a missing/unfetchable sidecar (old release, offline) warns and
+  continues. An unparseable sidecar skips verification in postinstall;
+  `install.sh` fails closed on it (sha256 tool rejects the file). A
+  corrupt/tampered archive in postinstall is fatal
+  (`isChecksumMismatch`), never a warning. No artifact URL changed, no
+  new publication.

@@ -82,6 +82,22 @@ jobs:
           distribution: temurin
           java-version: "21"
 
+      - name: Warm adapter dependencies (py venv/debugpy, node ws)
+        # Live suites copy these real-HOME deps into isolated HOMEs and
+        # skip without them (`existing dependency required`), so a clean
+        # runner must provision first: one parked start per adapter (the
+        # first run installs over the network), then close. The final
+        # test fails the step loudly instead of an all-skipped live run.
+        shell: bash
+        run: |
+          cargo build
+          ./target/debug/agent-debugger --session ci-warm-py py start examples/py-demo/app.py --break 'examples/py-demo/app.py:26' --timeout 60
+          ./target/debug/agent-debugger --session ci-warm-py close
+          ./target/debug/agent-debugger --session ci-warm-node node start examples/node-demo/calc.js --break 'examples/node-demo/calc.js:2' --timeout 60
+          ./target/debug/agent-debugger --session ci-warm-node close
+          test -d ~/.agent-debugger/adapters/python/venv || { echo "python venv not provisioned"; exit 1; }
+          test -d ~/.agent-debugger/adapters/node/node_modules || { echo "node ws not provisioned"; exit 1; }
+
       - name: Canonical live gates
         shell: bash
         run: scripts/run_gates.sh --live

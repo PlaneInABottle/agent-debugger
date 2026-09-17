@@ -45,8 +45,9 @@ Early access. First packaged release.
 
 ### Known limitations
 
-- Live integration suites run locally (`scripts/run_gates.sh --live`);
-  CI runs `--unit` only.
+- Live integration suites run locally (`scripts/run_gates.sh --live`) and
+  on ubuntu CI (the `live` job warms adapter deps, then runs `--live`);
+  the fast CI matrix runs `--unit` only.
 - Exception stops are uncaught-only; `justMyCode` always on; Node
   `refs()` unsupported. See `docs/feature-roadmap.md`.
 - New project: expect edge cases across OS / runtime / package-manager

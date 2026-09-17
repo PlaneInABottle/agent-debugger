@@ -1,5 +1,15 @@
 # Project Hardening - Implementation Plan
 
+> **Status: HISTORICAL (superseded).** M1/M2/M3 are implemented; the live
+> contract is `docs/current-contract.md` and the contributor map is
+> `docs/architecture-map.md`. "Current fact" lines below describe the
+> pre-hardening tree and are stale by design — notably the installer
+> checksum note (now implemented: `install.sh: verify_checksum`,
+> `scripts/postinstall.js: verifyChecksum` against the published
+> `.sha256` sidecars, see `docs/current-contract.md` "Deferred
+> limitations") and the HOME fallback note (now fail-closed via
+> `agent_home()`). Do not implement from this file.
+
 ## Problem and Success Criteria
 - Broad review requests actual fixes toward stable, maintainable, scalable real use; breaking changes allowed if valuable. No commits authorized.
 - Success: safety-critical local defects fixed with deterministic regressions, no silent state loss, honest readiness/exit codes, synchronized provisioning, strict framing parity, and CI that actually runs the canonical gates.

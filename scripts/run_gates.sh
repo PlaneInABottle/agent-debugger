@@ -43,6 +43,10 @@ cd "$ROOT"
 mode="full"
 if [ "${1:-}" = "--unit" ]; then mode="unit"; fi
 if [ "${1:-}" = "--live" ]; then mode="live"; fi
+if [ "$#" -gt 1 ]; then
+  echo "usage: scripts/run_gates.sh [--unit|--live]" >&2
+  exit 2
+fi
 if [ "${1:-}" != "" ] && [ "$mode" = "full" ]; then
   echo "usage: scripts/run_gates.sh [--unit|--live]" >&2
   exit 2
@@ -78,7 +82,10 @@ run_unit() {
   # Deterministic sorted list: every tests/test_*.py is a unit gate
   # EXCEPT the three daemon-backed live suites (run by run_live) and any
   # helper module. New unit files are picked up with no runner edit.
-  for t in $(printf '%s\n' tests/test_*.py | LC_ALL=C sort); do
+  # Direct glob (never $(...) word-splitting: whitespace in a future
+  # filename must not split, and a no-match glob must not run literally).
+  for t in tests/test_*.py; do
+    [ -e "$t" ] || continue
     case "$t" in
       tests/test_live.py|tests/test_m5_live.py|tests/test_ux_live.py)
         continue;;
@@ -118,20 +125,27 @@ run_unit() {
   section "javac bridge + checks"
   JTMP=$(mktemp -d)
   trap 'rm -rf "$JTMP"' EXIT
+  # Windows java.exe takes `;` separators (a `:` list is one bad path);
+  # Git Bash would also mangle a literal `:` list for native binaries.
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) CP_SEP=";" ;;
+    *) CP_SEP=":" ;;
+  esac
   javac -d "$JTMP/classes" bridge/java/src/*.java || fail "javac bridge"
   javac -cp "$JTMP/classes" -d "$JTMP/checks" \
     tests/BJavaCheck.java tests/CJavaCheck.java \
     tests/M4JavaCheck.java tests/M5JavaCheck.java \
     tests/M6JavaCheck.java tests/M7JavaCheck.java \
-    tests/SaturationJavaCheck.java tests/FramingJavaCheck.java || fail "javac checks"
+    tests/SaturationJavaCheck.java tests/FramingJavaCheck.java \
+    tests/StrictJavaCheck.java || fail "javac checks"
   passed "javac"
 
-  section "java checks (execute B/C/M4-M7 + saturation + framing)"
+  section "java checks (execute B/C/M4-M7 + saturation + framing + strict)"
   # Compiled checks are fail-fast by construction (each prints its own
   # ok-lines and System.exit(1) on any failure), so the gate just runs
   # every check class against the freshly compiled bridge above.
-  for c in BJavaCheck CJavaCheck M4JavaCheck M5JavaCheck M6JavaCheck M7JavaCheck SaturationJavaCheck FramingJavaCheck; do
-    java -cp "$JTMP/classes:$JTMP/checks" "$c" || fail "java $c"
+  for c in BJavaCheck CJavaCheck M4JavaCheck M5JavaCheck M6JavaCheck M7JavaCheck SaturationJavaCheck FramingJavaCheck StrictJavaCheck; do
+    java -cp "$JTMP/classes${CP_SEP}$JTMP/checks" "$c" || fail "java $c"
   done
   rm -rf "$JTMP"
   trap - EXIT

@@ -371,16 +371,16 @@ untouched. Zero protocol/sidecar/schema delta; Python/Rust/Node untouched.
 | Framing/bounds | `src/dap.rs` tests (8192/header/64 MiB) | `tests/framing.test.js` | — |
 | Setup/error phases | `error.json` phase tests (`transport`/`config`/`runtime`, corrupt message) | `tests/setup_phase.test.js`, `tests/test_pybridge.py` | `tests/test_error_attribution.py` |
 | Target identity (no `observedTarget`) | `owner_*`, `session_entry` asserts (`observedTarget` absent, flat never promoted) | `tests/target_identity.test.js` | `tests/test_live.py` identity cases |
-| Breaks add/remove/clear | `confirmed_*` persistence tests, `breaks_lock_*` | `tests/breaks_add.test.js`, `tests/breaks_remove.test.js`, `tests/m3_fixes.test.js`, `tests/m4_fixes.test.js` | `tests/test_live.py` live add/remove |
+| Breaks add/remove/clear | `confirmed_*` persistence tests, `breaks_lock_*` | `tests/breaks_add.test.js`, `tests/breaks_remove.test.js`, `tests/m3_fixes.test.js`, `tests/m4_fixes.test.js`, `tests/strict_break_lines.test.js` (strict line/int parity) | `tests/test_live.py` live add/remove |
 | Concurrency/serve | lock/quarantine unit tests (`reclaim_*`, `detach_*`, endpoint claim) | `tests/breaks_concurrency_matrix.test.js`, `tests/m5_concurrency.test.js`, `tests/test_pybridge.py` (+12 M5), `tests/test_pybridge_owners.py` (M3 narrow-owner tests: registry lifecycle/swap incl. missing-child exit, server pool/close) + `scripts/check_pybridge_owners.sh` incl. `--self-test` (M3 routing: no view/serving/server writes outside owners) | `tests/test_breaks_concurrency_matrix.py`, `tests/test_m5_live.py` (6 scenarios) |
 | Close under load | `close` confirm/port-death tests + `close_deletion_seams_refuse_symlink_swap` (`src/session/close_status.rs` tests: both close deletions refuse a symlink-swapped dir, outside target intact) | `tests/close_under_load.test.js` | `tests/test_close_under_load.py` |
-| Wait/capture/timeout | stop-freshness unit tests | `tests/wait_capture.test.js`, `tests/stoptimeout.test.js` | `tests/test_wait_capture.py`, `tests/test_ux_live.py` (timeout prefix asserts), `tests/test_main_exit_visibility.py` |
+| Wait/capture/timeout | stop-freshness unit tests | `tests/wait_capture.test.js`, `tests/stoptimeout.test.js`, `tests/browser_reload.test.js` (reload park restore + running publish) | `tests/test_wait_capture.py`, `tests/test_ux_live.py` (timeout prefix asserts), `tests/test_main_exit_visibility.py` |
 | Workers/targets | `cmd_targets_in` roster tests | `tests/worker_targets.test.js`, `tests/worker_break_records.test.js`, `tests/vars_frame.test.js`, `tests/nodebridge_owners.test.js` (M4 narrow-owner tests: registry lifecycle/swap-restore incl. worker-removed-mid-command + queued-before-swap exit, chains, server pool/close) + `scripts/check_nodebridge_owners.sh` incl. `--self-test` (M4 routing: no container/clear/length-reset/wholesale writes outside owners), `tests/browserbridge_owners.test.js` (M5.1: single-tab shape, mutation chain, pool/close) + `scripts/check_browserbridge_owners.sh` incl. `--self-test` (M5.1 routing: no server/chain replacement or tail/depth writes outside owners) | `tests/test_m5_live.py` |
-| Java bridge | — | `javac` compile + execution: `bridge/java/src/*.java` + `tests/M4JavaCheck.java`, `M5JavaCheck.java`, `M6JavaCheck.java`, `M7JavaCheck.java`, `BJavaCheck.java`, `CJavaCheck.java` (each executed in-gate; fail-fast `System.exit(1)`) + `scripts/check_java_owners.sh` incl. `--self-test` (M5.2 move/retain/reject gate; retained/setup detection is comment-stripped declaration match) | `tests/test_live.py` java adapter |
+| Java bridge | `endpoint_lock_path_escapes_without_collision` (host escaping) | `javac` compile + execution: `bridge/java/src/*.java` + `tests/M4JavaCheck.java`, `M5JavaCheck.java`, `M6JavaCheck.java`, `M7JavaCheck.java`, `BJavaCheck.java`, `CJavaCheck.java`, `tests/StrictJavaCheck.java` (port/\u strictness, owner-claim verify, hitCounts prune) (each executed in-gate; fail-fast `System.exit(1)`) + `scripts/check_java_owners.sh` incl. `--self-test` (M5.2 move/retain/reject gate; retained/setup detection is comment-stripped declaration match) | `tests/test_live.py` java adapter |
 | Review regressions | `cargo test` full | `tests/review_fixes.test.js` | `tests/test_live.py` (4 adapters, isolated `HOME`, installed binary `target/debug/agent-debugger`) |
 | Contract fixtures (frozen strings) | `bridge::tests::contract_fixtures_match_cli_constants` | `tests/contract_fixtures.test.js`, `tests/test_contract_fixtures.py` | — (fixtures only, no live) |
-| Provisioning (daemon-free) | `bridge::tests` (stale rewrite, shared-JS no-short-circuit, `NODE_PATH`, venv paths, `JAVA_CLASSES` markers) | — | `tests/_live_home.py` setup (symlink real venv/node_modules, never install) + `tests/test_live_home.py` |
-| Installer checksum (.sha256 verify-or-skip) | — | `tests/install_checksum.test.js` + `tests/test_install_checksum.sh` (sh gate section in `run_gates.sh`) | — (verified at release time per `docs/release-checklist.md`) |
+| Provisioning (daemon-free) | `bridge::tests` (stale rewrite, shared-JS no-short-circuit, `NODE_PATH`, venv paths, `JAVA_CLASSES` markers) | — | `tests/_live_home.py` setup (copies real venv/node_modules with symlinks preserved, never installs) + `tests/test_live_home.py` |
+| Installer checksum (.sha256 verify-or-skip) | — | `tests/install_checksum.test.js` + `tests/test_install_checksum.sh` (sh gate section in `run_gates.sh`) + `tests/wrapper_find.test.js` (PATH shim self-avoidance) | — (verified at release time per `docs/release-checklist.md`) |
 | Release asset matrix | — | `tests/test_release_assets.py` (py gate section; matrix parsed from `release.yml`) | `scripts/check_release.sh <tag>` (manual, release time) |
 | Provision timeout kill + tmp hygiene | `run_with_timeout_kills_slow_child`, `atomic_tmp_names_are_unique_per_call`, `atomic_write_uses_unique_tmp_and_leaves_none` | — | — |
 
@@ -395,7 +395,7 @@ runners): unit = `cargo test` + `cargo fmt --check` + every
 `node --test tests/*.test.js` + `tests/test_install_checksum.sh` + owner-routing gates
 (`check_nodebridge_owners` + `check_browserbridge_owners` +
 `check_pybridge_owners` + `check_java_owners`, each incl. `--self-test`) + `javac` bridge/checks + executed
- java checks (B/C/M4-M7); live = `cargo build`
+ java checks (B/C/M4-M7 + saturation + framing + strict); live = `cargo build`
 + `tests/run_live.py` (runs `test_live` + `test_m5_live` + `test_ux_live`
 in one scope), with `TEST_LANG`/`SKIP_BROWSER` filters for live only.
 Live nonzero policy (enforced programmatically in `tests/run_live.py` via
@@ -525,7 +525,7 @@ the script is normative:
   `scripts/check_browserbridge_owners.sh`,
   `scripts/check_pybridge_owners.sh`,
   `scripts/check_java_owners.sh` (each incl. `--self-test`) + `javac` bridge/checks
-  + executed Java checks B/C/M4–M7).
+  + executed Java checks B/C/M4–M7 + saturation + framing + strict).
 - Live gate: `scripts/run_gates.sh --live` (builds first when the binary is
   missing; `TEST_LANG=py|node|java|browser` + `SKIP_BROWSER=1` filter live
   only; JS unit always runs in full). Live entry is `tests/run_live.py`

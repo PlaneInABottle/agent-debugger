@@ -59,7 +59,13 @@ jobs:
           ARCHIVE_NAME="agent-debugger-${{ matrix.target }}.tar.gz"
           chmod +x "$BIN_PATH"
           tar -czvf "$ARCHIVE_NAME" -C "target/${{ matrix.target }}/release" agent-debugger
-          shasum -a 256 "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256"
+          # shasum (macOS perl) vs sha256sum (ubuntu coreutils): use
+          # whichever the runner ships (Windows Git Bash lacks shasum).
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256"
+          else
+            shasum -a 256 "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256"
+          fi
 
       - name: Package binary (Windows)
         if: runner.os == 'Windows'
@@ -69,7 +75,12 @@ jobs:
           cd "target/${{ matrix.target }}/release"
           7z a "../../../$ARCHIVE_NAME" agent-debugger.exe
           cd ../../..
-          shasum -a 256 "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256"
+          # Git Bash ships coreutils sha256sum but no perl shasum.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256"
+          else
+            shasum -a 256 "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256"
+          fi
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -96,7 +107,7 @@ jobs:
       - name: Generate unified SHA256 checksums
         shell: bash
         run: |
-          sha256sum agent-debugger-*.tar.gz agent-debugger-*.zip > SHA256SUMS.txt || true
+          sha256sum agent-debugger-*.tar.gz agent-debugger-*.zip > SHA256SUMS.txt
           ls -la agent-debugger-* SHA256SUMS.txt
 
       - name: Determine tag
@@ -130,7 +141,7 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       - name: Publish to NPM (if NPM_TOKEN is provided)
-        if: env.NODE_AUTH_TOKEN != ''
+        if: secrets.NPM_TOKEN != ''
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
