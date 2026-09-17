@@ -14,7 +14,7 @@ spec = importlib.util.spec_from_file_location("pybridge", ROOT / "bridge/py/src/
 bridge = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bridge)
 
-FIXTURE = json.loads((ROOT / "tests/contract/framing.json").read_text())
+FIXTURE = json.loads((ROOT / "tests/contract/framing.json").read_text(encoding="utf-8"))
 
 
 class FeedConn:

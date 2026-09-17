@@ -20,7 +20,9 @@ spec.loader.exec_module(bridge)
 
 
 def fixture(name):
-    return json.loads((CONTRACT / name).read_text())
+    # Explicit UTF-8: several fixtures carry non-ASCII frozen strings
+    # (`…`), and the platform locale must never decide how they decode.
+    return json.loads((CONTRACT / name).read_text(encoding="utf-8"))
 
 
 class ContractFixtureTests(unittest.TestCase):
@@ -63,7 +65,17 @@ class ContractFixtureTests(unittest.TestCase):
         self.assertEqual(bridge.IDENT_FIELD_CAP, fx["fieldCap"])
         self.assertEqual(bridge.IDENT_TOTAL_CAP, fx["bridgeTotalCap"])
         capped = bridge._cap_str("y" * 600, fx["fieldCap"])
-        self.assertIn(fx["truncSuffixFormat"].replace("N", str(600 - fx["fieldCap"])), capped)
+        suffix = fx["truncSuffixFormat"].replace("N", str(600 - fx["fieldCap"]))
+        # Codepoint-level diagnostics (ASCII-safe for any log pipeline):
+        # a past Windows run produced U+FFFD where U+2026 belongs, with
+        # correct file bytes — unreproducible locally, so a recurrence
+        # must arrive with ground truth attached.
+        self.assertIn(
+            suffix,
+            capped,
+            f"suffix codepoints={[hex(ord(c)) for c in suffix]} "
+            f"capped tail codepoints={[hex(ord(c)) for c in capped[505:525]]}",
+        )
         redacted = bridge.redact_identity_argv(["run", "--password=hunter2"])
         self.assertNotIn("hunter2", json.dumps(redacted))
         self.assertIn(fx["redacted"], json.dumps(redacted))
