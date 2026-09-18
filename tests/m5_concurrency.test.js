@@ -345,6 +345,42 @@ test('m5 node: step and resume sends trace to stderr', async () => {
   assert.match(joined, /trace: main resume sent/);
 });
 
+test('m5 node: step park landed during the request still counts fresh', async () => {
+  // CI test_30 signature: the step response and the paused event coalesce
+  // in one CDP read, so the pause handler (swap chain) records the park
+  // BEFORE the step caller's continuation. A freshness baseline captured
+  // at pump entry then equals the very park it must serve, and the step
+  // times out beside a parked worker. The baseline must predate the
+  // request: any park landing after the step was sent is fresh by
+  // definition.
+  const dir = tmpdir('m5-node-steprace-');
+  const st = nodeSession(dir);
+  st.paused = null;
+  const w = addWorker(st, 's1');
+  w.state = 'stopped';
+  w.paused = { frames: [workerFrame('w1', 3)], stopInfo: null };
+  st.trackChanges = async () => {};
+  st.pump = async () => 'stopped';
+  const p2 = {
+    reason: 'other', hitBreakpoints: [], data: null,
+    callFrames: [workerFrame('w1', 4)],
+  };
+  st.req = async (method) => {
+    if (method === 'Debugger.stepOver') {
+      // Queue the pause through the real chains while the request is in
+      // flight (production dispatch order; queue, never nest).
+      st._chainPause(() => st._swapRun(() => st.onWorkerPaused(w, p2)))
+        .catch(() => {});
+    }
+    return {};
+  };
+  const resp = await st.cmdStep({ target: w.id }, 0.3);
+  assert.equal(resp.stopped, true);
+  assert.equal(resp.target, w.id);
+  assert.equal(w.awaitingStep, false, 'landed park consumed the step flag');
+  assert.ok(w.paused, 'worker still parked after the step');
+});
+
 test('m5 node: close is accepted despite an outstanding resume', async () => {
   const dir = tmpdir('m5-node-close-');
   const st = nodeSession(dir);

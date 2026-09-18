@@ -2847,14 +2847,16 @@ class Session {
 
   /** Wait for a selectable stop: loops the (stub-compatible) pump until
    *  selectFreshStop names a target or the original budget is spent.
-   *  Pump errors propagate at once (a slice timeout with nothing parked
-   *  is rebuilt with the exact original envelope so wait/capture
-   *  enrichment keeps working); exits and owner loss pass through
-   *  untouched. */
-  async pumpForStop(timeout, tid, explicit, withWaitContext) {
+   *  `base` is supplied by resume commands (captured BEFORE the step/
+   *  resume request went out) and defaults to a pump-entry baseline for
+   *  wait/capture. Pump errors propagate at once (a slice timeout with
+   *  nothing parked is rebuilt with the exact original envelope so
+   *  wait/capture enrichment keeps working); exits and owner loss pass
+   *  through untouched. */
+  async pumpForStop(timeout, tid, explicit, withWaitContext, base = null) {
     const startedAt = Date.now();
     const deadline = startedAt + timeout * 1000;
-    const base = this.freshBase();
+    const base0 = base || this.freshBase();
     const timedOut = () => {
       const e = this.stopTimeoutErr(timeout, withWaitContext, startedAt);
       e.message += ` [parks: ${this.parkInventory()}]`;
@@ -2869,7 +2871,7 @@ class Session {
         if (e instanceof StopTimeout) throw timedOut();
         throw e;
       }
-      const hit = this.selectFreshStop(tid, explicit, base);
+      const hit = this.selectFreshStop(tid, explicit, base0);
       if (hit) return hit;
       // A stale or other-target park only: leave it parked and keep
       // waiting for our own stop.
@@ -3720,6 +3722,13 @@ class Session {
 
   async cmdStep(req, timeout) {
     const tid = this.resolveTarget(req);
+    // Freshness baseline BEFORE the step request goes out: the pause that
+    // completes the step can be recorded by the swap chain before this
+    // caller's continuation runs (response + paused event coalesced in one
+    // CDP read), so a baseline taken at pump entry would equal — and thus
+    // discard — the very park the step must serve (CI test_30 timeout
+    // beside a parked worker). Any park landing after this point is fresh.
+    const base = this.freshBase();
     await this.withTarget(tid, async () => {
       this.requireLive();
       // Stepping needs a stopped frame to step from (uniform contract on
@@ -3752,11 +3761,14 @@ class Session {
         throw e;
       }
     });
-    return this.resumeAndWait(timeout, tid, typeof req.target === 'string');
+    return this.resumeAndWait(timeout, tid, typeof req.target === 'string', base);
   }
 
   async cmdContinue(req, timeout) {
     const tid = this.resolveTarget(req);
+    // Same pre-send baseline as cmdStep (see there): a park that lands
+    // while the resume request is in flight is a fresh stop.
+    const base = this.freshBase();
     await this.withTarget(tid, async () => {
       this.requireLive();
       if (this.paused) {
@@ -3798,13 +3810,15 @@ class Session {
   /** Resume one target after step/continue and wait for a selectable
    *  stop: only the requested target's fresh park when explicit, any
    *  fresh park when omitted (stale pre-existing parks never satisfy).
+   *  `base` carries the caller's pre-request freshness baseline (see
+   *  cmdStep); null falls back to a pump-entry baseline.
    *  The response names the target that actually parked. */
-  async resumeAndWait(timeout, tid = 'main', explicit = false) {
+  async resumeAndWait(timeout, tid = 'main', explicit = false, base = null) {
     this.pendingTarget = tid;
     try {
       let stopped;
       try {
-        stopped = await this.pumpForStop(timeout, tid, explicit, false);
+        stopped = await this.pumpForStop(timeout, tid, explicit, false, base);
       } catch (e) {
         // Pump timeout (or target exit) must clear the step flag — otherwise
         // the NEXT real stop misreports as a step landing and breakpoint hits
