@@ -281,6 +281,70 @@ test('m5 node: explicit wait timeout inventories live parks', async () => {
     /no stop within.*parks: main=running worker:s1=parked/);
 });
 
+test('m5 node: worker park + detach trace to stderr', async () => {
+  // Failure forensics: the live bundle ships bridge.log, so worker
+  // lifecycle transitions must be visible there in order.
+  const dir = tmpdir('m5-node-trace-');
+  const st = nodeSession(dir);
+  st.paused = null;
+  const lines = [];
+  const orig = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (s) => { lines.push(String(s)); return true; };
+  try {
+    const w = addWorker(st, 's1');
+    let openGate;
+    const gate = new Promise((resolve) => { openGate = resolve; });
+    st.trackChanges = () => gate;
+    const pending = st.onWorkerPaused(w, {
+      reason: 'other', hitBreakpoints: ['bp1'], data: null,
+      callFrames: [workerFrame()],
+    });
+    openGate();
+    await pending;
+    await st.handleEvent({
+      method: 'NodeWorker.detachedFromWorker', params: { sessionId: 's1' },
+    });
+  } finally {
+    process.stderr.write = orig;
+  }
+  const joined = lines.join('');
+  assert.match(joined, /trace: worker:s1 parked reason=other hits=1/);
+  assert.match(joined, /trace: worker:s1 detached/);
+});
+
+test('m5 node: step and resume sends trace to stderr', async () => {
+  const dir = tmpdir('m5-node-tracestep-');
+  const st = nodeSession(dir);
+  st.paused = {
+    frames: [{
+      callFrameId: 'm1', functionName: 'f', scopeChain: [],
+      location: { scriptId: 'ms1', lineNumber: 1 },
+    }],
+    stopInfo: null,
+  };
+  st.req = async () => ({});
+  st.pumpForStop = async () => 'main';
+  const lines = [];
+  const orig = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (s) => { lines.push(String(s)); return true; };
+  try {
+    await st.cmdStep({ timeout: 5 }, 5);
+    st.paused = {
+      frames: [{
+        callFrameId: 'm1', functionName: 'f', scopeChain: [],
+        location: { scriptId: 'ms1', lineNumber: 1 },
+      }],
+      stopInfo: null,
+    };
+    await st.cmdContinue({ timeout: 5 }, 5);
+  } finally {
+    process.stderr.write = orig;
+  }
+  const joined = lines.join('');
+  assert.match(joined, /trace: main step sent/);
+  assert.match(joined, /trace: main resume sent/);
+});
+
 test('m5 node: close is accepted despite an outstanding resume', async () => {
   const dir = tmpdir('m5-node-close-');
   const st = nodeSession(dir);

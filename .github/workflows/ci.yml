@@ -102,6 +102,20 @@ jobs:
         shell: bash
         run: scripts/run_gates.sh --live
 
+      - name: Upload live failure bundles
+        # The harness copies bridge.log/session.json/error.json/stops.json
+        # for failed sessions into a stable dir (temp HOME vanishes on
+        # process exit). Ships the next failure's forensics with it.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-failure-bundles
+          path: |
+            ${{ runner.temp }}/live-failure-bundles/
+            /tmp/live-failure-bundles/
+          if-no-files-found: ignore
+          retention-days: 7
+
   msrv:
     name: MSRV (1.89)
     runs-on: ubuntu-latest

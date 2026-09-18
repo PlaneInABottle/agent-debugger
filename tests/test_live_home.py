@@ -125,6 +125,40 @@ class LiveHomeHelperTests(unittest.TestCase):
             Fake.dump_failure_bundle()  # must not raise
         self.assertIn("ghost", buf.getvalue())
 
+    def test_failure_bundle_copies_artifacts_to_stable_dir(self):
+        with tempfile.TemporaryDirectory(prefix="live-home-drill-") as tmp:
+            home = Path(tmp)
+            sdir = home / ".agent-debugger" / "sessions" / "drill-session"
+            sdir.mkdir(parents=True)
+            (sdir / "bridge.log").write_bytes(b"parked line 10\n")
+            (sdir / "session.json").write_bytes(b'{"port": 1}')
+
+            class Fake(_live_home.LiveHomeMixin):
+                pass
+
+            Fake.home = home
+            Fake.sessions = {"drill-session"}
+            bundle = str(Path(tmp) / "bundles")
+            old = os.environ.get("LIVE_BUNDLE_DIR")
+            os.environ["LIVE_BUNDLE_DIR"] = bundle
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stderr(buf):
+                    Fake.dump_failure_bundle()
+            finally:
+                if old is None:
+                    del os.environ["LIVE_BUNDLE_DIR"]
+                else:
+                    os.environ["LIVE_BUNDLE_DIR"] = old
+            bdir = Path(bundle) / "Fake" / "drill-session"
+            self.assertEqual((bdir / "bridge.log").read_bytes(),
+                             b"parked line 10\n")
+            self.assertEqual((bdir / "session.json").read_bytes(),
+                             b'{"port": 1}')
+            # Missing artifacts are skipped, never fabricated.
+            self.assertFalse((bdir / "error.json").exists())
+            self.assertFalse((bdir / "stops.json").exists())
+
     def test_setup_home_copies_dependency_dirs_without_symlinks(self):
         # Regression for M3's symlink refusal: setup_home must provide real
         # adapter/dependency directories while retaining the existing

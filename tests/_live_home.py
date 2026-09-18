@@ -380,21 +380,41 @@ class LiveHomeMixin:
     @classmethod
     def dump_failure_bundle(cls):
         """Print artifact paths + redacted bridge.log tails for tracked
-        sessions (max 3). Never reads target env; never raises."""
+        sessions (max 3). Never reads target env; never raises. Also copies
+        the small text artifacts into a stable bundle dir outside the temp
+        HOME (which vanishes on process exit): CI uploads that dir as an
+        artifact, so the next failure ships its own forensics."""
         try:
             sessions_root = cls.home / ".agent-debugger" / "sessions"
             names = sorted(cls.sessions)[:3]
             if not names:
                 print("live diagnostics: no tracked sessions", file=sys.stderr)
                 return
+            bundle_root = Path(os.environ.get(
+                "LIVE_BUNDLE_DIR",
+                str(Path(tempfile.gettempdir()) / "live-failure-bundles")))
+            tag = cls.__name__
             for name in names:
                 sdir = sessions_root / name
                 print(f"live diagnostics: session={name} dir={sdir}",
                       file=sys.stderr)
+                bdir = bundle_root / tag / name
                 for artifact in ("bridge.log", "session.json",
                                  "error.json", "stops.json"):
                     print(f"live diagnostics: {name}/{artifact}: "
                           f"{sdir / artifact}", file=sys.stderr)
+                    try:
+                        data = (sdir / artifact).read_bytes()
+                    except OSError:
+                        continue
+                    try:
+                        bdir.mkdir(parents=True, exist_ok=True)
+                        # Cap single artifacts: logs stay small (stderr
+                        # only), but never let a bundle fill a disk.
+                        (bdir / artifact).write_bytes(data[:262144])
+                    except OSError as e:
+                        print(f"live diagnostics: bundle copy failed: {e}",
+                              file=sys.stderr)
                 log = sdir / "bridge.log"
                 try:
                     lines = log.read_text(errors="replace").splitlines()[-30:]

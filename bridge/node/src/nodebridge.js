@@ -1896,7 +1896,10 @@ class Session {
       // AND released (ignored) ones, so a kicked worker that runs out is
       // observable as exited rather than stuck as ignored forever.
       // Unknown sessions (never seen, e.g. evicted) stay untracked.
-      if (sid) this.workers.noteExit(`worker:${sid}`);
+      if (sid) {
+        process.stderr.write(`trace: worker:${sid} detached\n`);
+        this.workers.noteExit(`worker:${sid}`);
+      }
       return;
     }
     if (msg.method === 'NodeWorker.receivedMessageFromWorker') {
@@ -2397,6 +2400,7 @@ class Session {
         w.lastStop = this.workerLastStop(w);
         this.lastParkTarget = w.id;
         this.notePark(w.id, p, w.lastStop);
+        process.stderr.write(`trace: ${w.id} parked reason=${p.reason} hits=${(p.hitBreakpoints || []).length}\n`);
         return;
       }
       if (realHits.length > 0 || w.awaitingStep) {
@@ -2422,6 +2426,7 @@ class Session {
         w.lastStop = this.workerLastStop(w);
         this.lastParkTarget = w.id;
         this.notePark(w.id, p, w.lastStop);
+        process.stderr.write(`trace: ${w.id} parked reason=${p.reason} hits=${(p.hitBreakpoints || []).length}\n`);
         return;
       }
       restoreTrack();
@@ -3733,6 +3738,7 @@ class Session {
       this.publishState(false);
       try {
         await this.req(method);
+        process.stderr.write(`trace: ${tid} step sent\n`);
       } catch (e) {
         // Stepping a running target fails at the protocol level — restore the
         // park (unless a fresh pause already won) so the session file stops
@@ -3761,6 +3767,7 @@ class Session {
         this.publishState(false);
         try {
           await this.req('Debugger.resume');
+          process.stderr.write(`trace: ${tid} resume sent\n`);
         } catch (e) {
           // Synchronous request failure: restore the park unless a fresh
           // pause already won the race.
