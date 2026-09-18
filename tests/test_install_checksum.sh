@@ -3,6 +3,18 @@
 # missing sidecar warns-but-continues.
 set -eu
 
+# install.sh supports Darwin/Linux only (it exits 1 elsewhere), and the
+# file:// + curl/sha256sum interop under Git Bash cannot exercise the
+# real path (a failed sidecar download reads as "missing", so tamper
+# can never fail). Skip on Windows with reason; ubuntu/macos keep
+# covering the helper.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    echo "skip: installer checksum needs a unix curl/sha256sum (install.sh is Darwin/Linux-only)"
+    exit 0
+    ;;
+esac
+
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 
 # Extract only the verify_checksum function (avoid running the installer).
