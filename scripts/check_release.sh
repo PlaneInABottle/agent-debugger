@@ -18,7 +18,7 @@ ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT"
 
 TAG="${1:-}"
-API_BASE="${2:-https://api.github.com/PlaneInABottle/agent-debugger/releases}"
+API_BASE="${2:-https://api.github.com/repos/PlaneInABottle/agent-debugger/releases}"
 if [ -z "$TAG" ]; then
   echo "usage: scripts/check_release.sh <tag> [api-base-override]" >&2
   exit 2

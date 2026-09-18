@@ -58,6 +58,19 @@ class TestReleaseAssetCoverage(unittest.TestCase):
         # 4 unix tar.gz + 1 windows zip; update this test when adding a tier.
         self.assertEqual(len(release_targets()), 5)
 
+    def test_check_release_default_api_base_hits_the_repos_endpoint(self):
+        # The manual release verifier must default to the real endpoint
+        # https://api.github.com/repos/<owner>/<repo>/releases: without the
+        # /repos/ segment every check 404s ("no release ...") even when the
+        # release is fully published.
+        text = (ROOT / "scripts/check_release.sh").read_text()
+        m = re.search(r'API_BASE="\$\{2:-([^"]+)\}"', text)
+        self.assertIsNotNone(m, "check_release.sh API_BASE default not found")
+        base = m.group(1)
+        self.assertIn("/repos/", base, base)
+        self.assertTrue(base.startswith("https://api.github.com/repos/"),
+                        base)
+
 
 if __name__ == "__main__":
     unittest.main()

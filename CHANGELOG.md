@@ -4,6 +4,14 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); versioning follows
 [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- `scripts/check_release.sh` default API base now hits the real
+  `/repos/<owner>/<repo>/releases` endpoint (previously 404'd on every
+  run, reporting "no release" for a fully published release).
+
 ## [0.2.1] — 2026-09-18
 
 ### Fixed

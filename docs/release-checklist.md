@@ -1,8 +1,7 @@
 # Release checklist (tag → HN)
 
-No release has been cut yet (verified 2026-09-15: the releases API
-returns `[]`, so `install.sh`/`postinstall` currently 404 on every
-platform — the first tag is what makes this project installable).
+First release published: v0.2.1 (2026-09-18, all 11 assets verified
+with `scripts/check_release.sh`).
 
 ## Cut
 
