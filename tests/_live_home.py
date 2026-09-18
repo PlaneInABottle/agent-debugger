@@ -354,6 +354,13 @@ class LiveHomeMixin:
 
     def track(self, name):
         self.sessions.add(name)
+        # Instance-level record of THIS test's sessions: the class set
+        # loses names in test finally-blocks before cleanup runs, so the
+        # failure bundle reads this list, not the set delta.
+        try:
+            self._live_test_sessions.append(name)
+        except AttributeError:
+            self._live_test_sessions = [name]
         return name
 
     # -- failure diagnostics (bounded, redacted, never masks the error) --
@@ -362,6 +369,7 @@ class LiveHomeMixin:
         result = getattr(outcome, "result", None) if outcome else None
         self._live_problems_before = (
             len(result.failures) + len(result.errors)) if result else 0
+        self._live_test_sessions = []
         self.addCleanup(self._live_home_dump_on_failure)
 
     def _live_home_dump_on_failure(self):
@@ -373,20 +381,27 @@ class LiveHomeMixin:
             after = len(result.failures) + len(result.errors)
             if after <= getattr(self, "_live_problems_before", 0):
                 return
-            type(self).dump_failure_bundle()
+            # Prefer this test's own tracked sessions (survives
+            # finally-block removals); fall back to the class set.
+            names = getattr(self, "_live_test_sessions", None) or None
+            type(self).dump_failure_bundle(names)
         except Exception as e:
             print(f"live diagnostics bundle failed: {e}", file=sys.stderr)
 
     @classmethod
-    def dump_failure_bundle(cls):
-        """Print artifact paths + redacted bridge.log tails for tracked
-        sessions (max 3). Never reads target env; never raises. Also copies
+    def dump_failure_bundle(cls, names=None):
+        """Print artifact paths + redacted bridge.log tails for the given
+        sessions (default: first 3 of the class set, max 3). Never reads
+        target env; never raises. Also copies
         the small text artifacts into a stable bundle dir outside the temp
         HOME (which vanishes on process exit): CI uploads that dir as an
         artifact, so the next failure ships its own forensics."""
         try:
             sessions_root = cls.home / ".agent-debugger" / "sessions"
-            names = sorted(cls.sessions)[:3]
+            if names is None:
+                names = sorted(cls.sessions)[:3]
+            else:
+                names = sorted(set(names))[:3]
             if not names:
                 print("live diagnostics: no tracked sessions", file=sys.stderr)
                 return

@@ -159,6 +159,42 @@ class LiveHomeHelperTests(unittest.TestCase):
             self.assertFalse((bdir / "error.json").exists())
             self.assertFalse((bdir / "stops.json").exists())
 
+    def test_failure_bundle_prefers_given_names(self):
+        # The failing test's own sessions (explicit names) win over the
+        # class set's alphabetical first-three: a later-alphabet session
+        # must be bundled while an earlier one is not.
+        with tempfile.TemporaryDirectory(prefix="live-home-drill-") as tmp:
+            home = Path(tmp)
+            root = home / ".agent-debugger" / "sessions"
+            for name in ("aaa-early", "zzz-failed"):
+                d = root / name
+                d.mkdir(parents=True)
+                (d / "bridge.log").write_bytes(f"{name}\n".encode())
+
+            class Fake(_live_home.LiveHomeMixin):
+                pass
+
+            Fake.home = home
+            Fake.sessions = {"aaa-early", "zzz-failed"}
+            bundle = str(Path(tmp) / "bundles")
+            old = os.environ.get("LIVE_BUNDLE_DIR")
+            os.environ["LIVE_BUNDLE_DIR"] = bundle
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stderr(buf):
+                    Fake.dump_failure_bundle(["zzz-failed"])
+            finally:
+                if old is None:
+                    del os.environ["LIVE_BUNDLE_DIR"]
+                else:
+                    os.environ["LIVE_BUNDLE_DIR"] = old
+            self.assertIn("zzz-failed/bridge.log", buf.getvalue())
+            self.assertNotIn("aaa-early/bridge.log", buf.getvalue())
+            self.assertTrue(
+                (Path(bundle) / "Fake" / "zzz-failed" / "bridge.log").exists())
+            self.assertFalse(
+                (Path(bundle) / "Fake" / "aaa-early").exists())
+
     def test_setup_home_copies_dependency_dirs_without_symlinks(self):
         # Regression for M3's symlink refusal: setup_home must provide real
         # adapter/dependency directories while retaining the existing
