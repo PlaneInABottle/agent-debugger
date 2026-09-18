@@ -67,7 +67,7 @@ test('shim-only PATH exits 1 instead of re-spawning itself', async (t) => {
   assert.match(stderr, /Native executable was not found/);
 });
 
-test('own shim is skipped for a later native binary on PATH', async (t) => {
+test('own shim is skipped for a later native binary on PATH', { skip: process.platform === 'win32' ? 'fake native binary is a POSIX sh script (no shebang exec on Windows); PATH-skip selection stays covered by the findBinary override test on all platforms' : undefined }, async (t) => {
   const { shimDir, fakeDir, wdir, emptyHome } = setup();
   t.after(() => fs.rmSync(path.dirname(wdir), { recursive: true, force: true }));
   const { err, stdout } = await runWrapper(

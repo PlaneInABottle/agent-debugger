@@ -2850,13 +2850,18 @@ class Session {
     const startedAt = Date.now();
     const deadline = startedAt + timeout * 1000;
     const base = this.freshBase();
+    const timedOut = () => {
+      const e = this.stopTimeoutErr(timeout, withWaitContext, startedAt);
+      e.message += ` [parks: ${this.parkInventory()}]`;
+      return e;
+    };
     for (;;) {
       const remaining = (deadline - Date.now()) / 1000;
-      if (remaining <= 0) throw this.stopTimeoutErr(timeout, withWaitContext, startedAt);
+      if (remaining <= 0) throw timedOut();
       try {
         await this.pump(remaining, withWaitContext);
       } catch (e) {
-        if (e instanceof StopTimeout) throw this.stopTimeoutErr(timeout, withWaitContext, startedAt);
+        if (e instanceof StopTimeout) throw timedOut();
         throw e;
       }
       const hit = this.selectFreshStop(tid, explicit, base);
@@ -2869,6 +2874,19 @@ class Session {
 
   anyWorkerParked() {
     return this.workers.liveWorkers().some((w) => w.paused);
+  }
+
+  parkInventory() {
+    // One-line park truth for timeout diagnostics: which targets hold a
+    // park right now. Lets a timeout say whether it waited on an empty
+    // room (V8 silent/exited) or beside an unserved park (stale/base
+    // race) — same diagnostic pattern as the requireStopped suffix.
+    const parts = [`main=${this.paused ? 'parked' : 'running'}`];
+    for (const w of this.workers.liveWorkers()) {
+      parts.push(`${w.id}=${w.paused ? 'parked' : w.state}`);
+    }
+    parts.push(`lastPark=${this.lastParkTarget}`);
+    return parts.join(' ');
   }
 
   markExited() {
@@ -4855,15 +4873,18 @@ async function closeFromConn(st, conn) {
   try {
     await writeFrame(conn, { ok: true, closed: true, target: 'main' });
   } catch (_) { /* client already gone */ }
-  if (!mine) {
-    try {
-      conn.destroy();
-    } catch (_) { /* already gone */ }
-    return;
+  if (mine) {
+    await st.cleanup().catch(() => {});
   }
-  await st.cleanup().catch(() => {});
+  // Graceful FIN after the flush (not destroy): conn.destroy() here RSTs
+  // on Windows and discards the ACK the client is still reading (client
+  // fails the close roundtrip with 'truncated frame'). The no-op error
+  // listener covers a half-dead socket (end after a failed write would
+  // otherwise raise an unhandled 'error'). Shutdown never hangs on this:
+  // closeServer bounds server.close, and the CLI always reads one frame.
   try {
-    conn.destroy();
+    conn.on('error', () => {});
+    conn.end();
   } catch (_) { /* already gone */ }
 }
 

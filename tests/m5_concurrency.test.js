@@ -264,6 +264,23 @@ test('m5 node: worker park is selectable before enrichment awaits finish', async
   assert.equal(w.state, 'stopped');
 });
 
+test('m5 node: explicit wait timeout inventories live parks', async () => {
+  // A wait that times out beside an unserved park must say so: parked
+  // worker in the message distinguishes a stale/base race (park present,
+  // never selected) from V8 silence (empty room). Pump stubbed to
+  // parked-but-stale so the test never touches owner/process state.
+  const dir = tmpdir('m5-node-timeinv-');
+  const st = nodeSession(dir);
+  st.paused = null;
+  const w = addWorker(st, 's1');
+  w.state = 'stopped';
+  w.paused = { frames: [workerFrame()], stopInfo: null };
+  st.pump = async () => 'stopped';
+  await assert.rejects(
+    st.pumpForStop(0.15, w.id, true, false),
+    /no stop within.*parks: main=running worker:s1=parked/);
+});
+
 test('m5 node: close is accepted despite an outstanding resume', async () => {
   const dir = tmpdir('m5-node-close-');
   const st = nodeSession(dir);
