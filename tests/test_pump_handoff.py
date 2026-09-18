@@ -46,7 +46,7 @@ class FakeConn:
     def pop_stash(self):
         return self.stash.pop(0) if self.stash else None
 
-    def _read_msg(self):
+    def _read_msg(self, timeout=None):
         raise socket.timeout()
 
     def close(self):

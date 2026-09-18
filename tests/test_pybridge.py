@@ -1053,6 +1053,56 @@ class BridgeTests(unittest.TestCase):
         right.sendall(body[4:])
         self.assertEqual(dap._read_msg(), message)
 
+    def test_bounded_read_applies_its_bound_at_read_time(self):
+        # Live test_05/test_35 stall: a bounded reader (pump/idle) armed
+        # its bound, then waited on mu held by a handler that re-armed a
+        # multi-second deadline; the reader's recv inherited it and the
+        # accept loop stalled. The bound must win at read time.
+        left, right = socket.socketpair()
+        self.addCleanup(left.close)
+        self.addCleanup(right.close)
+        dap = bridge.DapConn(left)
+        left.settimeout(2.0)  # another reader's armed deadline
+        t0 = time.monotonic()
+        with self.assertRaises((socket.timeout, TimeoutError)):
+            dap._read_msg(timeout=0.05)
+        self.assertLess(time.monotonic() - t0, 1.0)
+
+    def test_bounded_read_keeps_bound_after_lock_wait(self):
+        # A reader blocked on the conn lock must read with ITS bound, not
+        # with the holder's long one.
+        left, right = socket.socketpair()
+        self.addCleanup(left.close)
+        self.addCleanup(right.close)
+        dap = bridge.DapConn(left)
+        entered = threading.Event()
+
+        def holder():
+            with dap.mu:
+                entered.set()
+                time.sleep(0.3)
+
+        holder_thread = threading.Thread(target=holder, daemon=True)
+        holder_thread.start()
+        self.assertTrue(entered.wait(2))
+        t0 = time.monotonic()
+        with self.assertRaises((socket.timeout, TimeoutError)):
+            dap._read_msg(timeout=0.05)
+        dt = time.monotonic() - t0
+        holder_thread.join()
+        self.assertLess(dt, 1.5, "read must not inherit the holder's deadline")
+        self.assertGreaterEqual(dt, 0.25, "read must wait for the lock")
+
+    def test_try_read_restores_the_socket_timeout(self):
+        st = self.session()
+        left, right = socket.socketpair()
+        self.addCleanup(left.close)
+        self.addCleanup(right.close)
+        dap = bridge.DapConn(left)
+        left.settimeout(2.0)
+        self.assertIsNone(st._try_read(dap))
+        self.assertEqual(left.gettimeout(), 2.0)
+
 
     def test_module_launch_args_use_module_not_program(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1562,7 +1612,7 @@ class BridgeTests(unittest.TestCase):
                     return {}
                 def send_only(self, cmd, args=None):
                     calls.append("send:" + cmd)
-                def _read_msg(self):
+                def _read_msg(self, timeout=None):
                     return {"type": "response", "command": "attach",
                             "request_seq": 1, "success": True, "body": {}}
 

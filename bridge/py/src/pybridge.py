@@ -193,8 +193,34 @@ class DapConn:
                 return None
             return self.stash.pop(0)
 
-    def _read_msg(self):
+    def restore_read_timeout(self, timeout):
+        """Best-effort restore that never waits on a concurrent reader:
+        while another thread holds mu it is mid-read with its own bound,
+        and every reader re-applies its bound under mu, so a skipped
+        restore can never leak (it only keeps the idle value stable)."""
+        if self.mu.acquire(blocking=False):
+            try:
+                self.sock.settimeout(timeout)
+            except OSError:
+                pass
+            finally:
+                self.mu.release()
+
+    def _read_msg(self, timeout=None):
+        """Mu-protected read. `timeout` is applied INSIDE the lock: a
+        caller's bound must never be overwritten by another thread between
+        the settimeout and the recv. Before this, a bounded idle/pump
+        reader set its small timeout, then waited on mu held by a handler
+        that re-set the socket to its own multi-second deadline — the
+        reader's recv inherited that deadline and the accept loop stalled
+        for it (live test_05/test_35 'timed out waiting for debug
+        session' signature)."""
         with self.mu:
+            if timeout is not None:
+                try:
+                    self.sock.settimeout(timeout)
+                except OSError as e:
+                    raise BridgeErr(f"DAP socket closed: {e}") from e
             return self._read_msg_locked()
 
     def _read_msg_locked(self):
@@ -286,9 +312,9 @@ class DapConn:
                     return m.get("body", {})
             if time.time() > deadline:
                 raise BridgeErr(f"DAP {command} timed out")
-            self.sock.settimeout(max(0.1, deadline - time.time()))
             try:
-                msg = self._read_msg()
+                msg = self._read_msg(
+                    timeout=max(0.1, deadline - time.time()))
             except BridgeErr:
                 raise
             if msg.get("type") == "response" and msg.get("request_seq") == mine:
@@ -2263,9 +2289,9 @@ class Session:
                     return True
             deadline = time.time() + timeout
             while time.time() < deadline:
-                self.dap.sock.settimeout(max(0.05, deadline - time.time()))
                 try:
-                    msg = self.dap._read_msg()
+                    msg = self.dap._read_msg(
+                        timeout=max(0.05, deadline - time.time()))
                 except (socket.timeout, TimeoutError, BridgeErr):
                     return self._process_event is not None
                 if _is_process_event(msg):
@@ -2587,9 +2613,9 @@ class Session:
                     if not m.get("success", False):
                         raise BridgeErr(m.get("message", f"{command} failed"))
                     return
-            self.dap.sock.settimeout(max(0.1, deadline - time.time()))
             try:
-                msg = self.dap._read_msg()
+                msg = self.dap._read_msg(
+                    timeout=max(0.1, deadline - time.time()))
             except (socket.timeout, TimeoutError):
                 # Response side handles its own deadline; bubble timeouts as
                 # BridgeErr everywhere else.
@@ -2641,9 +2667,9 @@ class Session:
                     if not m.get("success", False):
                         raise BridgeErr(m.get("message", f"{command} failed"))
                     return
-            dap.sock.settimeout(max(0.1, deadline - time.time()))
             try:
-                msg = dap._read_msg()
+                msg = dap._read_msg(
+                    timeout=max(0.1, deadline - time.time()))
             except (socket.timeout, TimeoutError):
                 raise BridgeErr(f"{command} response never arrived")
             if msg.get("type") == "response" and msg.get("command") == command:
@@ -3104,28 +3130,25 @@ class Session:
         when no COMPLETE message is available without waiting. DapConn
         buffers internally, so a select-first loop would stall on coalesced
         segments forever — buffered data must be consumed before selecting.
-        The socket timeout is preserved."""
+        The zero bound is applied inside the lock (see _read_msg); the
+        previous socket timeout is restored best-effort without waiting."""
         sock = getattr(conn, "sock", None)
         if sock is None:
             return None
+        # The zero bound is applied inside the lock (see _read_msg); the
+        # previous value is restored best-effort without waiting.
         try:
             prev = sock.gettimeout()
         except OSError:
             return None
         try:
-            try:
-                sock.settimeout(0)
-            except OSError:
-                return None
-            try:
-                return conn._read_msg()
-            except (socket.timeout, TimeoutError, BlockingIOError):
-                return None
+            return conn._read_msg(timeout=0)
+        except (socket.timeout, TimeoutError, BlockingIOError):
+            return None
         finally:
-            try:
-                sock.settimeout(prev)
-            except OSError:
-                pass
+            restore = getattr(conn, "restore_read_timeout", None)
+            if restore is not None:
+                restore(prev)
 
     def _dispatch_pumped(self, msg, tid):
         """Route one message to its target's handler. Main keeps the
@@ -3410,12 +3433,11 @@ class Session:
                     continue
                 # Bound split-segment stalls (old behavior): the rest of a
                 # half-received message normally follows in milliseconds.
+                # The bound is applied under the conn lock (see _read_msg),
+                # so a concurrent handler can never widen it mid-wait.
                 try:
-                    sock.settimeout(min(max(remaining, 0.1), 1.0))
-                except OSError:
-                    continue
-                try:
-                    msg = conn._read_msg()
+                    msg = conn._read_msg(
+                        timeout=min(max(remaining, 0.1), 1.0))
                 except (socket.timeout, TimeoutError):
                     continue
                 except BridgeErr as e:
@@ -4542,11 +4564,8 @@ class Session:
                 if sock is None or id(sock) not in ready_ids:
                     continue
                 try:
-                    sock.settimeout(max(0.01, deadline - time.time()))
-                except OSError:
-                    return
-                try:
-                    msg = conn._read_msg()
+                    msg = conn._read_msg(
+                        timeout=max(0.01, deadline - time.time()))
                 except (socket.timeout, TimeoutError, BridgeErr):
                     return
                 try:
@@ -5861,11 +5880,8 @@ def idle_pump(st):
                 if sock is None or id(sock) not in ready_ids:
                     continue
                 try:
-                    sock.settimeout(max(0.001, deadline - time.monotonic()))
-                except OSError:
-                    break
-                try:
-                    msg = conn._read_msg()
+                    msg = conn._read_msg(
+                        timeout=max(0.001, deadline - time.monotonic()))
                 except (socket.timeout, TimeoutError):
                     break
                 except BridgeErr as e:
