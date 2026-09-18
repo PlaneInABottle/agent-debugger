@@ -74,6 +74,10 @@ isolated temp HOME; they skip without them. Browser tests need Chrome.
 
 ## Race patterns this codebase has produced
 
+Signature-first recipes (symptom → first evidence → fix class) live in
+[references/ci-flake-playbooks.md](references/ci-flake-playbooks.md);
+the invariants they point at:
+
 - **Selection baseline after the fact.** `cmdStep`/`cmdContinue` must
   capture the freshness baseline *before* sending the request and pass
   it to `pumpForStop(..., base)`; a baseline captured at pump entry can
