@@ -98,6 +98,24 @@ jobs:
           test -d ~/.agent-debugger/adapters/python/venv || { echo "python venv not provisioned"; exit 1; }
           test -d ~/.agent-debugger/adapters/node/node_modules || { echo "node ws not provisioned"; exit 1; }
 
+      - name: Record runner pressure telemetry
+        # Background sampler for the wall-clock-timeout flake family:
+        # correlates failures with host memory/CPU pressure (swap,
+        # iowait, load). Starts before the gates, uploads only on
+        # failure. Zero product impact.
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/pressure"
+          (while true; do
+             echo "=== $(date -u +%FT%TZ) ==="
+             free -m || true
+             echo "--- vmstat ---"
+             vmstat 1 2 | tail -n 2 || true
+             echo "--- load ---"
+             cat /proc/loadavg || true
+             sleep 20
+           done > "${RUNNER_TEMP}/pressure/pressure.log" 2>&1 &)
+
       - name: Canonical live gates
         shell: bash
         run: scripts/run_gates.sh --live
@@ -113,6 +131,7 @@ jobs:
           path: |
             ${{ runner.temp }}/live-failure-bundles/
             /tmp/live-failure-bundles/
+            ${{ runner.temp }}/pressure/
           if-no-files-found: ignore
           retention-days: 7
 

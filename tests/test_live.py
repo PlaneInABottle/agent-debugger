@@ -207,6 +207,11 @@ class LiveTests(LiveHomeMixin, unittest.TestCase):
         type(self).chrome = subprocess.Popen([chrome, "--headless", "--disable-gpu", "--no-first-run",
             f"--remote-debugging-port={cdp_port}", f"--user-data-dir={self.home}/chrome", url],
             stdout=self.log, stderr=self.log)
+        # Release the class-level Chrome at test end (pass or fail), not
+        # at class cleanup: no later test uses it (m2/m3/m2r spawn their
+        # own), and an idle headless Chrome holds hundreds of MB for the
+        # other ~50 tests on the small CI runner (wall-clock flakes).
+        self.addCleanup(self._release_class_chrome)
         deadline = time.monotonic() + 20
         while True:
             try:
@@ -250,6 +255,18 @@ class LiveTests(LiveHomeMixin, unittest.TestCase):
         for session in [name, *specs]:
             self.assertTrue(self.cli(session, "close")["confirmed"])
             self.sessions.remove(session)
+
+    def _release_class_chrome(self):
+        if type(self).chrome is not None:
+            try:
+                type(self).chrome.terminate()
+                type(self).chrome.wait(timeout=10)
+            except Exception:
+                try:
+                    type(self).chrome.kill()
+                except Exception:
+                    pass
+            type(self).chrome = None
 
 
     def test_05_delayed_attach_stays_running(self):
