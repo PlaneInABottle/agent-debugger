@@ -195,6 +195,36 @@ class LiveHomeHelperTests(unittest.TestCase):
             self.assertFalse(
                 (Path(bundle) / "Fake" / "aaa-early").exists())
 
+    def test_dump_union_covers_untracked_sessions(self):
+        # test_live.py never calls track(): names added straight to the
+        # class set must still reach the bundle via the setUp snapshot
+        # diff, unioned with explicit track() hits.
+        from types import SimpleNamespace
+
+        class Fake(_live_home.LiveHomeMixin):
+            pass
+
+        Fake.sessions = {"aaa-old", "zzz-new"}
+        t = Fake()
+        t._live_problems_before = 0
+        t._live_test_sessions = ["mmm-tracked"]
+        t._live_sessions_before = {"aaa-old"}
+        t._outcome = SimpleNamespace(
+            result=SimpleNamespace(failures=[1], errors=[]))
+        seen = []
+        orig = Fake.dump_failure_bundle
+        try:
+            Fake.dump_failure_bundle = classmethod(
+                lambda cls, names=None: seen.append(names))
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                t._live_home_dump_on_failure()
+        finally:
+            Fake.dump_failure_bundle = orig
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(sorted(seen[0]),
+                         ["mmm-tracked", "zzz-new"])
+
     def test_cli_refreshes_bundle_even_on_failure(self):
         # close() deletes the session dir, so only a per-call refresh
         # (finally, including the raising call) preserves forensics.

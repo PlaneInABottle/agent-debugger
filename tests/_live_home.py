@@ -417,6 +417,10 @@ class LiveHomeMixin:
         self._live_problems_before = (
             len(result.failures) + len(result.errors)) if result else 0
         self._live_test_sessions = []
+        try:
+            self._live_sessions_before = set(type(self).sessions)
+        except (AttributeError, TypeError):
+            self._live_sessions_before = set()
         self.addCleanup(self._live_home_dump_on_failure)
 
     def _live_home_dump_on_failure(self):
@@ -428,10 +432,18 @@ class LiveHomeMixin:
             after = len(result.failures) + len(result.errors)
             if after <= getattr(self, "_live_problems_before", 0):
                 return
-            # Prefer this test's own tracked sessions (survives
-            # finally-block removals); fall back to the class set.
-            names = getattr(self, "_live_test_sessions", None) or None
-            type(self).dump_failure_bundle(names)
+            # This test's sessions from both records: explicit track() hits
+            # plus names added straight to the class set (test_live.py
+            # never calls track()). The union covers sessions that never
+            # answered (no per-call refresh ran) as well as closed ones.
+            names = list(getattr(self, "_live_test_sessions", None) or [])
+            try:
+                fresh = set(type(self).sessions) - set(
+                    getattr(self, "_live_sessions_before", set()))
+            except (AttributeError, TypeError):
+                fresh = set()
+            names.extend(sorted(fresh - set(names)))
+            type(self).dump_failure_bundle(names or None)
         except Exception as e:
             print(f"live diagnostics bundle failed: {e}", file=sys.stderr)
 
