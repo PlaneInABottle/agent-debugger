@@ -125,14 +125,38 @@ run_unit() {
   section "javac bridge + checks"
   JTMP=$(mktemp -d)
   trap 'rm -rf "$JTMP"' EXIT
-  # Windows java.exe takes `;` separators (a `:` list is one bad path);
-  # Git Bash would also mangle a literal `:` list for native binaries.
+  # Windows java.exe takes `;` separators (a `:` list is one bad path).
+  # Native java/javac also need real Windows paths: Git Bash arg munging
+  # converts `;`-lists inconsistently (javac wrote where java never reads
+  # -> ClassNotFoundException), so convert once with cygpath (forward
+  # slashes are valid for Java) and switch munging off for these
+  # invocations only (per-command env: never leaks into later gates).
   case "$(uname -s)" in
-    MINGW*|MSYS*|CYGWIN*) CP_SEP=";" ;;
-    *) CP_SEP=":" ;;
+    MINGW*|MSYS*|CYGWIN*)
+      CP_SEP=";"
+      if command -v cygpath >/dev/null 2>&1; then
+        JTMPW="$(cygpath -w "$JTMP" | tr '\\' '/')"
+        NO_CONV="MSYS2_ARG_CONV_EXCL=*"
+      else
+        JTMPW="$JTMP"
+        NO_CONV=""
+      fi
+      ;;
+    *)
+      CP_SEP=":"
+      JTMPW="$JTMP"
+      NO_CONV=""
+      ;;
   esac
-  javac -d "$JTMP/classes" bridge/java/src/*.java || fail "javac bridge"
-  javac -cp "$JTMP/classes" -d "$JTMP/checks" \
+  if [ -n "$NO_CONV" ]; then
+    JPFX="env $NO_CONV"
+  else
+    JPFX=""
+  fi
+  # shellcheck disable=SC2086 # intentional splitting: optional env prefix or nothing
+  $JPFX javac -d "$JTMPW/classes" bridge/java/src/*.java || fail "javac bridge"
+  # shellcheck disable=SC2086 # intentional splitting: optional env prefix or nothing
+  $JPFX javac -cp "$JTMPW/classes" -d "$JTMPW/checks" \
     tests/BJavaCheck.java tests/CJavaCheck.java \
     tests/M4JavaCheck.java tests/M5JavaCheck.java \
     tests/M6JavaCheck.java tests/M7JavaCheck.java \
@@ -145,7 +169,8 @@ run_unit() {
   # ok-lines and System.exit(1) on any failure), so the gate just runs
   # every check class against the freshly compiled bridge above.
   for c in BJavaCheck CJavaCheck M4JavaCheck M5JavaCheck M6JavaCheck M7JavaCheck SaturationJavaCheck FramingJavaCheck StrictJavaCheck; do
-    java -cp "$JTMP/classes${CP_SEP}$JTMP/checks" "$c" || fail "java $c"
+    # shellcheck disable=SC2086 # intentional splitting: optional env prefix or nothing
+    $JPFX java -cp "$JTMPW/classes${CP_SEP}$JTMPW/checks" "$c" || fail "java $c"
   done
   rm -rf "$JTMP"
   trap - EXIT
