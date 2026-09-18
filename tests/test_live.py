@@ -158,7 +158,9 @@ class LiveTests(LiveHomeMixin, unittest.TestCase):
         with concurrent.futures.ThreadPoolExecutor() as pool:
             start = pool.submit(self.cli, name, "py", "start", str(path), "--break", f"{path}:7")
             gate.touch()
-            self.assertEqual(start.result(timeout=30)["location"]["line"], 7)
+            # Future patience must outlast the CLI's own bound (45s): a
+            # 30s wait cut off a start still being served under load.
+            self.assertEqual(start.result(timeout=50)["location"]["line"], 7)
         self.assertIn("timeout", self.cli(name, "continue", "--timeout", "1", ok=False)["error"])
         self.assertIn("timeout", self.cli(name, "continue", "--timeout", "1", ok=False)["error"])
         gate.touch()
