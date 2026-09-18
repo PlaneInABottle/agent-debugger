@@ -46,6 +46,22 @@ is intact.
 3. Recurring with clean pressure data: treat as a product timing bug and
    instrument the wait path (trace + watchdog) before touching code.
 
+## "wait ok:true but dt >= the whole budget" (Java pre-lock park)
+
+Symptom: `wait` returns the correct stop but the client measured the
+full `--timeout` (e.g. `15.023 not less than 15`), repeatedly — not a
+one-off spike.
+
+1. This is NOT pressure: pressure delays the event, it does not park
+   early and wake at deadline. A full-budget ok:true means the pump sat
+   on an empty queue while the park was already committed — look for a
+   park landing between the accept-time check and the pump's lock
+   acquisition (the idle pump serving the gap is the classic source).
+2. Fix: re-check for the committed park immediately after acquiring the
+   pump lock (Java `awaitStopInner` post-`pumpLock` `parkedRecheck`,
+   non-idle only); whoever holds the only pump lock sees only newer
+   parks.
+
 ## Windows-only unit failures
 
 Symptom: Linux/macOS green, `Test (windows-latest)` red.

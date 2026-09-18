@@ -90,6 +90,14 @@ the invariants they point at:
   deadline while a bounded reader waits on the lock, stalling the accept
   loop (symptom: every CLI call reads `timed out waiting for debug
   session` while the bridge is alive).
+- **Wait pump blind to a pre-lock park (Java).** A park committed between
+  the accept-time suspended check and the pump's lock acquisition strands
+  the pump on a suspended VM's empty queue until deadline, when the
+  deadline `parkedRecheck` returns the same park at full budget (symptom:
+  `wait` ok:true but client-measured dt >= the whole `--timeout`, twice
+  in a row). Fix: `parkedRecheck` immediately after `pumpLock` acquisition
+  (non-idle only); only pumps park and the lock is held, so anything
+  visible is newer than the check.
 - **Park visibility vs enrichment.** Worker park + selection clock
   (`stopSeq`) go live synchronously before any `trackChanges`/
   `fireLogpoint` await, so `resolveTarget`/pump see the stop immediately.

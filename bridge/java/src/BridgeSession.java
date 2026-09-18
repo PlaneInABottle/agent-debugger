@@ -351,6 +351,18 @@ class BridgeSession {
         // hold sessionLock, so live reads stay prompt.
         if (!idle) st.pumpLock.lock();
         try {
+        // Race close (live test_34 dt>=budget signature): a park committed
+        // between the accept-time suspended check and this pump's lock
+        // acquisition (e.g. the idle pump serving the gap) would otherwise
+        // strand us on the empty queue of a suspended VM until deadline,
+        // when parkedRecheck returns the same park at full budget. Only
+        // pumps park and we hold the only pump lock, so any park visible
+        // here is newer than the check — serve it at once. Idle never
+        // takes this path (mirrors the deadline guard below).
+        if (!idle) {
+            String early = parkedRecheck(st);
+            if (early != null) return early;
+        }
         long deadline = System.nanoTime() + timeoutMs * 1_000_000;
         while (true) {
             // Same abandonment guard as serveLoop (1s event windows bound it).

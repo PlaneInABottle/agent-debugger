@@ -72,8 +72,13 @@ LIVE_RETRY=0 python3 tests/run_live.py               # disable retry-once
    (`DapConn._read_msg(timeout=...)`); never arm a shared socket outside it.
 3. Worker park + selection clock (`stopSeq`) go live synchronously, before
    enrichment awaits.
-4. Close uses FIN (`conn.end()`), never RST (`destroy()`).
-5. Register both failure paths when changing waits: a timeout must clear the
+4. A wait pump re-checks for an already-committed park AFTER acquiring the
+   pump lock (`parkedRecheck` post-lock in `awaitStopInner`): a park that
+   lands between the accept-time check and lock acquisition would
+   otherwise strand the pump on a suspended VM's empty queue until
+   deadline, returning the same park at full budget.
+5. Close uses FIN (`conn.end()`), never RST (`destroy()`).
+6. Register both failure paths when changing waits: a timeout must clear the
    step flag but never disarm a concurrent fresh park.
 
 ## Boundaries
