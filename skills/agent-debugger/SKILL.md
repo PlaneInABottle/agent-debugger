@@ -1,3 +1,8 @@
+---
+name: agent-debugger
+description: Debug live Java, Python, or Node processes headlessly with the agent-debugger CLI. Use when attaching to or starting a target, arming breaks, logpoints, watches or exits, waiting for stops, inspecting frames, locals and changed values, evaluating expressions, or closing sessions. Not for maintaining the CLI itself (use the agent-debugger-maintainer skill).
+---
+
 # Skill: agent-debugger
 
 Debug live Java, Python AND Node processes without touching code: no
