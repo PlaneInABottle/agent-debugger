@@ -2375,6 +2375,14 @@ class Session {
       if (p.reason === 'exception') {
         w.stopInfo = this.excInfo(p.data);
         w.paused = { frames, stopInfo: w.stopInfo };
+        // Park + selection clock go live synchronously (before any await):
+        // pump and resolveTarget must observe a selectable park the moment
+        // it exists. Otherwise a start `context` landing mid-park resolves
+        // to main (worker stopSeq still 0) and fails 'no stopped thread'
+        // while the worker is parked.
+        w.state = 'stopped';
+        this.stopSeq += 1;
+        w.stopSeq = this.stopSeq;
         try {
           for (const id of logHits) {
             await this.fireLogpoint(id, frames);
@@ -2386,9 +2394,6 @@ class Session {
           this.degradeTrack((e && e.constructor && e.constructor.name) || 'Error', null, frames);
         }
         restoreTrack();
-        w.state = 'stopped';
-        this.stopSeq += 1;
-        w.stopSeq = this.stopSeq;
         w.lastStop = this.workerLastStop(w);
         this.lastParkTarget = w.id;
         this.notePark(w.id, p, w.lastStop);
@@ -2398,6 +2403,11 @@ class Session {
         w.awaitingStep = false;
         w.stopInfo = null;
         w.paused = { frames, stopInfo: null };
+        // Park + selection clock go live synchronously (before any await):
+        // see the exception branch above.
+        w.state = 'stopped';
+        this.stopSeq += 1;
+        w.stopSeq = this.stopSeq;
         try {
           for (const id of logHits) {
             await this.fireLogpoint(id, frames);
@@ -2409,9 +2419,6 @@ class Session {
           this.degradeTrack((e && e.constructor && e.constructor.name) || 'Error', null, frames);
         }
         restoreTrack();
-        w.state = 'stopped';
-        this.stopSeq += 1;
-        w.stopSeq = this.stopSeq;
         w.lastStop = this.workerLastStop(w);
         this.lastParkTarget = w.id;
         this.notePark(w.id, p, w.lastStop);

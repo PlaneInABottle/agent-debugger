@@ -2477,20 +2477,37 @@ class TargetIdentityTests(unittest.TestCase):
         self.assertEqual(det["confidence"], "os-corroborated")
         self.assertNotIn("environ", json.dumps(det))
 
-    def test_windows_os_helpers_degrade_gracefully_off_windows(self):
+    @unittest.skipIf(os.name == "nt",
+                     "needs a non-Windows host (no windll/tasklist)")
+    def test_windows_os_helpers_return_none_off_windows(self):
         # No windll/tasklist here: both helpers must return None, never
         # raise, so non-Windows behavior is byte-identical to before.
         self.assertIsNone(bridge._windows_process_argv(os.getpid()))
         self.assertIsNone(bridge._windows_process_image(os.getpid()))
         self.assertIsNone(bridge._windows_process_argv(999999999))
 
+    @unittest.skipUnless(os.name == "nt",
+                         "needs real Windows (tasklist/ctypes)")
+    def test_windows_os_helpers_work_on_windows(self):
+        # Permissive by design (CI-only): helpers must never raise and
+        # must return a sane shape; a live own-pid may corroborate.
+        argv = bridge._windows_process_argv(os.getpid())
+        self.assertTrue(argv is None or (isinstance(argv, list) and argv))
+        self.assertIsNone(bridge._windows_process_argv(999999999))
+        img = bridge._windows_process_image(os.getpid())
+        self.assertTrue(img is None or isinstance(img, str))
+        self.assertIsNone(bridge._windows_process_image(999999999))
+
     def test_debuggee_os_windows_fallback_wiring(self):
         from unittest.mock import patch
         st = self.session()
-        # No /proc here and ps is forced to fail: the nt branch alone
-        # must corroborate.
+        # No /proc (forced: ubuntu CI has one and would short-circuit)
+        # and ps forced to fail: the nt branch alone must corroborate,
+        # deterministically on every platform.
+        no_proc = OSError("no proc here")
         no_ps = OSError("no ps on windows")
         with patch.object(os, "name", "nt"), \
+                patch("builtins.open", side_effect=no_proc), \
                 patch.object(bridge.subprocess, "run",
                              side_effect=no_ps), \
                 patch.object(bridge, "_windows_process_argv",
@@ -2506,6 +2523,9 @@ class TargetIdentityTests(unittest.TestCase):
         self.assertNotIn("environ", json.dumps(det))
         # Dead pid on Windows stays None (liveness check intact).
         with patch.object(os, "name", "nt"), \
+                patch("builtins.open", side_effect=no_proc), \
+                patch.object(bridge.subprocess, "run",
+                             side_effect=no_ps), \
                 patch.object(bridge, "_windows_process_argv",
                              return_value=None), \
                 patch.object(bridge, "_windows_process_image",

@@ -235,6 +235,35 @@ test('m5 node: unstopped context names parked workers (vanish diagnosis)', async
     /no stopped thread.*no worker parked/);
 });
 
+test('m5 node: worker park is selectable before enrichment awaits finish', async () => {
+  // Regression (live test_30/m5_node on loaded CI): onWorkerPaused set
+  // w.paused first and bumped the selection clock only after the
+  // fireLogpoint/trackChanges awaits. A start `context` landing in that
+  // window resolved to main (worker stopSeq still 0) and failed with
+  // 'no stopped thread' while worker:1 was parked. Park + clock must go
+  // live synchronously: hold enrichment behind a gate and assert the
+  // worker is already the resolveTarget pick before the gate opens.
+  const dir = tmpdir('m5-node-parksync-');
+  const st = nodeSession(dir);
+  st.paused = null;
+  const w = addWorker(st, 's1');
+  let openGate;
+  const gate = new Promise((resolve) => { openGate = resolve; });
+  st.trackChanges = () => gate;
+  const p = {
+    reason: 'other', hitBreakpoints: ['bp1'], data: null,
+    callFrames: [workerFrame()],
+  };
+  const pending = st.onWorkerPaused(w, p);
+  assert.ok(w.paused, 'park is live before enrichment runs');
+  assert.ok(w.stopSeq > 0, 'selection clock bumped before enrichment runs');
+  assert.equal(st.resolveTarget({}), w.id);
+  openGate();
+  await pending;
+  assert.equal(st.resolveTarget({}), w.id);
+  assert.equal(w.state, 'stopped');
+});
+
 test('m5 node: close is accepted despite an outstanding resume', async () => {
   const dir = tmpdir('m5-node-close-');
   const st = nodeSession(dir);
