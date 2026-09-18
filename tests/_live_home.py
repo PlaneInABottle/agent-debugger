@@ -376,7 +376,9 @@ class LiveHomeMixin:
     def _copy_session_artifacts(cls, sdir, bdir):
         """Copy the small text artifacts session dir -> bundle dir
         (atomic renames; bones: bridge.log/session.json/error.json/
-        stops.json, each capped). Never raises."""
+        stops.json, each capped). Never raises. Concurrent refreshes
+        (m5 thread-pooled cli calls) get unique temp names: two writers
+        replacing the same .part raced the rename away."""
         for artifact in ("bridge.log", "session.json",
                          "error.json", "stops.json"):
             try:
@@ -385,9 +387,17 @@ class LiveHomeMixin:
                 continue
             try:
                 bdir.mkdir(parents=True, exist_ok=True)
-                part = bdir / (artifact + ".part")
-                part.write_bytes(data[:262144])
-                os.replace(part, bdir / artifact)
+                fd, part = tempfile.mkstemp(
+                    dir=bdir, prefix=artifact + ".", suffix=".part")
+                try:
+                    with os.fdopen(fd, "wb") as fh:
+                        fh.write(data[:262144])
+                    os.replace(part, bdir / artifact)
+                finally:
+                    try:
+                        os.unlink(part)
+                    except OSError:
+                        pass
             except OSError as e:
                 print(f"live diagnostics: bundle copy failed: {e}",
                       file=sys.stderr)

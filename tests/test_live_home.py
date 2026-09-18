@@ -9,6 +9,7 @@ import io
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -194,6 +195,38 @@ class LiveHomeHelperTests(unittest.TestCase):
                 (Path(bundle) / "Fake" / "zzz-failed" / "bridge.log").exists())
             self.assertFalse(
                 (Path(bundle) / "Fake" / "aaa-early").exists())
+
+    def test_concurrent_bundle_refresh_is_race_free(self):
+        # m5 thread-pooled cli calls refresh one session bundle from
+        # several threads: shared ".part" names raced the rename away
+        # (spurious "bundle copy failed" and a dropped update). Unique
+        # temp names keep the replace atomic per writer.
+        with tempfile.TemporaryDirectory(prefix="live-home-drill-") as tmp:
+            home = Path(tmp)
+            sdir = home / ".agent-debugger" / "sessions" / "s1"
+            sdir.mkdir(parents=True)
+            (sdir / "bridge.log").write_bytes(b"trace:" + b"x" * 1024)
+            bdir = Path(tmp) / "bundles" / "s1"
+            failures = []
+
+            def worker():
+                buf = io.StringIO()
+                with contextlib.redirect_stderr(buf):
+                    _live_home.LiveHomeMixin._copy_session_artifacts(
+                        sdir, bdir)
+                if buf.getvalue():
+                    failures.append(buf.getvalue())
+
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(failures, [])
+            self.assertEqual((bdir / "bridge.log").read_bytes(),
+                             b"trace:" + b"x" * 1024)
+            leftovers = [p for p in bdir.iterdir() if p.suffix == ".part"]
+            self.assertEqual(leftovers, [])
 
     def test_dump_union_covers_untracked_sessions(self):
         # test_live.py never calls track(): names added straight to the
