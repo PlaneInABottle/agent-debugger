@@ -517,11 +517,14 @@ class UxLiveTests(LiveHomeMixin, unittest.TestCase):
         self._wait_http_ok(url, timeout=25)
         # Background capture plants the ephemeral and long-polls for the
         # park. Output discarded: this client is killed below.
-        proc = subprocess.Popen(
-            [str(BIN), "--session", name, "capture", "--break", brk,
-             "--timeout", "30"],
-            env=self.env, cwd=ROOT, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL)
+        def start_capture():
+            return subprocess.Popen(
+                [str(BIN), "--session", name, "capture", "--break", brk,
+                 "--timeout", "30"],
+                env=self.env, cwd=ROOT, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+
+        proc = start_capture()
         try:
             # Causal proof the capture holds the slot (bounded retry: the
             # freshly spawned CLI may need a moment to register
@@ -529,6 +532,10 @@ class UxLiveTests(LiveHomeMixin, unittest.TestCase):
             # never busy).
             deadline = time.monotonic() + 15
             while True:
+                # Grace for a freshly spawned capture to reach the bridge:
+                # a probe's own wait can otherwise take the slot first
+                # (java's wait holds it too), busy-rejecting the capture.
+                time.sleep(0.25)
                 rival = self.cli(name, "wait", "--timeout", "2", timeout=15,
                                  ok=False)
                 err = rival.get("error", "")
@@ -537,6 +544,11 @@ class UxLiveTests(LiveHomeMixin, unittest.TestCase):
                 self.assertIn(
                     "timeout", err,
                     f"rival must be busy or free, never parked: {rival}")
+                if proc.poll() is not None:
+                    # Lost the connect race and exited on the busy
+                    # rejection: restart it. A genuinely broken capture
+                    # keeps dying and still hits the deadline below.
+                    proc = start_capture()
                 if time.monotonic() > deadline:
                     self.fail(f"{lang} capture never held the slot: {err}")
                 # else: slot not yet registered — retry (bounded above)
