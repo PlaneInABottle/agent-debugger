@@ -11,7 +11,7 @@ remains world-class quality/stability first, features second.
 Canonical live contract: `docs/current-contract.md` (schema v2).
 Change record: `docs/schema-v2-cleanup.md`.
 History (do not implement from): `docs/debugger-feature-roadmap.md` (ARCHIVED).
-Package version: `0.2.0` (`Cargo.toml`); every sidecar carries `schemaVersion: 2`.
+Package version: `0.2.1` (`Cargo.toml`); every sidecar carries `schemaVersion: 2`.
 
 Rule for this file: references are durable **symbol/file** names, never exact
 line numbers (line numbers drift; symbols are grep-stable).

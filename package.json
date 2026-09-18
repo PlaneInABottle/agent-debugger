@@ -1,6 +1,6 @@
 {
   "name": "@planeinabottle/agent-debugger",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Headless, snapshot-first multi-language debugger for AI agents and terminal workflows",
   "bin": {
     "agent-debugger": "./bin/agent-debugger.js"

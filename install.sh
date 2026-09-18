@@ -4,13 +4,13 @@
 #   curl -fsSL https://raw.githubusercontent.com/PlaneInABottle/agent-debugger/master/install.sh | sh
 #
 # Environment variables:
-#   VERSION      - Specific version tag to install (e.g. v0.2.0, default: latest)
+#   VERSION      - Specific version tag to install (e.g. v0.2.1, default: latest)
 #   INSTALL_DIR  - Directory to place binary (default: ~/.local/bin or /usr/local/bin)
 
 set -eu
 
 REPO="PlaneInABottle/agent-debugger"
-DEFAULT_VERSION="v0.2.0"
+DEFAULT_VERSION="v0.2.1"
 
 log_info() {
   printf "\033[34m[agent-debugger]\033[0m %s\n" "$1"

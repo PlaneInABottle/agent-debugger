@@ -1,6 +1,6 @@
 [package]
 name = "agent-debugger"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 # MSRV floor: std File::try_lock / TryLockError stabilized in 1.89.
 # Enforced by the CI msrv job (dtolnay/rust-toolchain@1.89, cargo test).
