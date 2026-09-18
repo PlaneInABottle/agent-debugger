@@ -24,6 +24,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import shutil
 from pathlib import Path
@@ -287,6 +288,11 @@ class LiveHomeMixin:
     """Isolated-HOME setup/cleanup + failure bundle. Mix into the live
     TestCase; call setup_home() from setUpClass, then build fixtures."""
 
+    # Bundle refreshes run concurrently (m5 thread-pooled cli calls):
+    # serialize copies in-process. Two writers replacing one target raced
+    # the rename on POSIX and returned WinError 5 on Windows.
+    _bundle_copy_lock = threading.Lock()
+
     @classmethod
     def _mod(cls):
         return sys.modules[cls.__module__]
@@ -377,30 +383,32 @@ class LiveHomeMixin:
         """Copy the small text artifacts session dir -> bundle dir
         (atomic renames; bones: bridge.log/session.json/error.json/
         stops.json, each capped). Never raises. Concurrent refreshes
-        (m5 thread-pooled cli calls) get unique temp names: two writers
-        replacing the same .part raced the rename away."""
-        for artifact in ("bridge.log", "session.json",
-                         "error.json", "stops.json"):
-            try:
-                data = (sdir / artifact).read_bytes()
-            except OSError:
-                continue
-            try:
-                bdir.mkdir(parents=True, exist_ok=True)
-                fd, part = tempfile.mkstemp(
-                    dir=bdir, prefix=artifact + ".", suffix=".part")
+        serialize on the class lock, and each writer's temp file gets a
+        unique name: shared '.part' names raced the rename away on POSIX
+        and concurrent replaces hit WinError 5 on Windows."""
+        with cls._bundle_copy_lock:
+            for artifact in ("bridge.log", "session.json",
+                             "error.json", "stops.json"):
                 try:
-                    with os.fdopen(fd, "wb") as fh:
-                        fh.write(data[:262144])
-                    os.replace(part, bdir / artifact)
-                finally:
+                    data = (sdir / artifact).read_bytes()
+                except OSError:
+                    continue
+                try:
+                    bdir.mkdir(parents=True, exist_ok=True)
+                    fd, part = tempfile.mkstemp(
+                        dir=bdir, prefix=artifact + ".", suffix=".part")
                     try:
-                        os.unlink(part)
-                    except OSError:
-                        pass
-            except OSError as e:
-                print(f"live diagnostics: bundle copy failed: {e}",
-                      file=sys.stderr)
+                        with os.fdopen(fd, "wb") as fh:
+                            fh.write(data[:262144])
+                        os.replace(part, bdir / artifact)
+                    finally:
+                        try:
+                            os.unlink(part)
+                        except OSError:
+                            pass
+                except OSError as e:
+                    print(f"live diagnostics: bundle copy failed: {e}",
+                          file=sys.stderr)
 
     @classmethod
     def _refresh_live_bundle(cls, name):
