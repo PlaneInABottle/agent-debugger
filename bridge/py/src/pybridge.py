@@ -6050,6 +6050,10 @@ def _stall_end(st, token):
     try:
         with st._stall_lock:
             st._stall_handlers.pop(token, None)
+            # Drop the one-shot key too: CPython reuses id()s after gc,
+            # so a stale key could suppress a future dump, and the set
+            # would otherwise grow one entry per served command.
+            st._stall_dumped.discard(("handler", id(token)))
     except Exception:
         pass
 

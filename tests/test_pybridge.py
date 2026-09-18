@@ -2804,6 +2804,27 @@ class TargetIdentityTests(unittest.TestCase):
         self.assertEqual(bridge._stall_threshold_for(SimpleNamespace()),
                          bridge.STALL_DUMP_S)
 
+    def test_stall_end_releases_the_oneshot_key(self):
+        # _stall_dumped must not retain per-handler keys: CPython reuses
+        # id()s after gc (a stale key would suppress a future dump) and
+        # the set would otherwise grow one entry per served command.
+        st = self.session()
+        t0 = time.monotonic()
+        st._accept_beat = t0 + 10000  # keep the accept side quiet
+        token = bridge._stall_begin(st, "handler")
+        self.assertEqual(len(bridge._stall_check(st, now=t0 + 20)), 1)
+        with st._stall_lock:
+            self.assertEqual(len(st._stall_dumped), 1)
+        bridge._stall_end(st, token)
+        with st._stall_lock:
+            self.assertEqual(st._stall_handlers, {})
+            self.assertEqual(st._stall_dumped, set())
+        # A later handler reusing the token id still reports.
+        token2 = bridge._stall_begin(st, "handler")
+        out = bridge._stall_check(st, now=time.monotonic() + 20)
+        self.assertEqual(len(out), 1)
+        bridge._stall_end(st, token2)
+
 
 if __name__ == "__main__":
     unittest.main()
