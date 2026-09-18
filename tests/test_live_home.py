@@ -195,6 +195,42 @@ class LiveHomeHelperTests(unittest.TestCase):
             self.assertFalse(
                 (Path(bundle) / "Fake" / "aaa-early").exists())
 
+    def test_cli_refreshes_bundle_even_on_failure(self):
+        # close() deletes the session dir, so only a per-call refresh
+        # (finally, including the raising call) preserves forensics.
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory(prefix="live-home-drill-") as tmp:
+            home = Path(tmp)
+            sdir = home / ".agent-debugger" / "sessions" / "s1"
+            sdir.mkdir(parents=True)
+            (sdir / "bridge.log").write_bytes(b"trace: worker:1 parked\n")
+
+            class Fake(_live_home.LiveHomeMixin):
+                pass
+
+            Fake.home = home
+            Fake.env = dict(os.environ)
+            Fake._mod = classmethod(
+                lambda cls: SimpleNamespace(BIN="true", ROOT=tmp))
+            bundle = str(Path(tmp) / "bundles")
+            old = os.environ.get("LIVE_BUNDLE_DIR")
+            os.environ["LIVE_BUNDLE_DIR"] = bundle
+            boom = SimpleNamespace(returncode=1, stdout='{"ok": false}',
+                                   stderr='x')
+            try:
+                with mock.patch.object(_live_home.subprocess, "run",
+                                       return_value=boom):
+                    with self.assertRaises(AssertionError):
+                        Fake.cli("s1", "step", "over")
+            finally:
+                if old is None:
+                    del os.environ["LIVE_BUNDLE_DIR"]
+                else:
+                    os.environ["LIVE_BUNDLE_DIR"] = old
+            self.assertEqual(
+                (Path(bundle) / "Fake" / "s1" / "bridge.log").read_bytes(),
+                b"trace: worker:1 parked\n")
+
     def test_setup_home_copies_dependency_dirs_without_symlinks(self):
         # Regression for M3's symlink refusal: setup_home must provide real
         # adapter/dependency directories while retaining the existing

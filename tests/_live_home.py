@@ -343,14 +343,61 @@ class LiveHomeMixin:
     @classmethod
     def cli(cls, name, *args, timeout=30, ok=True, env=None, cwd=None):
         mod = cls._mod()
-        result = subprocess.run(
-            [str(mod.BIN), "--session", name, *args],
-            env=env or cls.env, cwd=cwd or mod.ROOT,
-            capture_output=True, text=True, timeout=timeout)
-        data = json.loads(result.stdout)
-        if ok and (result.returncode or not data.get("ok")):
-            raise AssertionError(f"{name} {args}: {data}, stderr={result.stderr}")
-        return data.get("data", data)
+        try:
+            result = subprocess.run(
+                [str(mod.BIN), "--session", name, *args],
+                env=env or cls.env, cwd=cwd or mod.ROOT,
+                capture_output=True, text=True, timeout=timeout)
+            data = json.loads(result.stdout)
+            if ok and (result.returncode or not data.get("ok")):
+                raise AssertionError(f"{name} {args}: {data}, stderr={result.stderr}")
+            return data.get("data", data)
+        finally:
+            # Bundle the session's small artifacts after every call
+            # (including the failing one): close deletes the session dir,
+            # so a post-hoc copy at cleanup finds nothing. Best effort,
+            # never breaks the call.
+            try:
+                cls._refresh_live_bundle(name)
+            except Exception:
+                pass
+
+    @classmethod
+    def _bundle_root(cls):
+        return Path(os.environ.get(
+            "LIVE_BUNDLE_DIR",
+            str(Path(tempfile.gettempdir()) / "live-failure-bundles")))
+
+    @classmethod
+    def _copy_session_artifacts(cls, sdir, bdir):
+        """Copy the small text artifacts session dir -> bundle dir
+        (atomic renames; bones: bridge.log/session.json/error.json/
+        stops.json, each capped). Never raises."""
+        for artifact in ("bridge.log", "session.json",
+                         "error.json", "stops.json"):
+            try:
+                data = (sdir / artifact).read_bytes()
+            except OSError:
+                continue
+            try:
+                bdir.mkdir(parents=True, exist_ok=True)
+                part = bdir / (artifact + ".part")
+                part.write_bytes(data[:262144])
+                os.replace(part, bdir / artifact)
+            except OSError as e:
+                print(f"live diagnostics: bundle copy failed: {e}",
+                      file=sys.stderr)
+
+    @classmethod
+    def _refresh_live_bundle(cls, name):
+        home = getattr(cls, "home", None)
+        if home is None:
+            return
+        sdir = Path(home) / ".agent-debugger" / "sessions" / name
+        if not sdir.is_dir():
+            return
+        cls._copy_session_artifacts(
+            sdir, cls._bundle_root() / cls.__name__ / name)
 
     def track(self, name):
         self.sessions.add(name)
@@ -405,9 +452,7 @@ class LiveHomeMixin:
             if not names:
                 print("live diagnostics: no tracked sessions", file=sys.stderr)
                 return
-            bundle_root = Path(os.environ.get(
-                "LIVE_BUNDLE_DIR",
-                str(Path(tempfile.gettempdir()) / "live-failure-bundles")))
+            bundle_root = cls._bundle_root()
             tag = cls.__name__
             for name in names:
                 sdir = sessions_root / name
@@ -418,18 +463,9 @@ class LiveHomeMixin:
                                  "error.json", "stops.json"):
                     print(f"live diagnostics: {name}/{artifact}: "
                           f"{sdir / artifact}", file=sys.stderr)
-                    try:
-                        data = (sdir / artifact).read_bytes()
-                    except OSError:
-                        continue
-                    try:
-                        bdir.mkdir(parents=True, exist_ok=True)
-                        # Cap single artifacts: logs stay small (stderr
-                        # only), but never let a bundle fill a disk.
-                        (bdir / artifact).write_bytes(data[:262144])
-                    except OSError as e:
-                        print(f"live diagnostics: bundle copy failed: {e}",
-                              file=sys.stderr)
+                # Same copy as the per-call refresh (covers sessions whose
+                # dir is already gone: copies silently skip the missing).
+                cls._copy_session_artifacts(sdir, bdir)
                 log = sdir / "bridge.log"
                 try:
                     lines = log.read_text(errors="replace").splitlines()[-30:]
