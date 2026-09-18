@@ -41,7 +41,7 @@ LIVE_RETRY=0 python3 tests/run_live.py              # disable retry-once when is
 ```
 
 Local live tests copy the real HOME's provisioned adapter deps
-(`~/.agent-debugger/adapters/{python,venv,node/node_modules}`) into an
+(`~/.agent-debugger/adapters/python/venv`, `~/.agent-debugger/adapters/node/node_modules`) into an
 isolated temp HOME; they skip without them. Browser tests need Chrome.
 
 ## Flake triage loop

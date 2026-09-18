@@ -13,6 +13,8 @@ This file is the operating contract for working IN this repository.
 - `src/` — Rust CLI: session lifecycle, TCP client, spawn, locks, attach probes.
 - `bridge/node/src/nodebridge.js`, `bridge/py/src/pybridge.py`,
   `bridge/java/`, `bridge/browser/src/browserbridge.js` — the bridges.
+  `bridge/js/` holds the shared Node-side framing/connection helpers
+  (`framing.js`, `cdp_conn.js`) the Node and browser bridges require.
 - `tests/` — unit suites (`tests/*.py`, `tests/*.test.js`) and live suites
   (`test_live.py`, `test_m5_live.py`, `test_ux_live.py`) sharing the harness
   `tests/_live_home.py`.

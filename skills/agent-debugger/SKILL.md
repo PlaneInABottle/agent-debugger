@@ -131,10 +131,8 @@ iterations cost zero LLM roundtrips.
   (Java: 50 refs/node, depth ≤ 4. Python: direct holders only, depth 1.
   Node: unsupported — no gc walk via CDP). Heap references only — a purely
   stack-held object honestly reports 0 referrers.
-- After `step`/`continue`, read `changed[]` first — inspect only those.
-  Empty `changed` with `changedComplete=false` is UNKNOWN (truncated or
-  degraded tracking — see `changeTracking.reason`), not "no change";
-  `removed[]` names dropped locals on complete scans only.
+- After `step`/`continue`, read `changed[]` first — see Token Rules below
+  for the complete/unknown semantics.
 - Every stop carries `stopInfo` when the cause isn't a plain breakpoint:
   `watch`/`exit` (Java: field/access/value, method/returns), `exception`
   (all three: class). Read it before the frames — it names the event.
