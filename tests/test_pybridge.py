@@ -2702,6 +2702,58 @@ class TargetIdentityTests(unittest.TestCase):
         bridge.write_parse_error(
             ["session", "--dir", "/definitely/not/a/real/dir/xyz"], "x")
 
+    def test_stall_check_reports_each_key_once(self):
+        st = self.session()
+        t0 = time.monotonic()
+        st._accept_beat = t0
+        token = bridge._stall_begin(st, "handler")
+        bridge._stall_label(st, token, "cmd=threads")
+        # Fresh loop, below-threshold handler: quiet.
+        self.assertEqual(bridge._stall_check(st, now=t0 + 5), [])
+        # Both the in-flight handler and the accept loop crossed: each
+        # reports exactly once, labeled with the command.
+        out = bridge._stall_check(st, now=t0 + 20)
+        self.assertEqual(len(out), 2)
+        self.assertTrue(any("cmd=threads" in r for r in out))
+        self.assertTrue(any("accept loop idle" in r for r in out))
+        self.assertEqual(bridge._stall_check(st, now=t0 + 40), [])
+        bridge._stall_end(st, token)
+        with st._stall_lock:
+            self.assertEqual(st._stall_handlers, {})
+
+    def test_stall_threshold_rides_the_command_budget(self):
+        # A continue/wait handler legitimately holds its connection for
+        # its own --timeout; only a run past budget + margin is a stall.
+        self.assertEqual(bridge._stall_threshold_for({"cmd": "threads"}),
+                         bridge.STALL_DUMP_S)
+        self.assertEqual(bridge._stall_threshold_for(
+            {"cmd": "continue", "timeout": 40}), 50.0)
+        self.assertEqual(bridge._stall_threshold_for(
+            {"cmd": "wait", "timeout": "25"}), 35.0)
+        # Missing/garbage budget falls back to the session default window.
+        self.assertEqual(bridge._stall_threshold_for({"cmd": "capture"}),
+                         70.0)
+        self.assertEqual(bridge._stall_threshold_for(
+            {"cmd": "continue", "timeout": "soon"}), 70.0)
+        st = self.session()
+        t0 = time.monotonic()
+        st._accept_beat = t0 + 10000  # keep the accept side quiet
+        token = bridge._stall_begin(st, "handler", threshold=100.0)
+        self.assertEqual(bridge._stall_check(st, now=t0 + 20), [])
+        self.assertEqual(len(bridge._stall_check(st, now=t0 + 120)), 1)
+        bridge._stall_end(st, token)
+
+    def test_stall_helpers_survive_broken_state(self):
+        # Belt-and-braces: a debilitated session object must never turn
+        # forensics into a serving failure.
+        broken = SimpleNamespace()
+        token = bridge._stall_begin(broken, "handler")
+        self.assertIsNone(token)
+        bridge._stall_label(broken, token, "cmd=x")
+        bridge._stall_end(broken, token)
+        self.assertEqual(bridge._stall_threshold_for(SimpleNamespace()),
+                         bridge.STALL_DUMP_S)
+
 
 if __name__ == "__main__":
     unittest.main()

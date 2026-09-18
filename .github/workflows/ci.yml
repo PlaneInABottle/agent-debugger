@@ -98,11 +98,11 @@ jobs:
           test -d ~/.agent-debugger/adapters/python/venv || { echo "python venv not provisioned"; exit 1; }
           test -d ~/.agent-debugger/adapters/node/node_modules || { echo "node ws not provisioned"; exit 1; }
 
-      - name: Record runner pressure telemetry
-        # Background sampler for the wall-clock-timeout flake family:
-        # correlates failures with host memory/CPU pressure (swap,
-        # iowait, load). Starts before the gates, uploads only on
-        # failure. Zero product impact.
+      - name: Canonical live gates
+        # Pressure sampler rides THIS step's process group (a separate
+        # step's background subshell is reaped when that step ends, which
+        # is why the first placement uploaded nothing): free/vmstat/load
+        # for the wall-clock-timeout family, uploaded on failure.
         shell: bash
         run: |
           mkdir -p "${RUNNER_TEMP}/pressure"
@@ -115,10 +115,7 @@ jobs:
              cat /proc/loadavg || true
              sleep 20
            done > "${RUNNER_TEMP}/pressure/pressure.log" 2>&1 &)
-
-      - name: Canonical live gates
-        shell: bash
-        run: scripts/run_gates.sh --live
+          scripts/run_gates.sh --live
 
       - name: Upload live failure bundles
         # The harness copies bridge.log/session.json/error.json/stops.json

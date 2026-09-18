@@ -20,6 +20,7 @@ frames/locals/changed/stopInfo) so agents see one uniform surface.
 """
 
 import csv
+import faulthandler
 import json
 import math
 import os
@@ -1406,6 +1407,15 @@ class Session:
         # on each DapConn.mu; lock order is always _gate -> mu.
         self._gate = threading.RLock()
         self._outstanding = {}   # tid -> resume cmd (continue/step) in flight
+        # -- bounded stall forensics (stderr only): each CLI handler
+        # registers while in flight and serve() beats every loop; on the
+        # first stall past STALL_DUMP_S a daemon dumps every thread's
+        # Python stack once. bridge.log ships with live failure bundles,
+        # so a hung bridge carries its own evidence.
+        self._stall_lock = threading.Lock()
+        self._stall_handlers = {}  # token -> (label, started_monotonic)
+        self._stall_dumped = set()
+        self._accept_beat = time.monotonic()
         self._park_local = threading.local()  # per-pump parked target id
         # -- stop diagnostics (UX batch): session-monotonic stop id plus the
         # previous park for same-location/same-thread diagnosis. Globals (not
@@ -5967,17 +5977,119 @@ def _handle_overload(st, conn):
         pass
 
 
+# Stall forensics bounds: a CLI handler or the accept loop running/stalled
+# past its threshold triggers ONE stack dump of every thread (stderr ->
+# bridge.log, which ships with the live failure bundles). The poll period
+# only bounds detection latency.
+STALL_DUMP_S = 15.0
+STALL_POLL_S = 5.0
+# Commands whose handler legitimately waits for a target event, with the
+# wait budget riding in the request body: their stall threshold becomes
+# budget + margin (a prompt command keeps STALL_DUMP_S).
+_STALL_WAIT_CMDS = {"continue", "step", "wait", "capture", "reload"}
+
+
+def _stall_threshold_for(req):
+    try:
+        cmd = req.get("cmd")
+    except AttributeError:
+        return STALL_DUMP_S
+    if cmd not in _STALL_WAIT_CMDS:
+        return STALL_DUMP_S
+    try:
+        budget = float(req.get("timeout"))
+    except (TypeError, ValueError):
+        # Body-less wait commands fall back to the session cfg.timeout
+        # server-side; 60s keeps that legitimate window quiet.
+        budget = 60.0
+    return max(STALL_DUMP_S, min(budget, 3600.0) + 10.0)
+
+
+def _stall_begin(st, label, threshold=STALL_DUMP_S):
+    try:
+        token = object()
+        with st._stall_lock:
+            st._stall_handlers[token] = (label, time.monotonic(), threshold)
+        return token
+    except Exception:
+        return None
+
+
+def _stall_label(st, token, label, threshold=None):
+    if token is None:
+        return
+    try:
+        with st._stall_lock:
+            entry = st._stall_handlers.get(token)
+            if entry is not None:
+                st._stall_handlers[token] = (
+                    label, entry[1], entry[2] if threshold is None else threshold)
+    except Exception:
+        pass
+
+
+def _stall_end(st, token):
+    if token is None:
+        return
+    try:
+        with st._stall_lock:
+            st._stall_handlers.pop(token, None)
+    except Exception:
+        pass
+
+
+def _stall_check(st, now=None, threshold=STALL_DUMP_S):
+    """One-shot stall decision (pure lookup + dump bookkeeping): names
+    handlers and the accept loop past their threshold. Each key reports
+    once; the caller logs the reasons and dumps the stacks."""
+    now = time.monotonic() if now is None else now
+    reasons = []
+    with st._stall_lock:
+        for token, (label, started, thresh) in list(st._stall_handlers.items()):
+            key = ("handler", id(token))
+            if now - started > thresh and key not in st._stall_dumped:
+                st._stall_dumped.add(key)
+                reasons.append(f"{label} {now - started:.0f}s")
+        if (now - st._accept_beat > threshold
+                and "accept" not in st._stall_dumped):
+            st._stall_dumped.add("accept")
+            reasons.append(f"accept loop idle {now - st._accept_beat:.0f}s")
+    return reasons
+
+
+def _stall_watch_loop(st):
+    while True:
+        time.sleep(STALL_POLL_S)
+        try:
+            reasons = _stall_check(st)
+            if reasons:
+                sys.stderr.write(
+                    "watchdog: stalled: " + "; ".join(reasons) + "\n")
+                sys.stderr.flush()
+                faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        except Exception:
+            pass
+
+
+def _start_stall_watchdog(st):
+    threading.Thread(target=_stall_watch_loop, args=(st,),
+                     name="stall-watchdog", daemon=True).start()
+
+
 def _handle_one(st, conn):
     """Serve a single CLI connection on a handler thread (M5): exactly one
     request and one response per connection. A client disconnect never
     cancels target-side work — the resume still publishes state; only this
     connection's response is dropped (best-effort write)."""
+    token = _stall_begin(st, "handler")
     try:
         try:
             req = read_frame(conn)
         except BridgeErr as e:
             try_write_frame(conn, {"ok": False, "error": str(e)})
             return
+        _stall_label(st, token, f"cmd={req.get('cmd', '?')}",
+                     threshold=_stall_threshold_for(req))
         err_target = _error_target(st, req)
         try:
             resp = st.dispatch(req)
@@ -6011,6 +6123,7 @@ def _handle_one(st, conn):
             pass
         with st._gate:
             st.server_state.release()
+        _stall_end(st, token)
 
 
 def serve(st, server, nonce):
@@ -6020,11 +6133,14 @@ def serve(st, server, nonce):
     # outstanding: the outstanding resume's pump owns wire consumption, and
     # a second consumer would steal its stop.
     st.server = server
+    st._accept_beat = time.monotonic()
+    _start_stall_watchdog(st)
     try:
         server.settimeout(0.1)
     except OSError:
         pass
     while True:
+        st._accept_beat = time.monotonic()
         # Abandoned (dir rm'd or respawned under our name)? Quit quietly.
         if not am_owner(st.cfg.dir, nonce):
             with st._gate:

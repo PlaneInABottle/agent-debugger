@@ -341,7 +341,11 @@ class LiveHomeMixin:
         cls.tmp.cleanup()
 
     @classmethod
-    def cli(cls, name, *args, timeout=30, ok=True, env=None, cwd=None):
+    def cli(cls, name, *args, timeout=45, ok=True, env=None, cwd=None):
+        # Subprocess bound must outlast the largest bridge budget a test
+        # passes (--timeout 40 starts): a 30s wrapper killed the CLI while
+        # the bridge was still serving the start, surfacing as a harness
+        # TimeoutExpired instead of the real outcome.
         mod = cls._mod()
         try:
             result = subprocess.run(
