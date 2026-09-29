@@ -493,15 +493,11 @@ pub(crate) fn spawn_in(
             return Err(e);
         }
     };
-    // Reap helper: the loop below either forgets the child (session owns
-    // it now) or kills it on failure paths. Option-taking keeps every
-    // path sound across loop iterations (no use-after-forget).
-    let reap = |child: &mut Option<std::process::Child>| {
-        if let Some(mut c) = child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-    };
+    // Detached by design: the short-lived CLI exits, the bridge keeps the
+    // debug session alive (reparented). Failure paths reap via
+    // bridge::reap_child (SIGTERM-first so the bridge's teardown kills a
+    // launched target, tree-kill fallback, then wait) — never a bare
+    // kill(), which would orphan the debuggee.
 
     // Detached by design: the short-lived CLI exits, the bridge keeps the
     // debug session alive (reparented). Never kill on success.
@@ -511,7 +507,7 @@ pub(crate) fn spawn_in(
         // the throw) — the error is the truth, not the stale readiness.
         if dir.join("error.json").exists() {
             let failure = read_bridge_error(&dir);
-            reap(&mut child);
+            bridge::reap_child(&mut child);
             let _ = std::fs::remove_dir_all(&dir);
             // A present-but-corrupt setup error file is an internal error:
             // exact message, never transport-diagnosed.
@@ -586,7 +582,7 @@ pub(crate) fn spawn_in(
                     // (immediate, then a bounded settle at the wait-loop
                     // cadence covering bridge-cleanup lag), never the logs.
                     if let Some(failure) = settle_for_bridge_error(&dir) {
-                        reap(&mut child);
+                        bridge::reap_child(&mut child);
                         let _ = std::fs::remove_dir_all(&dir);
                         if failure.corrupt {
                             anyhow::bail!("{}", failure.message);
@@ -645,7 +641,7 @@ pub(crate) fn spawn_in(
                     // is reusable and no orphan lingers. For attach, the
                     // transport message stays verbatim inside the same
                     // classified envelope (fresh post probe + identities).
-                    reap(&mut child);
+                    bridge::reap_child(&mut child);
                     let _ = std::fs::remove_dir_all(&dir);
                     if let Some((host, port)) = &endpoint {
                         let pre = pre_listener.flatten();
@@ -684,7 +680,7 @@ pub(crate) fn spawn_in(
             anyhow::bail!("bridge exited during setup (code {status}). {log_tail}");
         }
         if Instant::now() > deadline {
-            reap(&mut child);
+            bridge::reap_child(&mut child);
             let log_tail = read_log_tail(&dir);
             let _ = std::fs::remove_dir_all(&dir);
             anyhow::bail!(

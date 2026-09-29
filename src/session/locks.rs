@@ -105,6 +105,25 @@ pub(crate) fn lock_mtime(path: &std::path::Path) -> std::io::Result<Option<std::
     Err(last)
 }
 
+/// Complete a create_new claim: write the record, removing the
+/// just-created file on write failure. No guard owns it yet, so removal
+/// cannot steal a rival's lock (rivals only reclaim stale records, and
+/// this file is seconds old) — but leaving it would block retries for
+/// the full stale bound (300s startup, 2h endpoint) with nobody able to
+/// release it. AlreadyExists never reaches here (open failed first).
+fn write_lock_record(
+    f: &mut std::fs::File,
+    path: &std::path::Path,
+    content: &str,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if let Err(e) = f.write_all(content.as_bytes()) {
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Atomically claim the startup lock (single steal retry for a stale lock).
 /// Live locks (fresh or undatable) bail with a retryable "starting" error.
 pub(crate) fn acquire_startup_lock(path: &std::path::Path) -> anyhow::Result<StartupGuard> {
@@ -115,8 +134,7 @@ pub(crate) fn acquire_startup_lock(path: &std::path::Path) -> anyhow::Result<Sta
         .open(path)
     {
         Ok(mut f) => {
-            use std::io::Write as _;
-            f.write_all(nonce.as_bytes())
+            write_lock_record(&mut f, path, &nonce)
                 .map_err(|e| anyhow::anyhow!("cannot write startup lock: {e}"))?;
             return Ok(StartupGuard {
                 path: path.to_path_buf(),
@@ -193,8 +211,7 @@ pub(crate) fn claim_stale_startup_lock(path: &std::path::Path) -> anyhow::Result
         .map_err(|_| {
             anyhow::anyhow!("session is starting (concurrent start in progress; retry shortly)")
         })?;
-    use std::io::Write as _;
-    f.write_all(nonce.as_bytes())
+    write_lock_record(&mut f, path, &nonce)
         .map_err(|e| anyhow::anyhow!("cannot write startup lock: {e}"))?;
     Ok(StartupGuard {
         path: path.to_path_buf(),
@@ -659,8 +676,7 @@ pub(crate) fn acquire_endpoint_lock(
             .write(true)
             .create_new(true)
             .open(&path)?;
-        use std::io::Write as _;
-        f.write_all(content.as_bytes())
+        write_lock_record(&mut f, &path, &content)
             .map_err(|e| anyhow::anyhow!("cannot write endpoint lock: {e}"))?;
         Ok(EndpointGuard {
             path: path.clone(),
@@ -756,6 +772,24 @@ mod tests {
         // inside this assertion window; the stale tests pair it with old
         // mtimes, and holder_alive runs immediately).
         pid
+    }
+
+    #[test]
+    fn lock_record_write_failure_removes_fragment() {
+        // A read-only handle stands in for a failed write (disk full is
+        // not portable to simulate): the just-created fragment must be
+        // removed, or an unowned lock blocks retries for the full stale
+        // bound with no guard to release it.
+        let dir = tmpdir("lock-fragment");
+        let path = dir.join("frag.lock");
+        std::fs::write(&path, "").unwrap();
+        let mut ro = std::fs::File::open(&path).unwrap();
+        let err = write_lock_record(&mut ro, &path, "nonce").unwrap_err();
+        assert!(
+            !path.exists(),
+            "fragment removed after write failure: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

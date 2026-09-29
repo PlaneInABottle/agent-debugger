@@ -310,9 +310,13 @@ fn ensure_js_shared(dir: &std::path::Path) -> anyhow::Result<bool> {
 
 /// Prepend the isolated `ws` dir to `NODE_PATH` so any user value keeps
 /// working (pure seam of the browser arm in `session::spawn_lifecycle`).
+/// Joined with the platform path-list separator (`;` on Windows, `:` —
+/// a hardcoded `:` builds an invalid NODE_PATH on Windows).
 pub(crate) fn prepend_node_path(ws_dir: &str, existing: Option<&str>) -> String {
     match existing {
-        Some(v) if !v.is_empty() => format!("{ws_dir}:{v}"),
+        Some(v) if !v.is_empty() => std::env::join_paths([ws_dir, v])
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| format!("{ws_dir}:{v}")),
         _ => ws_dir.to_string(),
     }
 }
@@ -374,16 +378,20 @@ fn ensure_compiled_locked() -> anyhow::Result<PathBuf> {
             atomic_write_provisioned(&dest, source)?;
             sources.push(dest);
         }
-        let out = std::process::Command::new("javac")
-            .arg("-d")
-            .arg(&classes)
-            .args(&sources)
-            .output()
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "javac not found or failed to start: {e} (JDK required for the Java adapter)"
-                )
-            })?;
+        let mut javac_args = vec!["-d".to_string(), classes.to_string_lossy().to_string()];
+        javac_args.extend(sources.iter().map(|s| s.to_string_lossy().to_string()));
+        // Bounded like every other provision subprocess: a hung javac must
+        // fail the start, never hang it past the spawn deadline.
+        let out = run_with_timeout(
+            PathBuf::from("javac"),
+            &javac_args,
+            Duration::from_secs(300),
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "javac not found or failed to start: {e} (JDK required for the Java adapter)"
+            )
+        })?;
         if !out.status.success() {
             let log = String::from_utf8_lossy(&out.stderr);
             anyhow::bail!("javac failed:\n{log}");
@@ -397,7 +405,45 @@ pub fn python_dir() -> anyhow::Result<PathBuf> {
 }
 
 fn venv_python() -> anyhow::Result<PathBuf> {
-    Ok(python_dir()?.join("venv").join("bin").join("python"))
+    let venv = python_dir()?.join("venv");
+    // Windows venvs keep the interpreter under Scripts\ (POSIX: bin/).
+    // Probing the wrong layout reads a fresh provision as missing (then
+    // fails reinstalling into it) — or misses a working venv forever.
+    #[cfg(windows)]
+    let interp = venv.join("Scripts").join("python.exe");
+    #[cfg(not(windows))]
+    let interp = venv.join("bin").join("python");
+    Ok(interp)
+}
+
+/// Python launcher candidates in preference order: `python3` (POSIX
+/// norm) then `python` (Windows norm — `python3` is often absent there).
+fn python_launchers() -> [&'static str; 2] {
+    ["python3", "python"]
+}
+
+/// First launcher found on PATH (plus `.exe` on Windows). Pure PATH scan
+/// — no spawn, so unit-testable without a Python.
+fn find_python_launcher() -> Option<&'static str> {
+    find_python_launcher_in(std::env::var_os("PATH"))
+}
+
+fn find_python_launcher_in(path_var: Option<std::ffi::OsString>) -> Option<&'static str> {
+    let path_var = path_var?;
+    for prog in python_launchers() {
+        for dir in std::env::split_paths(&path_var) {
+            #[cfg(windows)]
+            let names = [format!("{prog}.exe"), prog.to_string()];
+            #[cfg(not(windows))]
+            let names = [prog.to_string()];
+            for name in names {
+                if dir.join(name).is_file() {
+                    return Some(prog);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Program + args used to install debugpy into the isolated venv.
@@ -423,11 +469,20 @@ fn debugpy_install_command() -> anyhow::Result<(PathBuf, Vec<String>)> {
 }
 
 fn has_debugpy(interp: &str) -> bool {
-    std::process::Command::new(interp)
-        .args(["-c", "import debugpy"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    has_debugpy_timeout(interp, Duration::from_secs(15))
+}
+
+/// Debugpy probe with a hard bound: a hung interpreter (or a slow
+/// network drive) must degrade to "no debugpy" instead of hanging every
+/// start/doctor invocation behind an unbounded `.output()`.
+fn has_debugpy_timeout(interp: &str, timeout: Duration) -> bool {
+    run_with_timeout(
+        PathBuf::from(interp),
+        &["-c".to_string(), "import debugpy".to_string()],
+        timeout,
+    )
+    .map(|o| o.status.success())
+    .unwrap_or(false)
 }
 
 /// Resolve a Python interpreter with debugpy: isolated venv first (created on
@@ -450,14 +505,16 @@ pub fn ensure_py() -> anyhow::Result<String> {
 }
 
 /// Probe-only fast path (no writes, no lock): venv interpreter, then
-/// system python3 — both with debugpy importable.
+/// system launchers in preference order — both with debugpy importable.
 fn ensure_py_fast() -> anyhow::Result<Option<String>> {
     let venv_str = venv_python()?.to_string_lossy().to_string();
     if has_debugpy(&venv_str) {
         return Ok(Some(venv_str));
     }
-    if has_debugpy("python3") {
-        return Ok(Some("python3".to_string()));
+    for prog in python_launchers() {
+        if has_debugpy(prog) {
+            return Ok(Some(prog.to_string()));
+        }
     }
     Ok(None)
 }
@@ -475,13 +532,25 @@ fn ensure_py_locked() -> anyhow::Result<String> {
     // `venv/` is tool-managed output: guard the dir, not each generated file.
     let venv_dir = python_dir()?.join("venv");
     ensure_provision_dir(&venv_dir)?;
-    let out = std::process::Command::new("python3")
-        .args(["-m", "venv"])
-        .arg(&venv_dir)
-        .output()
-        .map_err(|e| {
-            anyhow::anyhow!("python3 not found ({e}); install Python 3.8+ for the Python adapter")
-        })?;
+    let launcher = find_python_launcher().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no Python launcher found on PATH (tried python3, python); install Python 3.8+ for the Python adapter"
+        )
+    })?;
+    let out = run_with_timeout(
+        PathBuf::from(launcher),
+        &[
+            "-m".to_string(),
+            "venv".to_string(),
+            venv_dir.to_string_lossy().to_string(),
+        ],
+        Duration::from_secs(180),
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "{launcher} -m venv failed to start ({e}); install Python 3.8+ for the Python adapter"
+        )
+    })?;
     if !out.status.success() {
         anyhow::bail!(
             "could not create isolated Python env: {}",
@@ -553,6 +622,90 @@ fn kill_child(pid: u32) {
     }
 }
 
+/// Graceful-first termination for one pid: SIGTERM on unix (`kill`), a
+/// termination request on Windows (`taskkill` without /F). Best effort —
+/// failure-path reap falls back to kill_tree below. Every bridge installs
+/// a SIGTERM teardown (same cleanup() as close: launched target dies,
+/// attach detaches), so TERM lets the debuggee die with the bridge
+/// instead of orphaning under a bare SIGKILL.
+pub(crate) fn terminate_child(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string()])
+            .output();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .output();
+    }
+}
+
+/// Best-effort process-tree kill for one root pid: descendants first,
+/// then the root. Failure-path reap must never orphan a debuggee the
+/// bridge spawned but can no longer clean up itself (hung or
+/// TERM-deaf bridge). Unix walks `pgrep -P` recursively (`pgrep` missing
+/// degrades to root-only kill); Windows uses `taskkill /T /F`.
+pub(crate) fn kill_tree(pid: u32) {
+    #[cfg(not(windows))]
+    {
+        if let Ok(out) = std::process::Command::new("pgrep")
+            .args(["-P", &pid.to_string()])
+            .output()
+        {
+            if out.status.success() {
+                for line in String::from_utf8_lossy(&out.stdout).lines() {
+                    if let Ok(c) = line.trim().parse::<u32>() {
+                        if c != pid {
+                            kill_tree(c);
+                        }
+                    }
+                }
+            }
+        }
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .output();
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output();
+    }
+}
+
+/// Failure-path bridge reap: SIGTERM first so the bridge runs its SIGTERM
+/// teardown (cleanup kills a launched target / detaches — a bare SIGKILL
+/// would orphan the debuggee), bounded 2s grace, then tree-kill fallback
+/// for hung or TERM-deaf bridges, then a blocking wait to release the
+/// zombie. Takes the handle (every path owns across loop iterations, no
+/// use-after-forget).
+pub(crate) fn reap_child(child: &mut Option<std::process::Child>) {
+    let mut c = match child.take() {
+        Some(c) => c,
+        None => return,
+    };
+    terminate_child(c.id());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match c.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => break,
+        }
+    }
+    kill_tree(c.id());
+    let _ = c.wait();
+}
+
 /// Write the embedded pybridge when it changed; return its path.
 /// Single-flights on python.lock (same scope as `ensure_py`).
 pub fn ensure_pybridge() -> anyhow::Result<PathBuf> {
@@ -593,12 +746,15 @@ pub fn node_modules_dir() -> anyhow::Result<PathBuf> {
 /// Resolve the node binary running the bridge (explicit --node reaches the
 /// bridge for the *target*; the bridge itself always runs on PATH node).
 /// Returns "node" when `node --version` succeeds, else a helpful error.
+/// Bounded: a hung node must fail, never hang the start.
 pub fn ensure_node() -> anyhow::Result<String> {
-    let ok = std::process::Command::new("node")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let ok = run_with_timeout(
+        PathBuf::from("node"),
+        &["--version".to_string()],
+        Duration::from_secs(15),
+    )
+    .map(|o| o.status.success())
+    .unwrap_or(false);
     if ok {
         Ok("node".to_string())
     } else {
@@ -1174,14 +1330,32 @@ mod tests {
                 let (program, args) = debugpy_install_command().unwrap();
                 // Program is exactly the venv interpreter, never `<...>/bin/python/bin/pip`.
                 assert_eq!(program, venv_python().unwrap());
-                assert_eq!(program.file_name().and_then(|s| s.to_str()), Some("python"));
-                assert_eq!(
-                    program
-                        .parent()
-                        .and_then(|p| p.file_name())
-                        .and_then(|s| s.to_str()),
-                    Some("bin")
-                );
+                // Windows venvs live under Scripts\python.exe (POSIX: bin/python).
+                #[cfg(windows)]
+                {
+                    assert_eq!(
+                        program.file_name().and_then(|s| s.to_str()),
+                        Some("python.exe")
+                    );
+                    assert_eq!(
+                        program
+                            .parent()
+                            .and_then(|p| p.file_name())
+                            .and_then(|s| s.to_str()),
+                        Some("Scripts")
+                    );
+                }
+                #[cfg(not(windows))]
+                {
+                    assert_eq!(program.file_name().and_then(|s| s.to_str()), Some("python"));
+                    assert_eq!(
+                        program
+                            .parent()
+                            .and_then(|p| p.file_name())
+                            .and_then(|s| s.to_str()),
+                        Some("bin")
+                    );
+                }
                 assert_eq!(args, vec!["-m", "pip", "install", "debugpy==1.8.21"]);
             },
         );
@@ -1198,6 +1372,19 @@ mod tests {
         with_home(
             Some(std::path::Path::new("/tmp/agent-debugger-home-stable")),
             || {
+                // Layout follows the platform venv convention (Scripts on
+                // Windows, bin elsewhere) — probing `bin` on Windows reads
+                // every provision as missing.
+                #[cfg(windows)]
+                assert_eq!(
+                    venv_python().unwrap(),
+                    python_dir()
+                        .unwrap()
+                        .join("venv")
+                        .join("Scripts")
+                        .join("python.exe")
+                );
+                #[cfg(not(windows))]
                 assert_eq!(
                     venv_python().unwrap(),
                     python_dir()
@@ -1217,7 +1404,40 @@ mod tests {
     fn node_path_prepend_preserves_user_value() {
         assert_eq!(prepend_node_path("/ws", None), "/ws");
         assert_eq!(prepend_node_path("/ws", Some("")), "/ws");
+        // Platform path-list separator (`;` on Windows, `:` elsewhere) —
+        // a hardcoded `:` broke browser attach on Windows.
+        #[cfg(windows)]
+        assert_eq!(prepend_node_path("/ws", Some("/u/lib")), "/ws;/u/lib");
+        #[cfg(not(windows))]
         assert_eq!(prepend_node_path("/ws", Some("/u/lib")), "/ws:/u/lib");
+    }
+
+    #[test]
+    fn python_launcher_prefers_python3_falls_back_to_python() {
+        assert_eq!(python_launchers(), ["python3", "python"]);
+        // Pure PATH scan: no spawn, no env mutation (the PATH is passed
+        // in, so parallel tests never race on process-global env).
+        let bin = tmpdir("launcher-bin");
+        std::fs::write(bin.join("python"), "").unwrap();
+        let path = std::env::join_paths([bin.clone()]).unwrap();
+        assert_eq!(
+            find_python_launcher_in(Some(path)),
+            Some("python"),
+            "python-only machine resolves (Windows norm)"
+        );
+        std::fs::write(bin.join("python3"), "").unwrap();
+        let path = std::env::join_paths([bin.clone()]).unwrap();
+        assert_eq!(
+            find_python_launcher_in(Some(path)),
+            Some("python3"),
+            "python3 wins when present (POSIX norm)"
+        );
+        let empty = tmpdir("launcher-empty");
+        let path = std::env::join_paths([empty.clone()]).unwrap();
+        assert_eq!(find_python_launcher_in(Some(path)), None);
+        assert_eq!(find_python_launcher_in(None), None);
+        let _ = std::fs::remove_dir_all(&bin);
+        let _ = std::fs::remove_dir_all(&empty);
     }
 
     #[test]
@@ -1240,6 +1460,128 @@ mod tests {
             start.elapsed() < Duration::from_secs(10),
             "must return near the bound, not after the sleeper"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn has_debugpy_never_hangs_on_stuck_interpreter() {
+        // A hung interpreter must degrade to "no debugpy" at the bound,
+        // never hang the start behind an unbounded `.output()`. `exec`
+        // replaces the shell so the kill lands on sleep itself (no
+        // grandchild to confuse the assertion).
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tmpdir("hang-interp");
+        let script = dir.join("hang");
+        std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let start = std::time::Instant::now();
+        assert!(!has_debugpy_timeout(
+            &script.to_string_lossy(),
+            Duration::from_secs(2)
+        ));
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "probe must return near its bound"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Spawn a fake bridge script; block until it publishes its child's pid.
+    #[cfg(unix)]
+    fn spawn_fake_bridge(dir: &std::path::Path, body: &str) -> (std::process::Child, u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let script = dir.join("bridge.sh");
+        let pidfile = dir.join("child.pid");
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let child = std::process::Command::new(&script)
+            .arg(&pidfile)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("fake bridge must spawn");
+        let start = std::time::Instant::now();
+        let grandchild = loop {
+            if let Ok(raw) = std::fs::read_to_string(&pidfile) {
+                if let Ok(pid) = raw.trim().parse::<u32>() {
+                    break pid;
+                }
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "fake bridge never published its child pid"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        (child, grandchild)
+    }
+
+    #[cfg(unix)]
+    fn pid_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reap_child_runs_term_teardown_before_kill() {
+        // Cooperative fake bridge: traps TERM, kills its own child, exits.
+        // The grandchild must be dead afterwards — the pre-fix bare
+        // kill()+wait() orphaned it.
+        let dir = tmpdir("reap-coop");
+        let (child, grandchild) = spawn_fake_bridge(
+            &dir,
+            "#!/bin/sh\nsleep 30 &\nCHILD=$!\necho $CHILD > \"$1\"\ntrap \"kill $CHILD 2>/dev/null; exit 0\" TERM\nwait\n",
+        );
+        assert!(pid_alive(grandchild), "grandchild must start alive");
+        let start = std::time::Instant::now();
+        let mut slot = Some(child);
+        reap_child(&mut slot);
+        assert!(slot.is_none(), "handle taken on every path");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "cooperative teardown must not touch the kill fallback"
+        );
+        assert!(
+            !pid_alive(grandchild),
+            "grandchild reaped via TERM teardown"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reap_child_tree_kills_term_deaf_bridge() {
+        // Uncooperative fake bridge: ignores TERM (the background sleep
+        // inherits the disposition). Reap must still leave nothing behind
+        // via the tree-kill fallback after its bounded grace.
+        let dir = tmpdir("reap-deaf");
+        let (child, grandchild) = spawn_fake_bridge(
+            &dir,
+            "#!/bin/sh\ntrap \"\" TERM\nsleep 30 &\necho $! > \"$1\"\nwait\n",
+        );
+        let bridge_pid = child.id();
+        assert!(pid_alive(grandchild), "grandchild must start alive");
+        let start = std::time::Instant::now();
+        let mut slot = Some(child);
+        reap_child(&mut slot);
+        assert!(slot.is_none(), "handle taken on every path");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "fallback path must wait out the TERM grace, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "fallback must stay bounded, took {elapsed:?}"
+        );
+        assert!(!pid_alive(bridge_pid), "deaf bridge SIGKILLed");
+        assert!(!pid_alive(grandchild), "grandchild tree-killed");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

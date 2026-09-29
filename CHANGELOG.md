@@ -11,6 +11,35 @@ All notable changes to this project are documented here. Format follows
 - `scripts/check_release.sh` default API base now hits the real
   `/repos/<owner>/<repo>/releases` endpoint (previously 404'd on every
   run, reporting "no release" for a fully published release).
+- Node `continue` forwards the pre-resume freshness baseline (same rule
+  as `step`): a park landing while the resume is in flight counts fresh
+  instead of timing out beside a parked target.
+- Exception stops consume a pending step (node main/worker, browser):
+  a stale `awaitingStep` misclassified a later stray pause as a step
+  landing instead of auto-resuming it.
+- Terminal close stays graceful on the normal `handleConn` path (node +
+  browser): no `destroy()` after `closeFromConn`'s FIN, which RST'd the
+  just-written ACK on Windows.
+- Failure-path reap SIGTERMs first (bounded 2s grace, then tree-kill)
+  instead of a bare `kill()`: every bridge installs the SIGTERM teardown
+  (node/browser/python/Java), so a launched target dies with a reaped
+  bridge instead of orphaning.
+- pybridge publishes the park epoch before frame enrichment: a
+  stack-unavailable raise no longer hides a suspended target from
+  concurrent waiters, and the deadline path rechecks the shared handoff
+  before `StopTimeout`.
+- Live retry heals only tests that actually passed: a class-level skip
+  on retry no longer erases the original failure.
+- npm postinstall fails closed on a fetched-but-unparseable checksum
+  sidecar (previously warn-and-continue installed it unverified).
+- Windows Python provisioning uses the `Scripts\python.exe` venv layout
+  (was hardcoded `bin/python`) and falls back from `python3` to `python`;
+  `NODE_PATH` joins with the platform separator (`;` on Windows).
+- Provisioning probes (`has_debugpy`, `node --version`, `javac`, venv
+  creation) are bounded — a hung toolchain fails the start instead of
+  hanging it.
+- Failed lock-record writes remove the just-created file: no unowned
+  lock blocks retries for the stale bound.
 
 ## [0.2.1] — 2026-09-18
 

@@ -71,15 +71,27 @@ LIVE_RETRY=0 python3 tests/run_live.py               # disable retry-once
 2. DAP read bounds are applied INSIDE the connection lock
    (`DapConn._read_msg(timeout=...)`); never arm a shared socket outside it.
 3. Worker park + selection clock (`stopSeq`) go live synchronously, before
-   enrichment awaits.
+   enrichment awaits. Same rule in pybridge (`_commit_park_clock` before
+   frame enrichment): a stack-unavailable raise must still publish the
+   epoch, or waiters time out on a suspended target.
 4. A wait pump re-checks for an already-committed park AFTER acquiring the
    pump lock (`parkedRecheck` post-lock in `awaitStopInner`): a park that
    lands between the accept-time check and lock acquisition would
    otherwise strand the pump on a suspended VM's empty queue until
-   deadline, returning the same park at full budget.
-5. Close uses FIN (`conn.end()`), never RST (`destroy()`).
+   deadline, returning the same park at full budget. Same family in
+   pybridge: the deadline branch rechecks `_shared_park_hit` before
+   `StopTimeout` (a rival may commit during the final select window).
+5. Close uses FIN (`conn.end()`), never RST (`destroy()`) — including the
+   normal `handleConn` path after `closeFromConn` (a `finally` destroy
+   would RST the just-written ACK).
 6. Register both failure paths when changing waits: a timeout must clear the
-   step flag but never disarm a concurrent fresh park.
+   step flag but never disarm a concurrent fresh park. An exception stop
+   consumes a pending step the same way (clears `awaitingStep`); a stale
+   flag misclassifies a later stray pause as a step landing.
+7. Failure-path reap SIGTERMs first (`reap_child`: every bridge installs
+   the SIGTERM teardown — launched target dies, attach detaches), waits a
+   bounded 2s grace, then tree-kills; never a bare `kill()` that orphans
+   the debuggee.
 
 ## Boundaries
 
