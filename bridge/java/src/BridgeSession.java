@@ -43,6 +43,20 @@ class BridgeSession {
         st.cfg = cfg;
         st.server = server;
         st.dir = dir;
+        // SIGTERM teardown (CLI failure-path reap SIGTERMs first so this
+        // runs): same VM teardown as close/setup-failure — a launched VM
+        // exits with the bridge instead of orphaning, an attach detaches.
+        // Hooks run on their own thread: cleanupVm nulls under the lock
+        // and every path tolerates nulls; server double-close is ignored.
+        // Normal exits already tore down (idempotent); the CLI's bounded
+        // SIGKILL still bounds a stuck teardown.
+        final SessionState hookSt = st;
+        try {
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                try { cleanupVm(hookSt); } catch (Throwable ignored) {}
+                try { hookSt.server.close(); } catch (Exception ignored) {}
+            }));
+        } catch (Throwable ignored) { /* hooks unavailable: reap still SIGKILLs */ }
         // Claim the session dir first thing: if the owner deletes it (rm -rf
         // instead of close) or respawns under our name, our nonce mismatches
         // and we quit quietly instead of orphaning. Same contract as the
