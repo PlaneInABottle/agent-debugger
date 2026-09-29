@@ -160,6 +160,38 @@ class PumpHandoffTests(unittest.TestCase):
             st._note_exit("child:61")
             self.assertNotIn("child:61", st._park_seq)
 
+    def test_stack_unavailable_still_publishes_park_epoch(self):
+        # A stop whose stack read fails must still publish the shared park
+        # epoch: the dispatching pump gets the honest BridgeErr, but a
+        # concurrent waiter observes the (suspended) park through the
+        # handoff instead of running to StopTimeout on a parked target.
+        with tempfile.TemporaryDirectory() as tmp:
+            st = make_session(tmp)
+            st.refresh_frames = Mock(side_effect=lambda timeout=5: None)
+            seq0 = st._stop_seq
+            with self.assertRaises(bridge.BridgeErr):
+                st._handle_pumped(dict(STOP))
+            self.assertEqual(st._stop_seq, seq0 + 1,
+                             "park clock commits before the enrichment raise")
+            self.assertTrue(st.suspended)
+            self.assertEqual(st._shared_park_hit(seq0, None), "stopped")
+
+    def test_deadline_rechecks_shared_handoff_before_timeout(self):
+        # A park committed after the waiter's epoch capture (final select
+        # window, or while the deadline probe runs) must satisfy the
+        # waiter: the deadline path rechecks the shared handoff before
+        # raising StopTimeout. Deterministic: the epoch is stashed the way
+        # already past.
+        with tempfile.TemporaryDirectory() as tmp:
+            st = make_session(tmp)
+            seq0 = st._stop_seq
+            st._park_local.wait_start_seq = seq0
+            st._park_stop("breakpoint", 7, "main")
+            try:
+                self.assertEqual(st.pump(0), "stopped")
+            finally:
+                st.dap.close()
+
 
 if __name__ == "__main__":
     unittest.main()

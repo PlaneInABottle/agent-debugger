@@ -3364,6 +3364,14 @@ class Session:
                 if r and self._pump_hit_ok(want):
                     return r
                 self._close_suspect_episodes()
+                # A rival may have committed a fresh park after our last
+                # per-tick handoff check (final select window, or while the
+                # probe above ran): recheck the shared handoff before
+                # reporting timeout, or the waiter times out on a target
+                # that parked before its own deadline.
+                r = self._shared_park_hit(start_seq, want)
+                if r:
+                    return r
                 raise StopTimeout(self.timeout_text(timeout))
             entries = self._conn_entries()
             for tid, conn, _sock in entries:
@@ -3507,6 +3515,28 @@ class Session:
         return self._park_stop(self._stopped_reason(live),
                                self._stopped_tid(live))
 
+    def _commit_park_clock(self, eff):
+        """Publish the shared park epoch for one target (thread-local mark
+        + global stopSeq/parkSeq under the gate). Single place both the
+        success path and the stack-unavailable raise commit through, so a
+        concurrent waiter (shared epoch handoff) always observes a
+        suspended target. Usually reached under `_dispatch_pumped`'s gate,
+        but the suspect fallback can reach `_park_stop` from `pump` without
+        that outer section — the RLock makes both paths equivalent and
+        keeps the lock order `_gate -> mu`."""
+        self._park_local.parked = eff
+        with self._gate:
+            self._stop_seq += 1
+            if eff == "main":
+                self._main_seq = self._stop_seq
+            else:
+                t = self.targets.get(eff)
+                if t is not None:
+                    t.stop_seq = self._stop_seq
+                    t.state = "stopped"
+            self._last_park_target = eff
+            self._park_seq[eff] = self._stop_seq
+
     def _park_stop(self, reason, tid, target=None):
         """Park the session on a genuine stop. The single place that moves
         the park: thread, frames, stopInfo, change tracking, hit counting.
@@ -3525,6 +3555,13 @@ class Session:
         # the actual suspension and allow an explicit continue/retry.
         self.publish_state(True)
         self.refresh_frames(timeout=5)
+        # Park + selection clock go live synchronously once the suspension
+        # is confirmed, BEFORE any later enrichment step below
+        # (exception_info, track_changes, count_hits): each of those must
+        # never strand a concurrent waiter on StopTimeout for a target that
+        # is already suspended — the waiter observes the park through the
+        # shared epoch handoff even when this dispatch raises.
+        self._commit_park_clock(eff)
         if not self.frames:
             raise BridgeErr("target stopped but stack is unavailable; retry context or continue")
         if reason == "exception":
@@ -3560,23 +3597,6 @@ class Session:
                 "changed lists only certain value changes")
         self.count_hits(reason)
         self.publish_state(True)
-        self._park_local.parked = eff
-        # Publish every shared park field atomically. `_park_stop` is usually
-        # reached under `_dispatch_pumped`'s gate, but suspect fallback can
-        # reach it from `pump` without that outer section. The RLock makes
-        # both paths equivalent and keeps the lock order `_gate -> mu`; all
-        # blocking DAP work above remains outside this short section.
-        with self._gate:
-            self._stop_seq += 1
-            if eff == "main":
-                self._main_seq = self._stop_seq
-            else:
-                t = self.targets.get(eff)
-                if t is not None:
-                    t.stop_seq = self._stop_seq
-                    t.state = "stopped"
-            self._last_park_target = eff
-            self._park_seq[eff] = self._stop_seq
         # Diagnostics: monotonic id + previous-park comparison (never
         # fabricate: DAP stopped events carry no breakpoint ids).
         try:
@@ -5640,6 +5660,29 @@ class _Close(Exception):
     pass
 
 
+def _install_sigterm_cleanup(st):
+    """SIGTERM teardown (CLI failure-path reap SIGTERMs first so cleanup
+    runs): same cleanup() as close/owner-loss — disconnect with
+    terminateDebuggee on launch (reaps the tree), detach on attach — then
+    immediate exit. In-flight work is moot (the CLI already gave up).
+    Returns the handler (test seam: call it with a fake session). Signal
+    registration itself is best-effort (non-main thread, Windows)."""
+    import signal
+
+    def _handle(signum, frame):
+        try:
+            st.cleanup()
+        except Exception:
+            pass
+        os._exit(0)
+
+    try:
+        signal.signal(signal.SIGTERM, _handle)
+    except Exception:
+        pass
+    return _handle
+
+
 def write_file(path, content):
     """Atomic same-dir publish: unique temp (create-new) + replace, so a
     concurrent `status` read never sees a torn session.json. Best effort
@@ -6226,6 +6269,9 @@ def main(argv):
         st = Session(cfg)
         st._nonce = nonce
         st.session_port = server.getsockname()[1]
+        # Failure-path reap SIGTERMs first: terminateDebuggee/detach runs
+        # here instead of the target orphaning under a bare SIGKILL.
+        _install_sigterm_cleanup(st)
         try:
             if cfg.kind == "launch":
                 st.start_adapter()

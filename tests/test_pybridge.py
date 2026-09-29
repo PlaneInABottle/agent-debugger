@@ -2825,6 +2825,27 @@ class TargetIdentityTests(unittest.TestCase):
         self.assertEqual(len(out), 1)
         bridge._stall_end(st, token2)
 
+    def test_sigterm_handler_runs_cleanup_then_exits(self):
+        # Failure-path reap SIGTERMs first: the handler must run the same
+        # cleanup() as close (launch terminates the debuggee, attach
+        # detaches) and then exit — never raise out of the handler.
+        st = Mock()
+        handler = bridge._install_sigterm_cleanup(st)
+        with unittest.mock.patch.object(bridge.os, "_exit") as gone:
+            handler(None, None)
+        st.cleanup.assert_called_once_with()
+        gone.assert_called_once_with(0)
+
+    def test_sigterm_handler_survives_cleanup_failure(self):
+        # A failing cleanup must not prevent the exit (the CLI's SIGKILL
+        # still bounds it, but the common path exits promptly).
+        st = Mock()
+        st.cleanup.side_effect = RuntimeError("boom")
+        handler = bridge._install_sigterm_cleanup(st)
+        with unittest.mock.patch.object(bridge.os, "_exit") as gone:
+            handler(None, None)
+        gone.assert_called_once_with(0)
+
 
 if __name__ == "__main__":
     unittest.main()
