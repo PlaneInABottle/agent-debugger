@@ -31,6 +31,20 @@ class FailAlways(unittest.TestCase):
         self.fail("always fails by design")
 
 
+class SkipOnRetrySetup(unittest.TestCase):
+    """setUpClass flakes ONLY on retry: the first attempt ran the test
+    (and failed), the retry skips at class level. The placeholder skip id
+    (`setUpClass (...)`) differs from the test id — the merge must keep
+    the original failure."""
+
+    @classmethod
+    def setUpClass(cls):
+        raise unittest.SkipTest("setup flaked on retry")
+
+    def runTest(self):
+        pass
+
+
 def _runner():
     return unittest.TextTestRunner(stream=io.StringIO(), verbosity=0)
 
@@ -75,6 +89,19 @@ class RetryMergeTests(unittest.TestCase):
         result.failures.append((ghost, "traceback"))
         merged = run_live._rerun_failed_once(loader, _runner(), result)
         self.assertEqual(len(merged.failures), 1)
+
+    def test_class_skip_on_retry_keeps_failure(self):
+        # A failure whose retry skips at setUpClass level never passed:
+        # the original verdict must stand (the class-skip placeholder id
+        # never matches the test id, so id subtraction alone heals it).
+        loader = unittest.TestLoader()
+        result = unittest.TestResult()
+        ghost = mock.Mock()
+        ghost.id.return_value = f"{__name__}.SkipOnRetrySetup.runTest"
+        result.failures.append((ghost, "traceback"))
+        merged = run_live._rerun_failed_once(loader, _runner(), result)
+        self.assertEqual(len(merged.failures), 1)
+        self.assertFalse(merged.wasSuccessful())
 
 
 if __name__ == "__main__":

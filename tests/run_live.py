@@ -34,6 +34,25 @@ def _retry_enabled():
     return os.environ.get("LIVE_RETRY", "1").strip().lower() not in ("0", "false", "no")
 
 
+class _RetryResult(unittest.TextTestResult):
+    """Retry result that records which test ids actually PASSED: a retried
+    test heals only on a real pass. A class-level skip/error placeholder
+    (e.g. `setUpClass (mod.Class)` when setup flakes on retry) carries a
+    different id than the test, so id-set arithmetic alone would heal a
+    failure that never passed — the passed set below closes that hole."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.passed_ids = set()
+
+    def addSuccess(self, test):
+        try:
+            self.passed_ids.add(test.id())
+        except Exception:
+            pass
+        super().addSuccess(test)
+
+
 def _rerun_failed_once(loader, runner, result):
     """Rerun exactly the failed/errored test ids once; drop entries for
     tests that pass on retry. Returns the (possibly new) result to judge."""
@@ -63,12 +82,17 @@ def _rerun_failed_once(loader, runner, result):
     retry_ids = [t.id() for t in retry_tests]
     print(f"live retry: rerunning {len(retry_tests)} failed test(s) once: "
           f"{retry_ids}", flush=True)
-    retry_result = runner.run(retry_suite)
+    retry_result = unittest.TextTestRunner(
+        stream=runner.stream, verbosity=runner.verbosity,
+        resultclass=_RetryResult).run(retry_suite)
     still_bad = {t.id() for t, _ in list(retry_result.failures) + list(retry_result.errors)}
     skipped_on_retry = {t.id() for t, _ in list(getattr(retry_result, "skipped", []))}
     # Heal only tests that actually ran green on retry: a failure that
-    # skips on retry never passed, so its original verdict stands.
-    healed = set(retry_ids) - still_bad - skipped_on_retry
+    # skips on retry never passed, so its original verdict stands. The
+    # passed set (not id subtraction) is the source of truth — a
+    # class-level skip placeholder never appears in it.
+    passed = set(retry_result.passed_ids)
+    healed = (set(retry_ids) & passed) - still_bad
     # A retried test that errored at setUpClass level may surface under a
     # placeholder id; only drop entries whose exact id healed.
     result.failures = [(t, tr) for t, tr in result.failures if t.id() not in healed]

@@ -71,6 +71,38 @@ describe('postinstall checksum', () => {
     }
   });
 
+  it('verifyChecksum throws on unparseable sidecar (fail closed)', async () => {
+    // A fetched-but-garbled sidecar proves nothing about the archive: it
+    // must abort like a mismatch, never warn-and-continue. The message
+    // routes through the fatal classification (isChecksumMismatch).
+    const http = require('http');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'adb-sum-'));
+    try {
+      const file = path.join(dir, 'pkg.tar.gz');
+      fs.writeFileSync(file, 'hello-installer');
+      const server = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('not-a-sha256-sidecar\n');
+      });
+      await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const port = server.address().port;
+      try {
+        await assert.rejects(
+          postinstall.verifyChecksum(file, `http://127.0.0.1:${port}/pkg.tar.gz.sha256`),
+          /Checksum mismatch/,
+        );
+        assert.equal(
+          postinstall.isChecksumMismatch(new Error('Checksum mismatch for pkg.tar.gz (published checksum unparseable; refusing unverified archive)')),
+          true,
+        );
+      } finally {
+        server.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('verifyChecksum skips when sidecar missing (old-release compat)', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'adb-sum-'));
     try {

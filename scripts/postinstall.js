@@ -158,7 +158,9 @@ function downloadFile(url, dest, maxRedirects = 5) {
 // Verify a downloaded archive against its published .sha256 sidecar
 // (same "<hash>  <filename>" format release.yml writes via shasum).
 // Checksum unfetchable (old release without sidecar): warn, continue.
-// Mismatch: throw (caller aborts install, archive deleted by finally).
+// Mismatch — including a fetched-but-unparseable sidecar, which proves
+// nothing about the archive — throws (caller aborts install, archive
+// deleted by finally).
 async function verifyChecksum(archivePath, checksumUrl) {
   let text;
   try {
@@ -169,8 +171,11 @@ async function verifyChecksum(archivePath, checksumUrl) {
   }
   const expected = text.trim().split(/\s+/)[0].toLowerCase();
   if (!/^[0-9a-f]{64}$/.test(expected)) {
-    console.warn('[agent-debugger] Published checksum unparseable; skipping verification.');
-    return;
+    // Fail closed: a present-but-garbled sidecar verifies nothing, so it
+    // must abort like a mismatch — never warn-and-continue. The
+    // "Checksum mismatch" prefix routes through the fatal classification
+    // (isChecksumMismatch) in both install paths.
+    throw new Error(`Checksum mismatch for ${path.basename(archivePath)} (published checksum unparseable; refusing unverified archive)`);
   }
   const actual = sha256File(archivePath);
   if (actual !== expected) {
