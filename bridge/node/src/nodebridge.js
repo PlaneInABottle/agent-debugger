@@ -1973,6 +1973,11 @@ class Session {
     const realHits = hits.filter((id) => !this.logpointIds.has(id));
     this.countHits(p);
     if (p.reason === 'exception') {
+      // The pending step (if any) is consumed by this stop: the exception
+      // IS the step's result. Leaving awaitingStep set would misclassify a
+      // later unrelated pause (e.g. a stray `debugger` statement after
+      // continue) as a step landing instead of auto-resuming it.
+      this.awaitingStep = false;
       this.stopInfo = this.excInfo(p.data);
       // Park first, synchronously — trackChanges awaits must never strand
       // a CDP pause with a running state when they throw.
@@ -2376,6 +2381,9 @@ class Session {
       const realHits = hits.filter((id) => !this.logpointIds.has(id));
       this.countHits(p, w.stopStates);
       if (p.reason === 'exception') {
+        // Same step-flag consumption as the main exception branch above:
+        // the exception stop is the pending step's result.
+        w.awaitingStep = false;
         w.stopInfo = this.excInfo(p.data);
         w.paused = { frames, stopInfo: w.stopInfo };
         // Park + selection clock go live synchronously (before any await):
@@ -3793,7 +3801,7 @@ class Session {
       // Running already: nothing to resume (a bare resume errors on some
       // targets) — just wait for the next stop.
     });
-    return this.resumeAndWait(timeout, tid, typeof req.target === 'string');
+    return this.resumeAndWait(timeout, tid, typeof req.target === 'string', base);
   }
 
   /** Clear a resume flag on exactly the resumed holder (main or one
@@ -4823,6 +4831,10 @@ async function handleOverload(st, conn) {
 /** Serve one CLI connection: exactly one request and one response. The
  *  caller (serve) holds one acquired ServerState slot for this handler. */
 async function handleConn(st, conn) {
+  // Set once closeFromConn owns the socket (graceful FIN): the finally
+  // below must not destroy() after end() — that RSTs on Windows and
+  // discards the ACK the client is still reading (see closeFromConn).
+  let graceful = false;
   try {
     let req;
     try {
@@ -4850,6 +4862,7 @@ async function handleConn(st, conn) {
         // handlers abort on the torn-down transport; the serve loop
         // below gives them a bounded grace to flush error responses.
         await closeFromConn(st, conn);
+        graceful = true;
         return;
       }
       const msg = e instanceof BridgeErr ? e.message : `internal: ${(e && e.message) || e}`;
@@ -4862,7 +4875,7 @@ async function handleConn(st, conn) {
       } catch (_) { /* client already gone */ }
     }
   } finally {
-    conn.destroy();
+    if (!graceful) conn.destroy();
     st.server.release();
   }
 }
@@ -4882,6 +4895,27 @@ function errorTargetFor(st, req) {
     } catch (_) { /* fall through to the default */ }
   } catch (_) { /* fall through to the default */ }
   return 'main';
+}
+
+/** SIGTERM teardown installer (see main): the CLI's failure-path reap
+ *  SIGTERMs first so this cleanup runs — a launched target dies with the
+ *  bridge instead of orphaning. Same cleanup() as close; in-flight work is
+ *  moot (the CLI already gave up), so exit follows cleanup. Once-only: a
+ *  second TERM while cleanup runs is ignored. `proc` is the test seam. */
+function installSigtermCleanup(st, proc = process) {
+  let done = false;
+  proc.on('SIGTERM', () => {
+    if (done) return;
+    done = true;
+    Promise.resolve()
+      .then(() => st.cleanup())
+      .catch(() => {})
+      .then(() => {
+        try {
+          proc.exit(0);
+        } catch (_) { /* already exiting */ }
+      });
+  });
 }
 
 /** Terminal close handling for one connection, outside the handler pool:
@@ -4992,6 +5026,10 @@ async function main(argv) {
   const port = server.address().port;
   const st = new Session(cfg);
   st.sessionPort = port;
+  // Failure-path reap SIGTERMs (not SIGKILLs) first: install the teardown
+  // before the handshake spawns anything, so a launched target can never
+  // outlive a reaped bridge.
+  installSigtermCleanup(st);
   try {
     await st.handshake();
     if (st.child) {

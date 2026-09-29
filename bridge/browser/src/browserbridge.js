@@ -1226,6 +1226,10 @@ class Session {
     const realHits = hits.filter((id) => !this.logpointIds.has(id));
     this.countHits(p);
     if (p.reason === 'exception') {
+      // The pending step (if any) is consumed by this stop — see the node
+      // bridge: a stale flag would misclassify a later stray pause as a
+      // step landing instead of auto-resuming it.
+      this.awaitingStep = false;
       this.stopInfo = this.excInfo(p.data);
       // Park first, synchronously — trackChanges awaits must never strand
       // a CDP pause with a running state when they throw.
@@ -3011,6 +3015,9 @@ async function handleOverload(st, conn) {
 /** Serve one CLI connection: exactly one request and one response. The
  *  caller (serve) holds one acquired ServerState slot for this handler. */
 async function handleConn(st, conn) {
+  // Same graceful-close rule as the node bridge: once closeFromConn owns
+  // the socket (FIN), the finally below must not destroy() after it.
+  let graceful = false;
   try {
     let req;
     try {
@@ -3036,6 +3043,7 @@ async function handleConn(st, conn) {
         // The serve loop below gives in-flight handlers a bounded grace
         // to flush their aborts.
         await closeFromConn(st, conn);
+        graceful = true;
         return;
       }
       const msg = e instanceof BridgeErr ? e.message : `internal: ${(e && e.message) || e}`;
@@ -3048,9 +3056,30 @@ async function handleConn(st, conn) {
       } catch (_) { /* client already gone */ }
     }
   } finally {
-    conn.destroy();
+    if (!graceful) conn.destroy();
     st.server.release();
   }
+}
+
+/** SIGTERM teardown installer (see main): the CLI's failure-path reap
+ *  SIGTERMs first so this cleanup runs — detach-before-exit instead of a
+ *  bare SIGKILL. Same cleanup() as close; in-flight work is moot (the CLI
+ *  already gave up), so exit follows cleanup. Once-only. `proc` is the
+ *  test seam. */
+function installSigtermCleanup(st, proc = process) {
+  let done = false;
+  proc.on('SIGTERM', () => {
+    if (done) return;
+    done = true;
+    Promise.resolve()
+      .then(() => st.cleanup())
+      .catch(() => {})
+      .then(() => {
+        try {
+          proc.exit(0);
+        } catch (_) { /* already exiting */ }
+      });
+  });
 }
 
 /** Terminal close handling for one connection, outside the handler pool:
@@ -3064,14 +3093,20 @@ async function closeFromConn(st, conn) {
     await writeFrame(conn, { ok: true, closed: true, target: 'main' });
   } catch (_) { /* client already gone */ }
   if (!mine) {
-    try {
-      conn.destroy();
-    } catch (_) { /* already gone */ }
+    gracefulEnd(conn);
     return;
   }
   await st.cleanup().catch(() => {});
+  gracefulEnd(conn);
+}
+
+/** Graceful FIN after the flush (never destroy): destroy() RSTs on
+ *  Windows and discards the ACK the client is still reading — same rule
+ *  as the node bridge's closeFromConn. */
+function gracefulEnd(conn) {
   try {
-    conn.destroy();
+    conn.on('error', () => {});
+    conn.end();
   } catch (_) { /* already gone */ }
 }
 
@@ -3150,6 +3185,8 @@ async function main(argv) {
   const port = server.address().port;
   const st = new Session(cfg);
   st.sessionPort = port;
+  // Failure-path reap SIGTERMs first: orderly detach-before-exit.
+  installSigtermCleanup(st);
   try {
     await st.handshake();
     // No startup pump (unlike node/java): an attached tab is usually idle
