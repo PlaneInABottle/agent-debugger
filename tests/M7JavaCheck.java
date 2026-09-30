@@ -127,7 +127,7 @@ public class M7JavaCheck {
         check(msg.contains("target identity: java Foo"), "hint appended, got: " + msg);
 
         // -- waitContext JSON: unknown trigger, canonical order, honest note.
-        String ctx = BridgeSnapshot.waitContextJson(st, 2000, 1735689600000L, null);
+        String ctx = BridgeSnapshot.waitContextJson(st, 2000, 1735689600000L, System.nanoTime(), null);
         check(ctx.contains("\"triggerStatus\":\"unknown\""), "trigger unknown");
         check(!ctx.contains("expectedBreak"), "wait plants no expectedBreak");
         check(ctx.contains("\"waitStartedAt\":1735689600"), "wait start stamped");
@@ -135,7 +135,7 @@ public class M7JavaCheck {
         check(ctx.contains("not observed") && ctx.contains("not that the code is unreachable"),
                 "honest note, no root-cause claim");
         check(ctx.contains("\"targetIdentity\":"), "identity rides along");
-        String ctx2 = BridgeSnapshot.waitContextJson(st, 2000, 1735689600000L, "com.Foo:54");
+        String ctx2 = BridgeSnapshot.waitContextJson(st, 2000, 1735689600000L, System.nanoTime(), "com.Foo:54");
         check(ctx2.contains("\"expectedBreak\":\"com.Foo:54\""), "capture expectedBreak rides");
         int trigPos = ctx2.indexOf("triggerStatus");
         int expPos = ctx2.indexOf("expectedBreak");
@@ -315,7 +315,7 @@ public class M7JavaCheck {
         // stage, the planted flag, and the honest trigger-unknown note.
         long entryMs = 1735689600000L;
         String exitCtx = BridgeSnapshot.captureExitContextJson(
-                st, "armed-wait", true, "com.Foo:54", entryMs);
+                st, "armed-wait", true, "com.Foo:54", entryMs, System.nanoTime());
         check(exitCtx.contains("\"captureStage\":\"armed-wait\""), "exit stage armed-wait");
         check(exitCtx.contains("\"ephemeralPlanted\":true"), "exit planted rides");
         check(exitCtx.contains("\"expectedBreak\":\"com.Foo:54\""), "exit spec rides");
@@ -324,7 +324,7 @@ public class M7JavaCheck {
         check(exitCtx.contains("\"triggerStatus\":\"unknown\""), "exit trigger unknown");
         check(exitCtx.contains("not observed"), "exit honest note");
         String goneCtx = BridgeSnapshot.captureExitContextJson(
-                st, "session-gone", false, null, entryMs);
+                st, "session-gone", false, null, entryMs, System.nanoTime());
         check(goneCtx.contains("\"captureStage\":\"session-gone\"")
                 && goneCtx.contains("\"ephemeralPlanted\":false")
                 && !goneCtx.contains("expectedBreak"),

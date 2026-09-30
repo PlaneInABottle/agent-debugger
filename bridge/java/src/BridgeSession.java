@@ -348,6 +348,7 @@ class BridgeSession {
     static String awaitStopInner(SessionState st, long timeoutMs, boolean idle,
             String expectedBreak, boolean withContext) throws Exception {
         final long waitStartMs = System.currentTimeMillis();
+        final long waitStartNanos = System.nanoTime();
         // LOW closure: snapshot vm/closing under sessionLock (visibility) —
         // cleanupVm nulls vm under the same lock, so the pump observes either
         // the live VM or null, never a half-closed transport. The blocking
@@ -395,7 +396,7 @@ class BridgeSession {
                     if (parked != null) return parked;
                 }
                 String ctx = withContext
-                        ? BridgeSnapshot.waitContextJson(st, timeoutMs, waitStartMs, expectedBreak) : null;
+                        ? BridgeSnapshot.waitContextJson(st, timeoutMs, waitStartMs, waitStartNanos, expectedBreak) : null;
                 throw new StopTimeout(BridgeSnapshot.timeoutText(st, timeoutMs), ctx);
             }
             EventSet set;
@@ -680,7 +681,7 @@ class BridgeSession {
      *  time. Exits BEFORE arming wrap at the plant site (before-armed).
      *  Never endpoint-rejected or unreachable. */
     static BridgeException stageCaptureExit(Exception e, boolean planted,
-            String spec, SessionState st, long waitStartMs) {
+            String spec, SessionState st, long waitStartMs, long waitStartNanos) {
         if (!(e instanceof BridgeException) || e.getMessage() == null) return null;
         String lower = e.getMessage().toLowerCase();
         if (!lower.contains("exit") && !lower.contains("closed")) return null;
@@ -689,7 +690,7 @@ class BridgeSession {
                 + (spec != null ? " (" + spec + ")" : "")
                 + ": " + e.getMessage();
         return new BridgeException(msg, BridgeSnapshot.captureExitContextJson(
-                st, "armed-wait", wasPlanted, spec, waitStartMs));
+                st, "armed-wait", wasPlanted, spec, waitStartMs, waitStartNanos));
     }
 
     // -- layered target identity (M-ID): {debuggee, endpoint,
@@ -1533,7 +1534,7 @@ class BridgeSession {
                         synchronized (st.sessionLock) {
                             e.waitContextJson = BridgeSnapshot.captureExitContextJson(
                                     st, "session-gone", false, specOut[0],
-                                    System.currentTimeMillis());
+                                    System.currentTimeMillis(), System.nanoTime());
                         }
                     }
                     throw e;
@@ -1595,13 +1596,14 @@ class BridgeSession {
                                     + "breakpoint was armed: " + e.getMessage(),
                                     BridgeSnapshot.captureExitContextJson(st, "before-armed",
                                             false, specOut[0],
-                                            System.currentTimeMillis()));
+                                            System.currentTimeMillis(), System.nanoTime()));
                         }
                         throw e;
                     }
                 }
                 String snap;
                 long waitStartMs = System.currentTimeMillis();
+                long waitStartNanos = System.nanoTime();
                 try {
                     snap = awaitStop(st, timeout, specOut[0], true);
                 } catch (Exception e) {
@@ -1615,7 +1617,7 @@ class BridgeSession {
                             unplantCaptureBreak(st);
                         } catch (Exception ue) {
                             BridgeException staged = stageCaptureExit(
-                                    e, planted, specOut[0], st, waitStartMs);
+                                    e, planted, specOut[0], st, waitStartMs, waitStartNanos);
                             if (staged != null) {
                                 throw new BridgeException(staged.getMessage()
                                         + "; capture ephemeral may still be planted"
@@ -1642,7 +1644,7 @@ class BridgeSession {
                         throw e;
                     }
                     BridgeException staged = stageCaptureExit(
-                            e, planted, specOut[0], st, waitStartMs);
+                            e, planted, specOut[0], st, waitStartMs, waitStartNanos);
                     if (staged != null) throw staged;
                     throw e;
                 }
@@ -1680,9 +1682,11 @@ class BridgeSession {
                     } catch (Exception e) {
                         resumeErr = JdiBridge.shortMsg(e);
                     }
-                    long pauseMs = Math.max(0,
-                            System.currentTimeMillis() - (parkMs > 0 ? parkMs
-                                    : System.currentTimeMillis()));
+                    long pauseMs = st.parkedAtNanos > 0
+                            ? Math.max(0, (System.nanoTime() - st.parkedAtNanos) / 1_000_000)
+                            : Math.max(0,
+                                    System.currentTimeMillis() - (parkMs > 0 ? parkMs
+                                            : System.currentTimeMillis()));
                     StringBuilder resp = new StringBuilder(
                             "{\"ok\":true,\"stopped\":true,");
                     resp.append("\"targetWasPaused\":false,\"resumed\":").append(resumed);
@@ -1745,6 +1749,7 @@ class BridgeSession {
         st.prevParkAtMs = now;
         st.stopReason = reason;
         st.parkedAtMs = now;
+        st.parkedAtNanos = System.nanoTime();
         st.lastStopId = st.stopDiagSeq;
         st.lastSameLoc = sameLoc;
         st.lastSameThread = sameThread;

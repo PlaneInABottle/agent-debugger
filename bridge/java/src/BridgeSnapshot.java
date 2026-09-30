@@ -724,11 +724,11 @@ class BridgeSnapshot {
      *  before-armed pass the entry time (waitedMs ~0 — no wait occurred).
      *  Reads st/cfg fields only; acquires no lock. */
     static String captureExitContextJson(SessionState st, String stage,
-            boolean planted, String expectedBreak, long waitStartMs) {
-        long nowMs = System.currentTimeMillis();
+            boolean planted, String expectedBreak, long waitStartMs, long waitStartNanos) {
+        long waitedMs = Math.max(0, (System.nanoTime() - waitStartNanos) / 1_000_000);
         StringBuilder sb = new StringBuilder("{\"waitStartedAt\":");
         sb.append(waitStartMs / 1000)
-                .append(",\"waitedMs\":").append(Math.max(0, nowMs - waitStartMs));
+                .append(",\"waitedMs\":").append(waitedMs);
         sb.append(",\"triggerStatus\":\"unknown\"");
         sb.append(",\"captureStage\":").append(JdiBridge.quote(stage));
         sb.append(",\"ephemeralPlanted\":").append(planted);
@@ -752,8 +752,8 @@ class BridgeSnapshot {
      *  redacted + capped handshake copy (never rebuilt per command).
      *  Reads st/cfg fields only; acquires no lock. */
     static String waitContextJson(SessionState st, long timeoutMs, long waitStartMs,
-            String expectedBreak) {
-        long waitedMs = Math.max(0, System.currentTimeMillis() - waitStartMs);
+            long waitStartNanos, String expectedBreak) {
+        long waitedMs = Math.max(0, (System.nanoTime() - waitStartNanos) / 1_000_000);
         StringBuilder sb = new StringBuilder("{\"waitStartedAt\":");
         sb.append(waitStartMs / 1000).append(",\"waitedMs\":").append(waitedMs)
                 .append(",\"triggerStatus\":\"unknown\"");

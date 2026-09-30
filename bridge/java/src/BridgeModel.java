@@ -142,6 +142,7 @@ class SessionState {
         long prevParkAtMs = 0; // previous park wall clock
         String stopReason = null; // reason of the current park (breakpoint/step/exception/watch/exit)
         long parkedAtMs = 0; // wall clock ms of the current park
+        long parkedAtNanos = 0; // monotonic ns of the current park (pause-budget durations)
         long lastStopId = 0; // stopId of the current park
         boolean lastSameLoc = false; // same file+line as the previous park
         boolean lastSameThread = false; // same thread+target as the previous park
