@@ -29,7 +29,7 @@ verify_checksum() {
   ARCHIVE_PATH="$1"
   CHECKSUM_URL="$2"
   CHECKSUM_FILE="${ARCHIVE_PATH}.sha256"
-  if ! curl -fsSL "$CHECKSUM_URL" -o "$CHECKSUM_FILE" 2>/dev/null; then
+  if ! curl -fsSL --max-time 30 --max-filesize 16384 "$CHECKSUM_URL" -o "$CHECKSUM_FILE" 2>/dev/null; then
     log_info "No published checksum found; skipping verification."
     return 0
   fi
@@ -86,7 +86,7 @@ TARGET="${TARGET_ARCH}-${TARGET_OS}"
 VERSION="${VERSION:-}"
 if [ -z "$VERSION" ]; then
   log_info "Fetching latest release version from GitHub..."
-  LATEST_TAG=$(curl -sSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep '"tag_name":' | head -n 1 | cut -d '"' -f 4 || true)
+  LATEST_TAG=$(curl -sSL --max-time 30 --max-filesize 1048576 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep '"tag_name":' | head -n 1 | cut -d '"' -f 4 || true)
   if [ -n "$LATEST_TAG" ]; then
     VERSION="$LATEST_TAG"
   else
@@ -126,7 +126,7 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 log_info "Downloading ${DOWNLOAD_URL}..."
-if ! curl -fSL "$DOWNLOAD_URL" -o "${TMP_DIR}/${ASSET_NAME}" 2>/dev/null; then
+if ! curl -fSL --max-time 120 --max-filesize 67108864 "$DOWNLOAD_URL" -o "${TMP_DIR}/${ASSET_NAME}" 2>/dev/null; then
   log_error "Failed to download pre-built binary from ${DOWNLOAD_URL}"
   log_error "Please check that release ${VERSION} exists, or install from source:"
   log_error "  cargo install --path ."

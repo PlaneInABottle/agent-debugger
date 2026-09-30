@@ -120,36 +120,91 @@ async function main() {
   }
 }
 
-function downloadFile(url, dest, maxRedirects = 5) {
+function downloadFile(url, dest, maxRedirects = 5, opts = {}) {
+  const timeoutMs = opts.timeoutMs || 60000;
+  const maxBytes = opts.maxBytes || 64 * 1024 * 1024;
   return new Promise((resolve, reject) => {
     if (maxRedirects <= 0) {
       return reject(new Error('Too many redirects'));
     }
 
+    let settled = false;
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      try { req.destroy(); } catch (_) { /* already gone */ }
+      fs.unlink(dest, () => reject(err));
+    };
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+
     const mod = url.startsWith('http://') ? http : https;
     const req = mod.get(url, { headers: { 'User-Agent': 'agent-debugger-npm-installer' } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return resolve(downloadFile(res.headers.location, dest, maxRedirects - 1));
+        res.resume();
+        try { req.destroy(); } catch (_) { /* redirecting */ }
+        if (settled) return;
+        settled = true;
+        resolve(downloadFile(res.headers.location, dest, maxRedirects - 1, opts));
+        return;
       }
 
       if (res.statusCode !== 200) {
-        return reject(new Error(`HTTP ${res.statusCode}: ${res.statusMessage}`));
+        res.resume();
+        fail(new Error(`HTTP ${res.statusCode}: ${res.statusMessage}`));
+        return;
+      }
+
+      const declared = Number(res.headers['content-length']);
+      if (Number.isFinite(declared) && declared > maxBytes) {
+        res.resume();
+        fail(new Error(`download too large (${declared} bytes declared, cap ${maxBytes})`));
+        return;
       }
 
       const file = fs.createWriteStream(dest);
-      res.pipe(file);
-
-      file.on('finish', () => {
-        file.close(resolve);
+      let written = 0;
+      let tooBig = false;
+      res.on('data', (chunk) => {
+        if (tooBig) return;
+        written += chunk.length;
+        if (written > maxBytes) {
+          tooBig = true;
+          res.resume();
+          try { req.destroy(); } catch (_) { /* aborting */ }
+          file.destroy();
+          fail(new Error(`download too large (cap ${maxBytes} bytes)`));
+          return;
+        }
+        if (!file.write(chunk)) res.pause();
+      });
+      file.on('drain', () => res.resume());
+      res.on('end', () => {
+        if (tooBig) return;
+        file.end(() => done());
+      });
+      res.on('error', (err) => {
+        file.destroy();
+        fail(err);
       });
 
       file.on('error', (err) => {
-        fs.unlink(dest, () => reject(err));
+        try { req.destroy(); } catch (_) { /* already gone */ }
+        fail(err);
       });
     });
 
+    req.setTimeout(timeoutMs, () => {
+      fail(new Error(`download timed out after ${Math.round(timeoutMs / 1000)}s`));
+    });
+
     req.on('error', (err) => {
-      reject(err);
+      if (settled) return;
+      settled = true;
+      fs.unlink(dest, () => reject(err));
     });
   });
 }
@@ -165,6 +220,9 @@ async function verifyChecksum(archivePath, checksumUrl) {
   try {
     text = await downloadText(checksumUrl);
   } catch (err) {
+    if (/too large|timed out/.test(String((err && err.message) || err))) {
+      throw new Error(`Checksum mismatch for ${path.basename(archivePath)} (published checksum unfetchable within bounds; refusing unverified archive)`);
+    }
     console.warn('[agent-debugger] No published checksum found; skipping verification.');
     return;
   }
@@ -196,7 +254,9 @@ function isChecksumMismatch(err) {
   return !!err && /Checksum mismatch/.test(String((err && err.message) || err));
 }
 
-function downloadText(url, maxRedirects = 5) {
+function downloadText(url, maxRedirects = 5, opts = {}) {
+  const timeoutMs = opts.timeoutMs || 30000;
+  const maxChars = opts.maxChars || 16 * 1024;
   return new Promise((resolve, reject) => {
     if (maxRedirects <= 0) {
       return reject(new Error('Too many redirects'));
@@ -204,22 +264,40 @@ function downloadText(url, maxRedirects = 5) {
     const mod = url.startsWith('http://') ? http : https;
     const req = mod.get(url, { headers: { 'User-Agent': 'agent-debugger-npm-installer' } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return resolve(downloadText(res.headers.location, maxRedirects - 1));
+        res.resume();
+        return resolve(downloadText(res.headers.location, maxRedirects - 1, opts));
       }
       if (res.statusCode !== 200) {
+        res.resume();
         return reject(new Error(`HTTP ${res.statusCode}: ${res.statusMessage}`));
       }
       let body = '';
+      let tooBig = false;
       res.setEncoding('utf8');
-      res.on('data', (chunk) => { body += chunk; });
-      res.on('end', () => resolve(body));
+      res.on('data', (chunk) => {
+        if (tooBig) return;
+        if (body.length + chunk.length > maxChars) {
+          tooBig = true;
+          res.resume();
+          try { req.destroy(); } catch (_) { /* aborting */ }
+          reject(new Error(`response too large (cap ${maxChars} chars)`));
+          return;
+        }
+        body += chunk;
+      });
+      res.on('end', () => { if (!tooBig) resolve(body); });
+      res.on('error', reject);
+    });
+    req.setTimeout(timeoutMs, () => {
+      try { req.destroy(); } catch (_) { /* already gone */ }
+      reject(new Error(`download timed out after ${Math.round(timeoutMs / 1000)}s`));
     });
     req.on('error', (err) => reject(err));
   });
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { verifyChecksum, sha256File, TARGET_MAP, isChecksumMismatch, main };
+  module.exports = { verifyChecksum, sha256File, TARGET_MAP, isChecksumMismatch, main, downloadFile, downloadText };
 }
 
 // Only auto-run when executed as the npm postinstall script, never on

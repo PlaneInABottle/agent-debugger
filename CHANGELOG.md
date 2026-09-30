@@ -79,6 +79,11 @@ All notable changes to this project are documented here. Format follows
   on retry no longer erases the original failure.
 - npm postinstall fails closed on a fetched-but-unparseable checksum
   sidecar (previously warn-and-continue installed it unverified).
+- npm postinstall downloads are bounded: the archive rejects past 64MB
+  and the checksum sidecar past 16KB (both with timeouts) — a rogue
+  server can no longer OOM or hang `npm install` by trickling forever.
+  An oversized sidecar fails verification closed; `install.sh` curl
+  calls carry `--max-time` / `--max-filesize` the same way.
 - Windows Python provisioning uses the `Scripts\python.exe` venv layout
   (was hardcoded `bin/python`) and falls back from `python3` to `python`;
   `NODE_PATH` joins with the platform separator (`;` on Windows).

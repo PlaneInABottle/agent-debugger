@@ -151,5 +151,15 @@ expect_fail_timeout 25 "browser target-list cap" bridge/browser/src/browserbridg
   "          resolve('[');" \
   node --test --test-name-pattern="unbounded body" tests/browser_target_list.test.js
 
+expect_fail_timeout 25 "postinstall archive cap" scripts/postinstall.js \
+  "      res.on('data', (chunk) => {\n        if (tooBig) return;\n        written += chunk.length;\n        if (written > maxBytes) {" \
+  "      res.on('data', (chunk) => {\n        if (tooBig) return;\n        written += chunk.length;\n        if (false) { // TEMP-REVERT" \
+  node --test --test-name-pattern="unbounded body" tests/postinstall_bounds.test.js
+
+expect_fail_timeout 25 "postinstall sidecar cap" scripts/postinstall.js \
+  "      res.on('data', (chunk) => {\n        if (tooBig) return;\n        if (body.length + chunk.length > maxChars) {" \
+  "      res.on('data', (chunk) => {\n        if (tooBig) return;\n        if (false) { // TEMP-REVERT" \
+  node --test --test-name-pattern="unbounded sidecar" tests/postinstall_bounds.test.js
+
 echo "negative controls: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
