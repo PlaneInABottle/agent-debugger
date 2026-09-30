@@ -1,4 +1,14 @@
 // agent-debugger: agent-first CLI debugger. Java + Python + Node + Browser.
+//
+// Supported platforms: macOS and Linux only. Windows is explicitly NOT
+// supported (no local host to verify it, and the Windows-only paths were
+// untestable dead weight): building here fails fast at compile time
+// instead of shipping subtly broken behavior.
+#[cfg(windows)]
+compile_error!(
+    "agent-debugger does not support Windows (macOS/Linux only); \
+     see CHANGELOG for the removal rationale"
+);
 
 mod bridge;
 mod cli;

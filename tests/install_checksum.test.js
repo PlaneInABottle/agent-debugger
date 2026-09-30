@@ -37,10 +37,10 @@ describe('postinstall checksum', () => {
       'aarch64-apple-darwin',
       'x86_64-unknown-linux-gnu',
       'aarch64-unknown-linux-gnu',
-      'x86_64-pc-windows-msvc',
     ]) {
       assert.ok(triples.has(want), `TARGET_MAP must include ${want}`);
     }
+    assert.ok(!triples.has('x86_64-pc-windows-msvc'), 'Windows triple removed');
   });
 
   it('verifyChecksum throws on mismatch, passes on match', async () => {
@@ -137,5 +137,15 @@ describe('postinstall error classification', () => {
     assert.equal(postinstall.isChecksumMismatch(new Error('HTTP 404: Not Found')), false);
     assert.equal(postinstall.isChecksumMismatch(new Error('getaddrinfo ENOTFOUND github.com')), false);
     assert.equal(postinstall.isChecksumMismatch(null), false);
+  });
+
+  it('refuses Windows with a clear unsupported-platform error', async () => {
+    const real = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    try {
+      await assert.rejects(postinstall.main(), /does not support Windows/);
+    } finally {
+      Object.defineProperty(process, 'platform', { value: real, configurable: true });
+    }
   });
 });

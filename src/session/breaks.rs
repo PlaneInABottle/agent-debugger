@@ -718,9 +718,7 @@ mod tests {
         let _guard = acquire_breaks_lock(&dir).expect("must acquire without stale wait");
         drop(_guard);
         // Content is never written by the acquire above; compare after the
-        // release because Windows mandatory locking refuses reads through
-        // a second handle while the exclusive lock is held (Unix allows
-        // them). Nothing else touches the file in between either way.
+        // release so the check runs uncontended.
         assert_eq!(
             std::fs::read(&path).unwrap(),
             before,
@@ -742,7 +740,6 @@ mod tests {
         let path = breaks_lock_path(&dir);
         std::fs::write(&path, "sentinel").unwrap();
         let _holder = acquire_breaks_lock(&dir).unwrap();
-        #[cfg(unix)]
         let ino_before = {
             use std::os::unix::fs::MetadataExt;
             std::fs::metadata(&path).unwrap().ino()
@@ -758,16 +755,13 @@ mod tests {
         );
         drop(probe);
         drop(_holder);
-        // Read back after the release: Windows mandatory locking refuses
-        // reads through a second handle while the exclusive lock is held
-        // (Unix allows them), so the survival check runs uncontended.
+        // Read back after the release so the survival check runs uncontended.
         // Nothing else writes the file in between either way.
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "sentinel",
             "held record must survive"
         );
-        #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
             assert_eq!(
@@ -883,7 +877,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
     #[test]
     fn symlink_breaks_lock_refused_target_untouched() {
         // A planted symlink at the lock path is refused before opening;

@@ -3,8 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 
-const isWin = process.platform === 'win32';
-const binName = isWin ? 'agent-debugger.exe' : 'agent-debugger';
+const binName = 'agent-debugger';
 
 function findBinary(over = {}) {
   // Real path of this wrapper (symlinks resolved): PATH lookups below
@@ -99,7 +98,6 @@ function runBinary(binaryPath) {
 
   const child = spawn(binaryPath, process.argv.slice(2), {
     stdio: 'inherit',
-    windowsHide: true,
   });
 
   child.on('error', (err) => {

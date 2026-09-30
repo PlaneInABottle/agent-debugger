@@ -19,17 +19,20 @@ const TARGET_MAP = {
     x64: 'x86_64-unknown-linux-gnu',
     arm64: 'aarch64-unknown-linux-gnu',
   },
-  win32: {
-    x64: 'x86_64-pc-windows-msvc',
-  },
 };
 
-const isWin = process.platform === 'win32';
-const binName = isWin ? 'agent-debugger.exe' : 'agent-debugger';
+const binName = 'agent-debugger';
 const binDir = path.join(__dirname, '..', 'bin');
 const destBin = path.join(binDir, binName);
 
 async function main() {
+  if (process.platform === 'win32') {
+    throw new Error(
+      'agent-debugger does not support Windows (macOS/Linux only). ' +
+      'The npm package is restricted to darwin/linux via the "os" field; ' +
+      'if you see this, install from source on a supported platform.'
+    );
+  }
   if (process.env.AGENT_DEBUGGER_SKIP_DOWNLOAD === '1') {
     console.log('[agent-debugger] Skipping native binary download (AGENT_DEBUGGER_SKIP_DOWNLOAD=1).');
     return;
@@ -45,7 +48,7 @@ async function main() {
   if (fs.existsSync(localTarget)) {
     console.log('[agent-debugger] Using locally built target/release binary.');
     fs.copyFileSync(localTarget, destBin);
-    if (!isWin) fs.chmodSync(destBin, 0o755);
+    fs.chmodSync(destBin, 0o755);
     return;
   }
 
@@ -55,7 +58,7 @@ async function main() {
     if (fs.existsSync(cargoBin)) {
       console.log('[agent-debugger] Found ~/.cargo/bin binary, copying to package bin directory.');
       fs.copyFileSync(cargoBin, destBin);
-      if (!isWin) fs.chmodSync(destBin, 0o755);
+      fs.chmodSync(destBin, 0o755);
       return;
     }
   }
@@ -69,7 +72,7 @@ async function main() {
     return;
   }
 
-  const archiveExt = isWin ? 'zip' : 'tar.gz';
+  const archiveExt = 'tar.gz';
   const assetName = `agent-debugger-${targetTriple}.${archiveExt}`;
   const downloadUrl = `https://github.com/${REPO}/releases/download/${VERSION}/${assetName}`;
   const checksumUrl = `${downloadUrl}.sha256`;
@@ -87,14 +90,10 @@ async function main() {
     await verifyChecksum(tmpArchive, checksumUrl);
 
     console.log(`[agent-debugger] Extracting binary to ${binDir}...`);
-    if (isWin) {
-      execSync(`tar -xf "${tmpArchive}" -C "${binDir}"`, { stdio: 'ignore' });
-    } else {
-      execSync(`tar -xzf "${tmpArchive}" -C "${binDir}"`, { stdio: 'ignore' });
-    }
+    execSync(`tar -xzf "${tmpArchive}" -C "${binDir}"`, { stdio: 'ignore' });
 
     if (fs.existsSync(destBin)) {
-      if (!isWin) fs.chmodSync(destBin, 0o755);
+      fs.chmodSync(destBin, 0o755);
       console.log(`[agent-debugger] Successfully installed native binary (${destBin}).`);
     } else {
       console.warn('[agent-debugger] Warning: Extraction succeeded but binary file not found at expected location.');
@@ -220,7 +219,7 @@ function downloadText(url, maxRedirects = 5) {
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { verifyChecksum, sha256File, TARGET_MAP, isChecksumMismatch };
+  module.exports = { verifyChecksum, sha256File, TARGET_MAP, isChecksumMismatch, main };
 }
 
 // Only auto-run when executed as the npm postinstall script, never on

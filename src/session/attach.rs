@@ -1240,7 +1240,6 @@ mod tests {
         let live = sock.local_addr().unwrap().port();
         fake_owner(&root, "owner", "py", "attach", "h", json!(1111), live);
         // A symlink with a colliding name must be skipped, never followed.
-        #[cfg(unix)]
         {
             std::os::unix::fs::symlink(root.join("owner"), root.join("evil")).unwrap();
             // "evil" has no intent of its own; even if it resolved, the

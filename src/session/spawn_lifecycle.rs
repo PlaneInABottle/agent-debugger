@@ -1246,27 +1246,12 @@ mod tests {
         let err = attach_setup_failure("127.0.0.1", 9, Some(false), msg.to_string(), &spec);
         let text = format!("{err:#}");
         assert!(text.starts_with("attach failed:"), "{text}");
-        // Port 9 is dead pre and post: not-listening — except on Windows,
-        // where there is no local listener source (/proc, lsof), so the
-        // post probe honestly reads unknown and the verdict is
-        // endpoint-unreachable (never a confident negative).
-        #[cfg(target_os = "windows")]
-        assert!(text.contains("could not reach debug endpoint"), "{text}");
-        #[cfg(not(target_os = "windows"))]
         assert!(text.contains("no debug listener found"), "{text}");
         assert!(
             !text.contains("stale?"),
             "raw transport text leaves error: {text}"
         );
         let bf = err.downcast_ref::<BridgeFailure>().expect("typed failure");
-        // Port 9 is dead pre and post: not-listening, with identities
-        // (Windows: unknown post probe → endpoint-unreachable, see above).
-        #[cfg(target_os = "windows")]
-        assert_eq!(
-            bf.diagnosis.as_ref().unwrap()["code"],
-            json!("endpoint-unreachable")
-        );
-        #[cfg(not(target_os = "windows"))]
         assert_eq!(
             bf.diagnosis.as_ref().unwrap()["code"],
             json!("endpoint-not-listening")

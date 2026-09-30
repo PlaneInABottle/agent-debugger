@@ -413,16 +413,6 @@ pub(crate) fn run_bounded(cmd: &str, args: &[&str]) -> Option<String> {
         // Nonzero exit, spawn/wait failure, or undecodable bytes: no data.
         Ok(_) => None,
         Err(_) => {
-            // Timed out: best-effort kill (the waiter thread reaps the
-            // child whenever it actually exits); the lookup reports
-            // unavailable instead of hanging attach. Platform-aware:
-            // bare `kill` does not exist on Windows (the old code
-            // silently leaked the timed-out child there).
-            #[cfg(windows)]
-            let _ = std::process::Command::new("taskkill")
-                .args(["/PID", &child_id.to_string(), "/F"])
-                .output();
-            #[cfg(not(windows))]
             let _ = std::process::Command::new("kill")
                 .arg(child_id.to_string())
                 .output();
@@ -444,25 +434,8 @@ pub(crate) fn listener_source_readable() -> bool {
     )
 }
 
-/// Non-Linux readability: macOS ships lsof, so the lookup source is
-/// readable; Windows has NO local listener source (the `port_lookup`
-/// below shells to lsof, which does not exist there) — report false so
-/// `listener_present` reads `None` (unknown) instead of `Some(false)`
-/// (high-confidence "nothing listens", which misdiagnosed live Windows
-/// endpoints as dead).
-#[cfg(target_os = "macos")]
-pub(crate) fn listener_source_readable() -> bool {
-    true
-}
-
-/// Windows: no /proc, no lsof — there is no local source to read.
-#[cfg(target_os = "windows")]
-pub(crate) fn listener_source_readable() -> bool {
-    false
-}
-
-/// Any other non-Linux (BSDs etc.): keep the old lsof-path behavior.
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+/// Non-Linux (macOS lsof path): the lookup source is readable.
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn listener_source_readable() -> bool {
     true
 }
@@ -1199,16 +1172,6 @@ mod tests {
             None
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    #[cfg(target_os = "windows")]
-    fn windows_listener_source_reads_unknown() {
-        // Windows has no local listener source (/proc, lsof): the source
-        // must read unreadable so `listener_present` answers None
-        // (unknown) instead of Some(false) — which misdiagnosed live
-        // endpoints as "not listening" with high confidence.
-        assert!(!listener_source_readable());
     }
 
     #[test]

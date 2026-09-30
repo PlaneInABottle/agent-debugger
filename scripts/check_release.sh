@@ -41,10 +41,7 @@ fi
 
 fail=0
 for t in $TARGETS; do
-  case "$t" in
-    *windows*) ext="zip" ;;
-    *) ext="tar.gz" ;;
-  esac
+  ext="tar.gz"
   for asset in "agent-debugger-${t}.${ext}" "agent-debugger-${t}.${ext}.sha256"; do
     if python3 -c "
 import json,sys

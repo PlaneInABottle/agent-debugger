@@ -310,8 +310,6 @@ fn ensure_js_shared(dir: &std::path::Path) -> anyhow::Result<bool> {
 
 /// Prepend the isolated `ws` dir to `NODE_PATH` so any user value keeps
 /// working (pure seam of the browser arm in `session::spawn_lifecycle`).
-/// Joined with the platform path-list separator (`;` on Windows, `:` —
-/// a hardcoded `:` builds an invalid NODE_PATH on Windows).
 pub(crate) fn prepend_node_path(ws_dir: &str, existing: Option<&str>) -> String {
     match existing {
         Some(v) if !v.is_empty() => std::env::join_paths([ws_dir, v])
@@ -405,25 +403,17 @@ pub fn python_dir() -> anyhow::Result<PathBuf> {
 }
 
 pub(crate) fn venv_python() -> anyhow::Result<PathBuf> {
-    let venv = python_dir()?.join("venv");
-    // Windows venvs keep the interpreter under Scripts\ (POSIX: bin/).
-    // Probing the wrong layout reads a fresh provision as missing (then
-    // fails reinstalling into it) — or misses a working venv forever.
-    #[cfg(windows)]
-    let interp = venv.join("Scripts").join("python.exe");
-    #[cfg(not(windows))]
-    let interp = venv.join("bin").join("python");
-    Ok(interp)
+    Ok(python_dir()?.join("venv").join("bin").join("python"))
 }
 
-/// Python launcher candidates in preference order: `python3` (POSIX
-/// norm) then `python` (Windows norm — `python3` is often absent there).
+/// Python launcher candidates in preference order: `python3` first, then
+/// plain `python` as fallback.
 fn python_launchers() -> [&'static str; 2] {
     ["python3", "python"]
 }
 
-/// First launcher found on PATH (plus `.exe` on Windows). Pure PATH scan
-/// — no spawn, so unit-testable without a Python.
+/// First launcher found on PATH. Pure PATH scan — no spawn, so
+/// unit-testable without a Python.
 pub(crate) fn find_python_launcher() -> Option<&'static str> {
     find_python_launcher_in(std::env::var_os("PATH"))
 }
@@ -432,14 +422,8 @@ fn find_python_launcher_in(path_var: Option<std::ffi::OsString>) -> Option<&'sta
     let path_var = path_var?;
     for prog in python_launchers() {
         for dir in std::env::split_paths(&path_var) {
-            #[cfg(windows)]
-            let names = [format!("{prog}.exe"), prog.to_string()];
-            #[cfg(not(windows))]
-            let names = [prog.to_string()];
-            for name in names {
-                if dir.join(name).is_file() {
-                    return Some(prog);
-                }
+            if dir.join(prog).is_file() {
+                return Some(prog);
             }
         }
     }
@@ -612,59 +596,40 @@ pub(crate) fn run_with_timeout(
     }
 }
 
-/// Graceful-first termination for one pid: SIGTERM on unix (`kill`), a
-/// termination request on Windows (`taskkill` without /F). Best effort —
-/// failure-path reap falls back to kill_tree below. Every bridge installs
-/// a SIGTERM teardown (same cleanup() as close: launched target dies,
-/// attach detaches), so TERM lets the debuggee die with the bridge
-/// instead of orphaning under a bare SIGKILL.
+/// Graceful-first termination for one pid (SIGTERM via `kill`).
+/// Best effort — failure-path reap falls back to kill_tree below. Every
+/// bridge installs a SIGTERM teardown (same cleanup() as close: launched
+/// target dies, attach detaches), so TERM lets the debuggee die with the
+/// bridge instead of orphaning under a bare SIGKILL.
 pub(crate) fn terminate_child(pid: u32) {
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string()])
-            .output();
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = std::process::Command::new("kill")
-            .arg(pid.to_string())
-            .output();
-    }
+    let _ = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .output();
 }
 
 /// Best-effort process-tree kill for one root pid: descendants first,
 /// then the root. Failure-path reap must never orphan a debuggee the
 /// bridge spawned but can no longer clean up itself (hung or
-/// TERM-deaf bridge). Unix walks `pgrep -P` recursively (`pgrep` missing
-/// degrades to root-only kill); Windows uses `taskkill /T /F`.
+/// TERM-deaf bridge). Walks `pgrep -P` recursively (`pgrep` missing
+/// degrades to root-only kill).
 pub(crate) fn kill_tree(pid: u32) {
-    #[cfg(not(windows))]
+    if let Ok(out) = std::process::Command::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .output()
     {
-        if let Ok(out) = std::process::Command::new("pgrep")
-            .args(["-P", &pid.to_string()])
-            .output()
-        {
-            if out.status.success() {
-                for line in String::from_utf8_lossy(&out.stdout).lines() {
-                    if let Ok(c) = line.trim().parse::<u32>() {
-                        if c != pid {
-                            kill_tree(c);
-                        }
+        if out.status.success() {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                if let Ok(c) = line.trim().parse::<u32>() {
+                    if c != pid {
+                        kill_tree(c);
                     }
                 }
             }
         }
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", &pid.to_string()])
-            .output();
     }
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .output();
-    }
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .output();
 }
 
 /// Failure-path bridge reap: SIGTERM first so the bridge runs its SIGTERM
@@ -905,38 +870,16 @@ pub fn find_chrome() -> Option<(String, String)> {
     find_chrome_in(chrome_candidates())
 }
 
-/// Candidate Chrome/Chromium binaries by platform. POSIX covers macOS app
-/// bundles plus PATH names; Windows covers the standard install paths
-/// plus PATH names — without these the browser adapter reported
-/// not-ready on every Windows machine even with Chrome installed.
+/// Candidate Chrome/Chromium binaries: macOS app bundles plus PATH names.
 fn chrome_candidates() -> Vec<String> {
-    #[allow(unused_mut)]
-    let mut out = vec![
+    vec![
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".to_string(),
         "/Applications/Chromium.app/Contents/MacOS/Chromium".to_string(),
         "google-chrome".to_string(),
         "google-chrome-stable".to_string(),
         "chromium".to_string(),
         "chromium-browser".to_string(),
-    ];
-    #[cfg(windows)]
-    {
-        out.extend(
-            [
-                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-                "chrome.exe",
-                "msedge.exe",
-            ]
-            .iter()
-            .map(|s| s.to_string()),
-        );
-        // %LOCALAPPDATA% per-user install (Chrome installs per-user by default).
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            out.push(format!(r"{local}\Google\Chrome\Application\chrome.exe"));
-        }
-    }
-    out
+    ]
 }
 
 fn find_chrome_in(candidates: Vec<String>) -> Option<(String, String)> {
@@ -979,7 +922,6 @@ mod tests {
         dir
     }
 
-    #[cfg(unix)]
     fn ino_of(p: &std::path::Path) -> (u64, u64) {
         use std::os::unix::fs::MetadataExt;
         let m = std::fs::metadata(p).unwrap();
@@ -1028,14 +970,12 @@ mod tests {
         assert!(err.contains("in progress; retry shortly"), "{err}");
         assert!(t0.elapsed() < Duration::from_secs(5), "short bound honored");
         assert!(lock.exists(), "lock file retained on contention");
-        #[cfg(unix)]
         let before = ino_of(&lock);
         drop(holder);
         // Release admits the next holder on the same inode.
         let _next = acquire_provision_lock(&lock, Duration::from_secs(5), Duration::from_millis(5))
             .unwrap();
         assert!(lock.exists(), "lock file never deleted");
-        #[cfg(unix)]
         assert_eq!(ino_of(&lock), before, "inode rendezvous retained");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1058,21 +998,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// True cross-process evidence on unix: python3 holds a BSD flock on
+    /// True cross-process evidence: python3 holds a BSD flock on
     /// the lock file (the same mechanism as File::try_lock); killing it
     /// must release, and the next Rust holder proceeds on the same inode.
-    /// Unix-only: the holder needs fcntl.flock, which does not exist on
-    /// Windows. Death-release on Windows is OS-guaranteed like everywhere
-    /// (LockFileEx releases on process death) and the Windows kill path
-    /// itself (taskkill) is covered by run_with_timeout_kills_slow_child,
-    /// which runs on every platform including Windows CI.
     #[test]
-    #[cfg(unix)]
     fn provision_lock_releases_on_holder_death() {
         let dir = tmpdir("provision-crash");
         let lock = provision_lock_path(&dir, "python");
         std::fs::write(&lock, "").unwrap();
-        #[cfg(unix)]
         let before = ino_of(&lock);
         let prog = lock.to_string_lossy().to_string();
         let mut child = std::process::Command::new("python3")
@@ -1102,13 +1035,11 @@ mod tests {
         let _next = acquire_provision_lock(&lock, Duration::from_secs(5), Duration::from_millis(5))
             .unwrap();
         assert!(lock.exists(), "lock file retained across holder death");
-        #[cfg(unix)]
         assert_eq!(ino_of(&lock), before, "inode retained across death");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    #[cfg(unix)]
     fn provision_symlink_plants_refused() {
         // Canonical-scope plants under an isolated HOME: adapter-dir link,
         // bridge-dest link, and lock link all bail with the link intact
@@ -1157,7 +1088,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn provision_nested_generated_dir_symlink_refused() {
         // Tool-managed nested dirs (venv/, node_modules/, classes/) get
         // the same symlink refusal as adapter roots — realistically scoped:
@@ -1243,7 +1173,6 @@ mod tests {
             let adapters = adapters_dir().unwrap();
             let lock = provision_lock_path(&adapters, "python");
             assert!(lock.exists(), "lock file retained");
-            #[cfg(unix)]
             {
                 let a = ino_of(&lock);
                 let _g =
@@ -1358,34 +1287,15 @@ mod tests {
             Some(std::path::Path::new("/tmp/agent-debugger-home-stable")),
             || {
                 let (program, args) = debugpy_install_command().unwrap();
-                // Program is exactly the venv interpreter, never `<...>/bin/python/bin/pip`.
                 assert_eq!(program, venv_python().unwrap());
-                // Windows venvs live under Scripts\python.exe (POSIX: bin/python).
-                #[cfg(windows)]
-                {
-                    assert_eq!(
-                        program.file_name().and_then(|s| s.to_str()),
-                        Some("python.exe")
-                    );
-                    assert_eq!(
-                        program
-                            .parent()
-                            .and_then(|p| p.file_name())
-                            .and_then(|s| s.to_str()),
-                        Some("Scripts")
-                    );
-                }
-                #[cfg(not(windows))]
-                {
-                    assert_eq!(program.file_name().and_then(|s| s.to_str()), Some("python"));
-                    assert_eq!(
-                        program
-                            .parent()
-                            .and_then(|p| p.file_name())
-                            .and_then(|s| s.to_str()),
-                        Some("bin")
-                    );
-                }
+                assert_eq!(program.file_name().and_then(|s| s.to_str()), Some("python"));
+                assert_eq!(
+                    program
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .and_then(|s| s.to_str()),
+                    Some("bin")
+                );
                 assert_eq!(args, vec!["-m", "pip", "install", "debugpy==1.8.21"]);
             },
         );
@@ -1393,28 +1303,9 @@ mod tests {
 
     #[test]
     fn venv_paths_derive_from_adapter_dir_and_absent_interp_is_no_debugpy() {
-        // Path seam of `ensure_py` (which itself needs processes/network
-        // and stays untested): the venv interpreter is derived from the
-        // adapter dir, never the system PATH. A missing interpreter reads
-        // as "no debugpy" (the check the order logic branches on), never
-        // an error — this test pins the seam, not the order itself.
-        // Pinned HOME: derivation must observe one stable root.
         with_home(
             Some(std::path::Path::new("/tmp/agent-debugger-home-stable")),
             || {
-                // Layout follows the platform venv convention (Scripts on
-                // Windows, bin elsewhere) — probing `bin` on Windows reads
-                // every provision as missing.
-                #[cfg(windows)]
-                assert_eq!(
-                    venv_python().unwrap(),
-                    python_dir()
-                        .unwrap()
-                        .join("venv")
-                        .join("Scripts")
-                        .join("python.exe")
-                );
-                #[cfg(not(windows))]
                 assert_eq!(
                     venv_python().unwrap(),
                     python_dir()
@@ -1425,28 +1316,15 @@ mod tests {
                 );
             },
         );
-        // A missing interpreter is "no debugpy" (fallback proceeds),
-        // never an error: proves the order check degrades, not fails.
         assert!(!has_debugpy("/nonexistent/agent-debugger-interp"));
     }
 
     #[test]
-    fn chrome_candidates_cover_path_names_and_platform_paths() {
-        // PATH names resolve everywhere; Windows adds its install paths
-        // (without them browser readiness was always false on Windows).
+    fn chrome_candidates_cover_path_names() {
         let c = chrome_candidates();
         for name in ["google-chrome", "chromium", "chromium-browser"] {
             assert!(c.contains(&name.to_string()), "missing {name}");
         }
-        #[cfg(windows)]
-        {
-            assert!(
-                c.iter().any(|s| s.ends_with("chrome.exe")),
-                "Windows needs its install paths: {c:?}"
-            );
-        }
-        // Unknown binaries resolve to None fast (a dead entry tries the
-        // next candidate, and a hung one is bounded — never `?` out).
         let t0 = std::time::Instant::now();
         assert!(find_chrome_in(vec!["/definitely/not/a/browser-xyz".to_string()]).is_none());
         assert!(
@@ -1456,7 +1334,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn run_with_timeout_force_kills_term_deaf_child() {
         // A child ignoring SIGTERM must still be gone after the timeout:
         // the old TERM-only kill returned the timeout Err but left the
@@ -1505,34 +1382,19 @@ mod tests {
     fn node_path_prepend_preserves_user_value() {
         assert_eq!(prepend_node_path("/ws", None), "/ws");
         assert_eq!(prepend_node_path("/ws", Some("")), "/ws");
-        // Platform path-list separator (`;` on Windows, `:` elsewhere) —
-        // a hardcoded `:` broke browser attach on Windows.
-        #[cfg(windows)]
-        assert_eq!(prepend_node_path("/ws", Some("/u/lib")), "/ws;/u/lib");
-        #[cfg(not(windows))]
         assert_eq!(prepend_node_path("/ws", Some("/u/lib")), "/ws:/u/lib");
     }
 
     #[test]
     fn python_launcher_prefers_python3_falls_back_to_python() {
         assert_eq!(python_launchers(), ["python3", "python"]);
-        // Pure PATH scan: no spawn, no env mutation (the PATH is passed
-        // in, so parallel tests never race on process-global env).
         let bin = tmpdir("launcher-bin");
         std::fs::write(bin.join("python"), "").unwrap();
         let path = std::env::join_paths([bin.clone()]).unwrap();
-        assert_eq!(
-            find_python_launcher_in(Some(path)),
-            Some("python"),
-            "python-only machine resolves (Windows norm)"
-        );
+        assert_eq!(find_python_launcher_in(Some(path)), Some("python"));
         std::fs::write(bin.join("python3"), "").unwrap();
         let path = std::env::join_paths([bin.clone()]).unwrap();
-        assert_eq!(
-            find_python_launcher_in(Some(path)),
-            Some("python3"),
-            "python3 wins when present (POSIX norm)"
-        );
+        assert_eq!(find_python_launcher_in(Some(path)), Some("python3"));
         let empty = tmpdir("launcher-empty");
         let path = std::env::join_paths([empty.clone()]).unwrap();
         assert_eq!(find_python_launcher_in(Some(path)), None);
@@ -1543,9 +1405,6 @@ mod tests {
 
     #[test]
     fn run_with_timeout_kills_slow_child() {
-        // A 30s sleeper with a 1s bound must fail fast with the timeout
-        // error (not hang 30s), on every OS — the kill path above must
-        // fire portably (taskkill on Windows, kill elsewhere).
         let start = std::time::Instant::now();
         let err = run_with_timeout(
             PathBuf::from("python3"),
@@ -1564,7 +1423,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn has_debugpy_never_hangs_on_stuck_interpreter() {
         // A hung interpreter must degrade to "no debugpy" at the bound,
         // never hang the start behind an unbounded `.output()`. `exec`
@@ -1588,7 +1446,6 @@ mod tests {
     }
 
     /// Spawn a fake bridge script; block until it publishes its child's pid.
-    #[cfg(unix)]
     fn spawn_fake_bridge(dir: &std::path::Path, body: &str) -> (std::process::Child, u32) {
         use std::os::unix::fs::PermissionsExt as _;
         let script = dir.join("bridge.sh");
@@ -1618,7 +1475,6 @@ mod tests {
         (child, grandchild)
     }
 
-    #[cfg(unix)]
     fn pid_alive(pid: u32) -> bool {
         std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
@@ -1628,7 +1484,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn reap_child_runs_term_teardown_before_kill() {
         // Cooperative fake bridge: traps TERM, kills its own child, exits.
         // The grandchild must be dead afterwards — the pre-fix bare
@@ -1655,7 +1510,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn reap_child_tree_kills_term_deaf_bridge() {
         // Uncooperative fake bridge: ignores TERM (the background sleep
         // inherits the disposition). Reap must still leave nothing behind

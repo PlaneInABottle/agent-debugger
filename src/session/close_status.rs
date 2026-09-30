@@ -623,7 +623,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn close_deletion_seams_refuse_symlink_swap() {
         // Both close deletions, exercised exactly (no close() network
         // waits: the 65 s close round-trip + probe + 15 s death poll never

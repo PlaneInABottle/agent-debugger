@@ -11,16 +11,8 @@ pub(super) fn doctor() -> anyhow::Result<Value> {
     let java = probe("java", &["-version"]);
     let javac = probe("javac", &["-version"]);
     let java_ready = javac["found"].as_bool().unwrap_or(false);
-    // Launcher-aware like provisioning (Windows norm is `python`, not
-    // `python3` — probing only `python3` reported python missing on
-    // Windows machines that have it).
     let py_launcher = bridge::find_python_launcher().unwrap_or("python3");
     let python = probe(py_launcher, &["--version"]);
-    // Prefer the isolated venv interpreter when provisioned, else the
-    // system launcher. (A non-UTF8 HOME degrades to the system probe
-    // here, never a panic. The venv layout is platform-aware — Scripts\
-    // on Windows — via the same helper provisioning uses, never a
-    // hardcoded `bin/python`.)
     let venv_py = bridge::venv_python().ok().filter(|p| p.exists());
     let debugpy = match &venv_py {
         Some(interp) => probe(&interp.to_string_lossy(), &["-c", "import debugpy"]),
@@ -131,14 +123,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn debugpy_probe_uses_the_provisioned_venv_interpreter() {
-        // A fake venv interpreter that prints a marker proves doctor probes
-        // whatever `venv_python()` derives — never a hardcoded layout. The
-        // layout itself is pinned per-platform in bridge::tests (the
-        // Windows `Scripts\` branch runs on Windows CI); this test pins
-        // the wiring, so a hardcoded `bin/python` here would miss a
-        // provisioned Windows venv and fall back to the system probe.
         use std::os::unix::fs::PermissionsExt as _;
         let home =
             std::env::temp_dir().join(format!("agent-debugger-doctor-{}-venv", std::process::id()));

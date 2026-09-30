@@ -29,8 +29,7 @@ pub(crate) fn agent_home() -> anyhow::Result<PathBuf> {
 /// name would escape the sessions root on join (Rust replaces the base),
 /// and `close` would recursively delete an arbitrary directory.
 pub(crate) fn check_name(name: &str) -> anyhow::Result<()> {
-    // Backslash is rejected outright too: a legal filename char on Unix
-    // but a separator on Windows — session names never need it.
+    // Backslash is rejected outright too: session names never need it.
     if name.contains(['\\', '/', '\0']) {
         anyhow::bail!("invalid session name '{name}' (single path segment only)");
     }
@@ -419,9 +418,8 @@ mod tests {
     #[test]
     fn refuse_symlink_guards_planted_log_link() {
         // Absent and regular files pass; a symlink refuses with the
-        // canonical text so File::create never follows it. Symlink
-        // creation needs privileges Windows CI may not grant: if the
-        // plant fails, the symlink leg is skipped (the other legs still
+        // canonical text so File::create never follows it. If the plant
+        // fails, the symlink leg is skipped (the other legs still
         // assert), never failed.
         let base = tmpdir("refuse-symlink");
         let target = base.join("victim.txt");
@@ -431,12 +429,7 @@ mod tests {
         std::fs::write(&absent, "log").unwrap();
         refuse_symlink(&absent, "bridge log").expect("regular file passes");
         std::fs::remove_file(&absent).unwrap();
-        #[cfg(unix)]
         let planted = std::os::unix::fs::symlink(&target, &absent).is_ok();
-        #[cfg(windows)]
-        let planted = std::os::windows::fs::symlink_file(&target, &absent).is_ok();
-        #[cfg(not(any(unix, windows)))]
-        let planted = false;
         if !planted {
             let _ = std::fs::remove_dir_all(&base);
             return;
@@ -541,7 +534,6 @@ mod tests {
         let file = base.join("f");
         std::fs::write(&file, "x").unwrap();
         assert!(check_dir_real(&file).is_err());
-        #[cfg(unix)]
         {
             let link = base.join("link");
             std::os::unix::fs::symlink(&real, &link).unwrap();

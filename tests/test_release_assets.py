@@ -2,9 +2,9 @@
 
 install.sh constructs TARGET as "<arch>-<os>" for
   arch in {x86_64, aarch64} x os in {apple-darwin, unknown-linux-gnu},
-postinstall.js TARGET_MAP adds x86_64-pc-windows-msvc (zip).
-release.yml must build all of them, otherwise ARM Linux (and any future
-mapped triple) 404s at install time.
+postinstall.js TARGET_MAP mirrors the same four triples. release.yml must
+build all of them, otherwise ARM Linux (and any future mapped triple)
+404s at install time. Windows is unsupported (no windows target anywhere).
 """
 import re
 import unittest
@@ -36,15 +36,15 @@ class TestReleaseAssetCoverage(unittest.TestCase):
         )
 
     def test_installer_triples_all_built(self):
-        # install.sh: 2 arch x 2 os = 4 tar.gz triples.
+        # install.sh: 2 arch x 2 os = 4 tar.gz triples; postinstall.js
+        # mirrors the same four.
         install_triples = {
             "x86_64-apple-darwin",
             "aarch64-apple-darwin",
             "x86_64-unknown-linux-gnu",
             "aarch64-unknown-linux-gnu",
         }
-        # postinstall.js: install triples + windows zip.
-        expected = install_triples | {"x86_64-pc-windows-msvc"}
+        expected = install_triples
         self.assertTrue(
             expected <= release_targets(),
             f"missing builds: {expected - release_targets()}",
@@ -55,8 +55,8 @@ class TestReleaseAssetCoverage(unittest.TestCase):
         )
 
     def test_expected_build_count(self):
-        # 4 unix tar.gz + 1 windows zip; update this test when adding a tier.
-        self.assertEqual(len(release_targets()), 5)
+        # 4 unix tar.gz; update this test when adding a tier.
+        self.assertEqual(len(release_targets()), 4)
 
     def test_check_release_default_api_base_hits_the_repos_endpoint(self):
         # The manual release verifier must default to the real endpoint

@@ -67,9 +67,8 @@ pub(crate) fn release_startup_lock(path: &std::path::Path, nonce: &str) {
     }
 }
 
-/// Transient-tolerant lock-record snapshot: Windows can fail filesystem
-/// reads/metadata/renames spuriously under concurrency (sharing
-/// violations, AV scans). Retry briefly; a vanished file reads as gone
+/// Transient-tolerant lock-record snapshot: filesystem reads can fail
+/// spuriously under concurrency. Retry briefly; a vanished file reads as gone
 /// (reclaimable), a persistently unreadable one stays an error so callers
 /// keep their fail-closed behavior. Verdicts never change — every attempt
 /// re-reads fresh state, so a live lock still reads live every time.
@@ -329,14 +328,13 @@ pub(crate) enum Liveness {
 }
 
 /// Best-effort holder liveness. Linux reads /proc directly (no
-/// subprocess); Windows uses the native `tasklist` (MSYS `ps` cannot see
-/// native PIDs); elsewhere a bounded `ps` probe answers.
+/// subprocess); elsewhere a bounded `ps` probe answers.
 #[cfg(target_os = "linux")]
 pub(crate) fn holder_alive(pid: u32) -> Liveness {
     let p = std::path::PathBuf::from(format!("/proc/{pid}"));
     match std::fs::symlink_metadata(&p) {
         Ok(m) if m.file_type().is_dir() => Liveness::Alive,
-        Ok(_) => Liveness::Unknown, // exists but unreadable shape: no verdict
+        Ok(_) => Liveness::Unknown,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Liveness::Dead,
         Err(_) => Liveness::Unknown,
     }
@@ -347,12 +345,11 @@ pub(crate) fn holder_alive(pid: u32) -> Liveness {
     ps_has_pid(pid)
 }
 
-/// Dedicated bounded `ps` status probe (macOS and other non-Linux,
-/// non-Windows): the exit status — not mere output presence — is the
-/// signal. `ps -p <dead>` exits nonzero (dead); spawn failure or timeout
-/// means the probe itself failed (unknown), never "dead". No shell, fixed
-/// argv, 5s hard bound.
-#[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
+/// Bounded `ps` status probe (non-Linux): the exit status — not mere
+/// output presence — is the signal. `ps -p <dead>` exits nonzero (dead);
+/// spawn failure or timeout means the probe itself failed (unknown),
+/// never "dead". No shell, fixed argv, 5s hard bound.
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn ps_has_pid(pid: u32) -> Liveness {
     const PS_TIMEOUT: Duration = Duration::from_secs(5);
     let want = pid.to_string();
@@ -372,10 +369,6 @@ pub(crate) fn ps_has_pid(pid: u32) -> Liveness {
     });
     match rx.recv_timeout(PS_TIMEOUT) {
         Ok(Ok(out)) if out.status.success() => {
-            // Success lists the pid when alive (headerless `-o pid=` row);
-            // a bare success without the row still reads as dead — ps
-            // exited 0 only when the selection matched... defensively, an
-            // empty match is dead, never alive.
             if String::from_utf8_lossy(&out.stdout)
                 .lines()
                 .any(|l| l.trim() == want)
@@ -385,54 +378,9 @@ pub(crate) fn ps_has_pid(pid: u32) -> Liveness {
                 Liveness::Dead
             }
         }
-        Ok(Ok(_)) => Liveness::Dead,     // nonzero exit: no such process
-        Ok(Err(_)) => Liveness::Unknown, // wait/reap failure: no verdict
-        Err(_) => Liveness::Unknown,     // timeout: probe failed, not the holder
-    }
-}
-
-/// Windows-native holder probe. MSYS/Cygwin `ps` cannot see native
-/// Windows PIDs, so the `ps` probe above reads every live holder as dead
-/// (and every live endpoint lock as stealable). `tasklist` ships with the
-/// OS: fixed argv, no shell, 5s hard bound. A successful listing that
-/// names the pid reads as alive; a successful listing without it reads as
-/// dead (`INFO: No tasks ...` is the normal no-match shape, exit 0).
-/// Spawn failure, timeout, or an unexpected exit reads as unknown (fail
-/// closed — never "dead").
-#[cfg(target_os = "windows")]
-pub(crate) fn ps_has_pid(pid: u32) -> Liveness {
-    const PS_TIMEOUT: Duration = Duration::from_secs(5);
-    let want = pid.to_string();
-    let quoted = format!("\"{want}\"");
-    let child = match std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {want}"), "/FO", "CSV", "/NH"])
-        .stdin(Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return Liveness::Unknown, // tasklist missing/unforkable: no verdict
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    match rx.recv_timeout(PS_TIMEOUT) {
-        Ok(Ok(out)) if out.status.success() => {
-            // CSV rows quote every field (`"img.exe","1234",...`); match
-            // the whole field so pid 12 never matches a `"123",` row.
-            if String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .any(|l| l.split(',').any(|f| f.trim() == quoted))
-            {
-                Liveness::Alive
-            } else {
-                Liveness::Dead
-            }
-        }
-        Ok(_) => Liveness::Unknown, // nonzero exit / reap failure: no verdict
-        Err(_) => Liveness::Unknown, // timeout: probe failed, not the holder
+        Ok(Ok(_)) => Liveness::Dead,
+        Ok(Err(_)) => Liveness::Unknown,
+        Err(_) => Liveness::Unknown,
     }
 }
 
@@ -544,8 +492,8 @@ pub(crate) fn reconcile_quarantine(
 ) -> bool {
     let qb = match std::fs::read_to_string(q) {
         Ok(b) => b,
-        // Transient read failure (Windows AV/indexer momentarily locking
-        // a just-moved file): q is our own uniquely-named temp holding
+        // Transient read failure (a just-moved file momentarily locked):
+        // q is our own uniquely-named temp holding
         // bytes verified stale an instant before the atomic rename moved
         // exactly those bytes here — dropping it completes the reclaim.
         // The old `unwrap_or_default` instead fed "" into the mismatch
@@ -1059,8 +1007,7 @@ mod tests {
     #[test]
     fn reconcile_unreadable_quarantine_drops_without_planting() {
         // A quarantine temp whose bytes cannot be read (here a directory
-        // stands in for a transiently locked file, as Windows AV/indexer
-        // locks cause) must still complete the reclaim: q is our own
+        // stands in for a transiently locked file) must still complete the reclaim: q is our own
         // uniquely-named temp holding verified-stale bytes, so dropping it
         // is correct. The old empty-string fallback instead planted an
         // empty record at the lock path, cascading mismatch failures to
