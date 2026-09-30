@@ -404,7 +404,7 @@ pub fn python_dir() -> anyhow::Result<PathBuf> {
     Ok(adapters_dir()?.join("python"))
 }
 
-fn venv_python() -> anyhow::Result<PathBuf> {
+pub(crate) fn venv_python() -> anyhow::Result<PathBuf> {
     let venv = python_dir()?.join("venv");
     // Windows venvs keep the interpreter under Scripts\ (POSIX: bin/).
     // Probing the wrong layout reads a fresh provision as missing (then
@@ -424,7 +424,7 @@ fn python_launchers() -> [&'static str; 2] {
 
 /// First launcher found on PATH (plus `.exe` on Windows). Pure PATH scan
 /// — no spawn, so unit-testable without a Python.
-fn find_python_launcher() -> Option<&'static str> {
+pub(crate) fn find_python_launcher() -> Option<&'static str> {
     find_python_launcher_in(std::env::var_os("PATH"))
 }
 
@@ -571,7 +571,15 @@ fn ensure_py_locked() -> anyhow::Result<String> {
 
 /// Run a command with a hard timeout (agents must never hang forever on
 /// network operations like pip). Returns the Output on time, else bails.
-fn run_with_timeout(
+/// Bounded subprocess capture shared by provisioning and `doctor` probes:
+/// a hung toolchain fails the caller, never hangs it past the bound.
+/// Timeout kill is SIGKILL-grade (`kill -KILL` / `taskkill /F`): timed-out
+/// provision tools (pip/npm/javac) have no teardown to run, and a
+/// TERM-deaf child would otherwise linger — holding the venv it was
+/// writing while the parent already reported failure, so the retry races
+/// it — plus its waiter thread, which blocks in wait_with_output until
+/// the child actually exits.
+pub(crate) fn run_with_timeout(
     program: std::path::PathBuf,
     args: &[String],
     timeout: std::time::Duration,
@@ -593,32 +601,14 @@ fn run_with_timeout(
         Ok(Ok(out)) => Ok(out),
         Ok(Err(e)) => Err(anyhow::anyhow!("{program_dbg} failed: {e}")),
         Err(_) => {
-            // Best-effort kill so a timed-out pip/npm never orphans: the
+            // Best-effort force-kill so a timed-out child never orphans: the
             // waiter thread still reaps the child whenever it exits.
-            kill_child(child_id);
+            kill_tree(child_id);
             Err(anyhow::anyhow!(
                 "{program_dbg} timed out after {}s",
                 timeout.as_secs()
             ))
         }
-    }
-}
-
-/// Best-effort kill of a timed-out provision child by pid.
-/// Unix: `kill` (SIGTERM). Windows: `taskkill /PID /F` (`kill` does not
-/// exist there — the old code silently leaked the child).
-fn kill_child(pid: u32) {
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
-            .output();
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = std::process::Command::new("kill")
-            .arg(pid.to_string())
-            .output();
     }
 }
 
@@ -912,22 +902,62 @@ fn ensure_browserbridge_in(dir: &std::path::Path) -> anyhow::Result<PathBuf> {
 /// Locate a Chrome/Chromium binary for the browser adapter (target only —
 /// we attach to it, never provision it). Returns (binary, version line).
 pub fn find_chrome() -> Option<(String, String)> {
-    let candidates = [
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        "google-chrome",
-        "google-chrome-stable",
-        "chromium",
-        "chromium-browser",
+    find_chrome_in(chrome_candidates())
+}
+
+/// Candidate Chrome/Chromium binaries by platform. POSIX covers macOS app
+/// bundles plus PATH names; Windows covers the standard install paths
+/// plus PATH names — without these the browser adapter reported
+/// not-ready on every Windows machine even with Chrome installed.
+fn chrome_candidates() -> Vec<String> {
+    #[allow(unused_mut)]
+    let mut out = vec![
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".to_string(),
+        "/Applications/Chromium.app/Contents/MacOS/Chromium".to_string(),
+        "google-chrome".to_string(),
+        "google-chrome-stable".to_string(),
+        "chromium".to_string(),
+        "chromium-browser".to_string(),
     ];
+    #[cfg(windows)]
+    {
+        out.extend(
+            [
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                "chrome.exe",
+                "msedge.exe",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
+        // %LOCALAPPDATA% per-user install (Chrome installs per-user by default).
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            out.push(format!(r"{local}\Google\Chrome\Application\chrome.exe"));
+        }
+    }
+    out
+}
+
+fn find_chrome_in(candidates: Vec<String>) -> Option<(String, String)> {
     for bin in candidates {
-        if let Ok(out) = std::process::Command::new(bin).arg("--version").output() {
-            if out.status.success() {
-                let mut text = String::from_utf8_lossy(&out.stdout).to_string();
-                text.push_str(&String::from_utf8_lossy(&out.stderr));
-                let first = text.lines().next().unwrap_or("").trim().to_string();
-                return Some((bin.to_string(), first));
-            }
+        // Bounded like every other toolchain probe: a hung browser binary
+        // must read as absent, never hang `doctor` past its budget.
+        // A failed/timeout probe tries the NEXT candidate (never `?` out
+        // of the loop — one dead entry must not hide the rest).
+        let out = match run_with_timeout(
+            std::path::PathBuf::from(&bin),
+            &["--version".to_string()],
+            std::time::Duration::from_secs(10),
+        ) {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        if out.status.success() {
+            let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            let first = text.lines().next().unwrap_or("").trim().to_string();
+            return Some((bin, first));
         }
     }
     None
@@ -1398,6 +1428,77 @@ mod tests {
         // A missing interpreter is "no debugpy" (fallback proceeds),
         // never an error: proves the order check degrades, not fails.
         assert!(!has_debugpy("/nonexistent/agent-debugger-interp"));
+    }
+
+    #[test]
+    fn chrome_candidates_cover_path_names_and_platform_paths() {
+        // PATH names resolve everywhere; Windows adds its install paths
+        // (without them browser readiness was always false on Windows).
+        let c = chrome_candidates();
+        for name in ["google-chrome", "chromium", "chromium-browser"] {
+            assert!(c.contains(&name.to_string()), "missing {name}");
+        }
+        #[cfg(windows)]
+        {
+            assert!(
+                c.iter().any(|s| s.ends_with("chrome.exe")),
+                "Windows needs its install paths: {c:?}"
+            );
+        }
+        // Unknown binaries resolve to None fast (a dead entry tries the
+        // next candidate, and a hung one is bounded — never `?` out).
+        let t0 = std::time::Instant::now();
+        assert!(find_chrome_in(vec!["/definitely/not/a/browser-xyz".to_string()]).is_none());
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "dead candidate must not hang"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_with_timeout_force_kills_term_deaf_child() {
+        // A child ignoring SIGTERM must still be gone after the timeout:
+        // the old TERM-only kill returned the timeout Err but left the
+        // child (and its waiter thread) lingering — a lingering pip then
+        // raced the retry over the venv it was writing. Ignored
+        // dispositions are inherited across fork, so a shell that traps
+        // TERM then runs sleep leaves a TERM-deaf tree (no `exec`: the
+        // shell keeps the script path in its cmdline, which is the
+        // stable pgrep needle — the bracket trick avoids matching pgrep
+        // itself).
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tmpdir("term-deaf");
+        let script = dir.join("term-deaf.sh");
+        std::fs::write(&script, "#!/bin/sh\ntrap \"\" TERM\nsleep 60\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let t0 = std::time::Instant::now();
+        let err =
+            run_with_timeout(script.clone(), &[], std::time::Duration::from_secs(3)).unwrap_err();
+        assert!(format!("{err}").contains("timed out"), "{err}");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "timeout must return near its bound"
+        );
+        // The TERM-deaf tree must actually be dead now, not lingering.
+        let pattern = format!("[t]erm-deaf\\.sh");
+        let dead_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let found = std::process::Command::new("pgrep")
+                .args(["-f", &pattern])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !found {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < dead_by,
+                "TERM-deaf child lingered past the timeout kill"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

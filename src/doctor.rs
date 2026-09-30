@@ -11,21 +11,20 @@ pub(super) fn doctor() -> anyhow::Result<Value> {
     let java = probe("java", &["-version"]);
     let javac = probe("javac", &["-version"]);
     let java_ready = javac["found"].as_bool().unwrap_or(false);
-    let python = probe("python3", &["--version"]);
-    // Prefer the isolated venv interpreter when provisioned, else system one.
-    // (Paths resolve through the fail-closed roots above; a non-UTF8 HOME
-    // degrades to the system probe here, never a panic.)
-    let venv_py = bridge::python_dir()?
-        .join("venv")
-        .join("bin")
-        .join("python");
-    let debugpy = if venv_py.exists() {
-        probe(
-            venv_py.to_str().unwrap_or("python3"),
-            &["-c", "import debugpy"],
-        )
-    } else {
-        probe("python3", &["-c", "import debugpy"])
+    // Launcher-aware like provisioning (Windows norm is `python`, not
+    // `python3` — probing only `python3` reported python missing on
+    // Windows machines that have it).
+    let py_launcher = bridge::find_python_launcher().unwrap_or("python3");
+    let python = probe(py_launcher, &["--version"]);
+    // Prefer the isolated venv interpreter when provisioned, else the
+    // system launcher. (A non-UTF8 HOME degrades to the system probe
+    // here, never a panic. The venv layout is platform-aware — Scripts\
+    // on Windows — via the same helper provisioning uses, never a
+    // hardcoded `bin/python`.)
+    let venv_py = bridge::venv_python().ok().filter(|p| p.exists());
+    let debugpy = match &venv_py {
+        Some(interp) => probe(&interp.to_string_lossy(), &["-c", "import debugpy"]),
+        None => probe(py_launcher, &["-c", "import debugpy"]),
     };
     let node = probe("node", &["--version"]);
     let chrome = match bridge::find_chrome() {
@@ -78,7 +77,15 @@ pub(super) fn doctor() -> anyhow::Result<Value> {
 }
 
 fn probe(program: &str, args: &[&str]) -> Value {
-    match std::process::Command::new(program).args(args).output() {
+    // Bounded like every other toolchain probe: a hung binary (stuck
+    // network drive, broken shim) reads as absent after 15s instead of
+    // hanging `doctor` forever behind an unbounded `.output()`.
+    let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    match bridge::run_with_timeout(
+        std::path::PathBuf::from(program),
+        &owned,
+        std::time::Duration::from_secs(15),
+    ) {
         Ok(out) => {
             let mut text = String::from_utf8_lossy(&out.stdout).to_string();
             text.push_str(&String::from_utf8_lossy(&out.stderr));
@@ -106,6 +113,52 @@ mod tests {
         with_home(Some(std::path::Path::new("")), || {
             assert!(doctor().is_err());
         });
+    }
+
+    #[test]
+    fn probe_missing_binary_reports_absent_fast() {
+        // A missing toolchain reads as absent (never an error, never a
+        // hang): proves the bounded-probe error path without waiting out
+        // the 15s bound (the bound itself is covered by the
+        // run_with_timeout timing tests in bridge::tests).
+        let t0 = std::time::Instant::now();
+        let v = probe("/definitely/not/a/tool-xyz", &["--version"]);
+        assert_eq!(v["found"], json!(false));
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "missing binary must fail fast"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn debugpy_probe_uses_the_provisioned_venv_interpreter() {
+        // A fake venv interpreter that prints a marker proves doctor probes
+        // whatever `venv_python()` derives — never a hardcoded layout. The
+        // layout itself is pinned per-platform in bridge::tests (the
+        // Windows `Scripts\` branch runs on Windows CI); this test pins
+        // the wiring, so a hardcoded `bin/python` here would miss a
+        // provisioned Windows venv and fall back to the system probe.
+        use std::os::unix::fs::PermissionsExt as _;
+        let home =
+            std::env::temp_dir().join(format!("agent-debugger-doctor-{}-venv", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let v = with_home(Some(home.as_path()), || {
+            let interp = bridge::venv_python().expect("venv path derives under a usable HOME");
+            std::fs::create_dir_all(interp.parent().unwrap()).unwrap();
+            std::fs::write(&interp, "#!/bin/sh\necho VENV-PROBE-MARKER\n").unwrap();
+            std::fs::set_permissions(&interp, std::fs::Permissions::from_mode(0o755)).unwrap();
+            doctor().expect("doctor with a usable HOME")
+        });
+        assert!(
+            v["debugpy"]["version"]
+                .as_str()
+                .unwrap_or("")
+                .contains("VENV-PROBE-MARKER"),
+            "debugpy probe must run the venv interpreter: {}",
+            v["debugpy"]
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
