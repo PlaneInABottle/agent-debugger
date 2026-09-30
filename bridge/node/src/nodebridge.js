@@ -753,6 +753,15 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/** Monotonic clock (ms) for every DEADLINE and elapsed-duration
+ *  computation: Date.now() steps backward on NTP corrections, manual clock
+ *  changes and VM resumes, which would stretch a bounded wait by hours (or
+ *  time it out instantly). Reported timestamps (updatedAt, observedAt, park
+ *  diagnostics) stay on the wall clock — they are values, not durations. */
+function monoNow() {
+  return Number(process.hrtime.bigint() / 1000000n);
+}
+
 function escapeRegex(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -1459,7 +1468,7 @@ class Session {
       this.child.once('close', (code) => resolve(code));
       this.child.once('error', () => resolve('spawn-error'));
     });
-    const deadline = Date.now() + 20000;
+    const deadline = monoNow() + 20000;
     for (;;) {
       if (this.spawnError) {
         throw new BridgeErr(`cannot run ${this.cfg.nodeBin}: ` +
@@ -1482,7 +1491,7 @@ class Session {
       if (code !== null && code !== undefined) {
         throw new BridgeErr(`target exited during startup (code ${code}): ${text.trim().slice(-500)}`);
       }
-      if (Date.now() > deadline) {
+      if (monoNow() > deadline) {
         try {
           this.child.kill('SIGKILL');
         } catch (_) { /* best effort */ }
@@ -1636,10 +1645,14 @@ class Session {
    *  trigger, so triggerStatus is always unknown; success paths never
    *  fabricate sent/failed. expectedBreak rides only when the capture
    *  planted one. */
-  waitContext(timeout, startedAt, expectedBreak) {
+  waitContext(timeout, started, expectedBreak) {
+    // `started` is the (wall_epoch_ms, monotonic_ms) pair taken at wait
+    // entry: the epoch is a reported value, `waitedMs` a duration measured
+    // on the monotonic clock (a wall-clock step must not report a negative
+    // or hours-long wait).
     const ctx = {
-      waitStartedAt: Math.floor(startedAt / 1000),
-      waitedMs: Math.max(0, Date.now() - startedAt),
+      waitStartedAt: Math.floor(started.epoch / 1000),
+      waitedMs: Math.max(0, Math.round(monoNow() - started.mono)),
       triggerStatus: 'unknown',
     };
     if (expectedBreak !== undefined && expectedBreak !== null) {
@@ -2794,17 +2807,21 @@ class Session {
     return msg;
   }
 
-  stopTimeoutErr(timeout, withWaitContext, startedAt) {
+  stopTimeoutErr(timeout, withWaitContext, started) {
     const err = new StopTimeout(this.timeoutText(timeout));
     // wait/capture only (never continue/step): the honest trigger-
     // unknown context rides structurally; the prefix is unchanged.
-    if (withWaitContext) err.waitContext = this.waitContext(timeout, startedAt);
+    if (withWaitContext) err.waitContext = this.waitContext(timeout, started);
     return err;
   }
 
   async pump(timeout, withWaitContext = false) {
-    const startedAt = Date.now();
-    const deadline = startedAt + timeout * 1000;
+    // Monotonic deadline: Date.now() steps backward on NTP corrections,
+    // manual changes and VM resumes, which would extend this bounded wait
+    // by hours (or time it out instantly). Reported timestamps (updatedAt,
+    // park diagnostics) stay on the wall clock — they are values.
+    const started = { epoch: Date.now(), mono: monoNow() };
+    const deadline = started.mono + timeout * 1000;
     for (;;) {
       if (!amOwner(this.cfg.dir)) {
         await this.cleanup().catch(() => {});
@@ -2814,8 +2831,8 @@ class Session {
       // counts for launch).
       if (this.paused || this.workers.liveWorkers().some((w) => w.paused)) return 'stopped';
       if (this.exited) throw new BridgeErr('target exited');
-      if (Date.now() > deadline) {
-        throw this.stopTimeoutErr(timeout, withWaitContext, startedAt);
+      if (monoNow() > deadline) {
+        throw this.stopTimeoutErr(timeout, withWaitContext, started);
       }
       await sleep(50);
     }
@@ -2862,16 +2879,16 @@ class Session {
    *  wait/capture enrichment keeps working); exits and owner loss pass
    *  through untouched. */
   async pumpForStop(timeout, tid, explicit, withWaitContext, base = null) {
-    const startedAt = Date.now();
-    const deadline = startedAt + timeout * 1000;
+    const started = { epoch: Date.now(), mono: monoNow() };
+    const deadline = started.mono + timeout * 1000;
     const base0 = base || this.freshBase();
     const timedOut = () => {
-      const e = this.stopTimeoutErr(timeout, withWaitContext, startedAt);
+      const e = this.stopTimeoutErr(timeout, withWaitContext, started);
       e.message += ` [parks: ${this.parkInventory()}]`;
       return e;
     };
     for (;;) {
-      const remaining = (deadline - Date.now()) / 1000;
+      const remaining = (deadline - monoNow()) / 1000;
       if (remaining <= 0) throw timedOut();
       try {
         await this.pump(remaining, withWaitContext);
@@ -3498,7 +3515,7 @@ class Session {
     // Entry time for the early-stage contexts below (session-gone /
     // before-armed): same seconds+ms units as every wait context; the
     // wait never happened, so waitedMs is ~0 — never faked.
-    const entryStarted = Date.now();
+    const entryStarted = { epoch: Date.now(), mono: monoNow() };
     let tid;
     try {
       tid = this.resolveTarget(req);
@@ -3509,8 +3526,8 @@ class Session {
       if (e instanceof BridgeErr && /exited/i.test(String((e && e.message) || e)) && !e.waitContext) {
         try {
           e.waitContext = {
-            waitStartedAt: Math.floor(entryStarted / 1000),
-            waitedMs: Math.max(0, Date.now() - entryStarted),
+            waitStartedAt: Math.floor(entryStarted.epoch / 1000),
+            waitedMs: Math.max(0, Math.round(monoNow() - entryStarted.mono)),
             triggerStatus: 'unknown',
             captureStage: 'session-gone',
             ephemeralPlanted: false,
@@ -3535,8 +3552,8 @@ class Session {
       if (e instanceof BridgeErr && /exited/i.test(String((e && e.message) || e)) && !e.waitContext) {
         try {
           e.waitContext = {
-            waitStartedAt: Math.floor(entryStarted / 1000),
-            waitedMs: Math.max(0, Date.now() - entryStarted),
+            waitStartedAt: Math.floor(entryStarted.epoch / 1000),
+            waitedMs: Math.max(0, Math.round(monoNow() - entryStarted.mono)),
             triggerStatus: 'unknown',
             captureStage: 'session-gone',
             ephemeralPlanted: false,
@@ -3575,8 +3592,8 @@ class Session {
           const wrapped = new BridgeErr(`capture target exited before ephemeral breakpoint was armed: ${(e && e.message) || e}`);
           try {
             wrapped.waitContext = {
-              waitStartedAt: Math.floor(entryStarted / 1000),
-              waitedMs: Math.max(0, Date.now() - entryStarted),
+              waitStartedAt: Math.floor(entryStarted.epoch / 1000),
+              waitedMs: Math.max(0, Math.round(monoNow() - entryStarted.mono)),
               triggerStatus: 'unknown',
               captureStage: 'before-armed',
               ephemeralPlanted: false,
@@ -3595,7 +3612,7 @@ class Session {
     // ephemeral WAS armed. Never endpoint-rejected/unreachable, never
     // "unreachable code". waitStartedAt/waitedMs match the timeout
     // context units (seconds since epoch / ms waited).
-    const started = Date.now();
+    const started = { epoch: Date.now(), mono: monoNow() };
     const stageExit = (err) => {
       if (!(err instanceof BridgeErr) || !/exited|closed/i.test(String((err && err.message) || err))) return null;
       const wasPlanted = !!(token && token.kind !== 'main-dup' && token.kind !== 'child-dup');
@@ -3603,8 +3620,8 @@ class Session {
         `target exited before capture hit${spec !== null ? ` (${spec})` : ''}: ${(err && err.message) || err}`);
       try {
         wrapped.waitContext = {
-          waitStartedAt: Math.floor(started / 1000),
-          waitedMs: Math.max(0, Date.now() - started),
+          waitStartedAt: Math.floor(started.epoch / 1000),
+          waitedMs: Math.max(0, Math.round(monoNow() - started.mono)),
           triggerStatus: 'unknown',
           captureStage: 'armed-wait',
           ephemeralPlanted: wasPlanted,

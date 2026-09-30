@@ -90,6 +90,17 @@ class StopTimeout(BridgeErr):
         self.wait_context = wait_context
 
 
+def mono():
+    """Monotonic clock for every DEADLINE and elapsed-duration
+    computation (bounded waits, handshake budgets, waitedMs). Wall clock
+    (`time.time()`) steps backward on NTP corrections, manual changes and
+    VM restores: a wait measured against it can then run for hours past its
+    budget (or time out instantly). Epoch timestamps (`observedAt`,
+    `updatedAt`, `waitStartedAt`, park diagnostics) still use wall clock —
+    they are values, not durations, and stay comparable across processes."""
+    return time.monotonic()
+
+
 def is_framing_error_text(msg):
     """True for malformed-adapter-frame texts (never target death): the
     framing layer raises plain BridgeErr for these, and the idle pump must
@@ -103,9 +114,9 @@ def is_framing_error_text(msg):
 # ---------------------------------------------------------------- framing
 
 def read_frame(conn):
-    deadline = time.monotonic() + 5
+    deadline = mono() + 5
     def recv(size):
-        remaining = deadline - time.monotonic()
+        remaining = deadline - mono()
         if remaining <= 0:
             raise BridgeErr("frame read timed out")
         conn.settimeout(remaining)
@@ -296,7 +307,7 @@ class DapConn:
             self.sock.sendall(b"Content-Length: %d\r\n\r\n" % len(body) + body)
         except OSError as e:
             raise BridgeErr(f"DAP send failed: {e}")
-        deadline = time.time() + timeout
+        deadline = mono() + timeout
         while True:
             for i, m in enumerate(self.stash):
                 if m.get("type") == "response" and m.get("request_seq") == mine:
@@ -310,11 +321,11 @@ class DapConn:
                             raise ConfigErr(m.get("message", f"{command} failed"))
                         raise BridgeErr(m.get("message", f"{command} failed"))
                     return m.get("body", {})
-            if time.time() > deadline:
+            if mono() > deadline:
                 raise BridgeErr(f"DAP {command} timed out")
             try:
                 msg = self._read_msg(
-                    timeout=max(0.1, deadline - time.time()))
+                    timeout=max(0.1, deadline - mono()))
             except BridgeErr:
                 raise
             if msg.get("type") == "response" and msg.get("request_seq") == mine:
@@ -2287,11 +2298,11 @@ class Session:
                     del self.dap.stash[i]
                     self._note_process_event(m.get("body", {}))
                     return True
-            deadline = time.time() + timeout
-            while time.time() < deadline:
+            deadline = mono() + timeout
+            while mono() < deadline:
                 try:
                     msg = self.dap._read_msg(
-                        timeout=max(0.05, deadline - time.time()))
+                        timeout=max(0.05, deadline - mono()))
                 except (socket.timeout, TimeoutError, BridgeErr):
                     return self._process_event is not None
                 if _is_process_event(msg):
@@ -2519,13 +2530,17 @@ class Session:
         except Exception:
             pass
 
-    def _wait_context(self, timeout, started_at, expected_break=None):
+    def _wait_context(self, timeout, started, expected_break=None):
         """Honest timeout context: the debugger never observes the external
         trigger, so triggerStatus is always unknown; success paths never
         fabricate sent/failed. expectedBreak rides only when the capture
-        planted one."""
-        ctx = {"waitStartedAt": int(started_at),
-               "waitedMs": max(0, int((time.time() - started_at) * 1000)),
+        planted one. `started` is the (wall_epoch, monotonic) pair taken at
+        wait entry: the epoch is a reported value, `waitedMs` a duration —
+        measured on the monotonic clock so a wall-clock step cannot report
+        a negative or hours-long wait."""
+        epoch, started_mono = started
+        ctx = {"waitStartedAt": int(epoch),
+               "waitedMs": max(0, int((mono() - started_mono) * 1000)),
                "triggerStatus": "unknown"}
         if expected_break is not None:
             ctx["expectedBreak"] = expected_break
@@ -2556,8 +2571,8 @@ class Session:
             # The child holds its own dup of the fd; the parent side must
             # close (previously leaked one fd per session daemon).
             log.close()
-        deadline = time.time() + 20
-        while time.time() < deadline:
+        deadline = mono() + 20
+        while mono() < deadline:
             if self.adapter.poll() is not None:
                 raise BridgeErr("debugpy adapter exited during startup (see adapter.log)")
             try:
@@ -2605,8 +2620,8 @@ class Session:
         _ = prog_args
 
     def _drain_response(self, command):
-        deadline = time.time() + 30
-        while time.time() < deadline:
+        deadline = mono() + 30
+        while mono() < deadline:
             for i, m in enumerate(self.dap.stash):
                 if m.get("type") == "response" and m.get("command") == command:
                     del self.dap.stash[i]
@@ -2615,7 +2630,7 @@ class Session:
                     return
             try:
                 msg = self.dap._read_msg(
-                    timeout=max(0.1, deadline - time.time()))
+                    timeout=max(0.1, deadline - mono()))
             except (socket.timeout, TimeoutError):
                 # Response side handles its own deadline; bubble timeouts as
                 # BridgeErr everywhere else.
@@ -2659,8 +2674,8 @@ class Session:
     def _drain_child_response(self, dap, command, timeout=30):
         """Consume one child's pipelined response (attach answers only after
         configurationDone — waiting earlier deadlocks, per M0)."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+        deadline = mono() + timeout
+        while mono() < deadline:
             for i, m in enumerate(dap.stash):
                 if m.get("type") == "response" and m.get("command") == command:
                     del dap.stash[i]
@@ -2669,7 +2684,7 @@ class Session:
                     return
             try:
                 msg = dap._read_msg(
-                    timeout=max(0.1, deadline - time.time()))
+                    timeout=max(0.1, deadline - mono()))
             except (socket.timeout, TimeoutError):
                 raise BridgeErr(f"{command} response never arrived")
             if msg.get("type") == "response" and msg.get("command") == command:
@@ -3332,7 +3347,7 @@ class Session:
         timeouts stay bare). The wait's park epoch comes from
         _take_wait_epoch (a pre-resume capture stashed by the resume caller,
         else a fresh entry capture — exact when no resume precedes)."""
-        deadline = time.time() + timeout
+        deadline = mono() + timeout
         start_seq = self._take_wait_epoch()
         for tid, conn, _sock in self._conn_entries():
             while True:
@@ -3352,7 +3367,7 @@ class Session:
                 except Exception:
                     pass
                 raise SystemExit(0)
-            remaining = deadline - time.time()
+            remaining = deadline - mono()
             if remaining <= 0:
                 # The resume produced only held suspects: park the first
                 # still-live one on any target instead of timing out, then
@@ -4118,7 +4133,7 @@ class Session:
         # precedes the wait: stash the entry epoch for the pump.
         self._park_local.wait_start_seq = self._pump_start_seq()
         self._park_local.parked = None
-        started = time.time()
+        started = (time.time(), mono())
         try:
             self._pump_for(timeout, tid if explicit else None)
         except StopTimeout as e:
@@ -4299,7 +4314,7 @@ class Session:
         # Entry time for the early-stage contexts below (session-gone /
         # before-armed): same seconds+ms units as every wait context; the
         # wait never happened, so waitedMs is ~0 — never faked.
-        entry = time.time()
+        entry = (time.time(), mono())
         try:
             tid = self.resolve_target(req)
             with self._TargetScope(self, tid):
@@ -4314,8 +4329,8 @@ class Session:
                     e, "wait_context", None) is None:
                 try:
                     e.wait_context = {
-                        "waitStartedAt": int(entry),
-                        "waitedMs": max(0, int((time.time() - entry) * 1000)),
+                        "waitStartedAt": int(entry[0]),
+                        "waitedMs": max(0, int((mono() - entry[1]) * 1000)),
                         "triggerStatus": "unknown",
                         "captureStage": "session-gone",
                         "ephemeralPlanted": False,
@@ -4360,8 +4375,8 @@ class Session:
                         f"breakpoint was armed: {e}")
                     try:
                         wrapped.wait_context = {
-                            "waitStartedAt": int(entry),
-                            "waitedMs": max(0, int((time.time() - entry) * 1000)),
+                            "waitStartedAt": int(entry[0]),
+                            "waitedMs": max(0, int((mono() - entry[1]) * 1000)),
                             "triggerStatus": "unknown",
                             "captureStage": "before-armed",
                             "ephemeralPlanted": False,
@@ -4375,7 +4390,7 @@ class Session:
                         pass
                     raise wrapped from e
                 raise
-        started = time.time()
+        started = (time.time(), mono())
         try:
             # No resume precedes this wait (the ephemeral only plants):
             # stash the entry epoch for the pump.
@@ -4517,8 +4532,8 @@ class Session:
         wrapped = BridgeErr(msg)
         try:
             wrapped.wait_context = {
-                "waitStartedAt": int(started),
-                "waitedMs": max(0, int((time.time() - started) * 1000)),
+                "waitStartedAt": int(started[0]),
+                "waitedMs": max(0, int((mono() - started[1]) * 1000)),
                 "triggerStatus": "unknown",
                 "captureStage": "armed-wait",
                 "ephemeralPlanted": planted,
@@ -4537,8 +4552,8 @@ class Session:
         """Consume already-arrived messages (output events etc.) without
         waiting for a stop. Lets `logs` flush recently collected lines.
         Polls every live session; a newly parked stop ends the drain."""
-        deadline = time.time() + budget
-        while time.time() < deadline:
+        deadline = mono() + budget
+        while mono() < deadline:
             drained = False
             for tid, conn, _sock in self._conn_entries():
                 while True:
@@ -4574,7 +4589,7 @@ class Session:
                 return
             try:
                 ready, _, _ = select.select(
-                    socks, [], [], max(0.01, deadline - time.time()))
+                    socks, [], [], max(0.01, deadline - mono()))
             except (OSError, ValueError):
                 return
             if not ready:
@@ -4585,7 +4600,7 @@ class Session:
                     continue
                 try:
                     msg = conn._read_msg(
-                        timeout=max(0.01, deadline - time.time()))
+                        timeout=max(0.01, deadline - mono()))
                 except (socket.timeout, TimeoutError, BridgeErr):
                     return
                 try:
@@ -5880,9 +5895,9 @@ def idle_pump(st):
                         sys.stderr.write(f"dap: {e}\n")
                         return
                     progressed = True
-                    if time.monotonic() >= deadline:
+                    if mono() >= deadline:
                         break
-                while time.monotonic() < deadline:
+                while mono() < deadline:
                     try:
                         msg = st._try_read(conn)
                     except BridgeErr as e:
@@ -5913,7 +5928,7 @@ def idle_pump(st):
                 return
             try:
                 ready, _, _ = select.select(
-                    socks, [], [], max(0.001, deadline - time.monotonic()))
+                    socks, [], [], max(0.001, deadline - mono()))
             except (OSError, ValueError):
                 return
             if not ready:
@@ -5924,7 +5939,7 @@ def idle_pump(st):
                     continue
                 try:
                     msg = conn._read_msg(
-                        timeout=max(0.001, deadline - time.monotonic()))
+                        timeout=max(0.001, deadline - mono()))
                 except (socket.timeout, TimeoutError):
                     break
                 except BridgeErr as e:

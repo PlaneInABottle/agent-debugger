@@ -2446,7 +2446,7 @@ class TargetIdentityTests(unittest.TestCase):
         }
         st._note_process_event({"name": "srv.py", "systemProcessId": 12,
                                 "startMethod": "attach"})
-        started = time.time() - 2.0
+        started = (time.time() - 2.0, bridge.mono() - 2.0)
         ctx = st._wait_context(2, started)
         self.assertEqual(ctx["triggerStatus"], "unknown")
         self.assertNotIn("expectedBreak", ctx)
@@ -2466,7 +2466,7 @@ class TargetIdentityTests(unittest.TestCase):
             "adapter": {"confidence": "unavailable"},
         }
         st._build_target_identity()
-        ctx = st._wait_context(7, time.time())
+        ctx = st._wait_context(7, (time.time(), bridge.mono()))
         st.pump = Mock(side_effect=bridge.StopTimeout(st.timeout_text(7), ctx))
         with self.assertRaises(bridge.StopTimeout) as cm:
             st.cmd_wait({}, 7)
@@ -2486,7 +2486,7 @@ class TargetIdentityTests(unittest.TestCase):
         }
         st._build_target_identity()
         st.dap_request = Mock(side_effect=lambda *a, **k: {"breakpoints": [{"verified": True}]})
-        ctx = st._wait_context(5, time.time())
+        ctx = st._wait_context(5, (time.time(), bridge.mono()))
         st.pump = Mock(side_effect=bridge.StopTimeout(st.timeout_text(5), ctx))
         spec = f"{path}:5"
         with self.assertRaises(bridge.StopTimeout) as cm:

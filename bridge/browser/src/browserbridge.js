@@ -633,6 +633,16 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/** Monotonic clock (ms) for every DEADLINE and elapsed-duration
+ *  computation: Date.now() steps backward on NTP corrections, manual
+ *  clock changes and VM resumes, which would stretch a bounded wait by
+ *  hours (or time it out instantly). Reported timestamps (updatedAt,
+ *  observedAt, park diagnostics) stay on the wall clock — they are
+ *  values, not durations. */
+function monoNow() {
+  return Number(process.hrtime.bigint() / 1000000n);
+}
+
 const EXITED_MSG = 'target tab has closed — close this session';
 
 // ---------------------------------------------------------------- M5 owners
@@ -1114,10 +1124,10 @@ class Session {
    *  trigger, so triggerStatus is always unknown; success paths never
    *  fabricate sent/failed. expectedBreak rides only when the capture
    *  planted one. */
-  waitContext(timeout, startedAt, expectedBreak) {
+  waitContext(timeout, started, expectedBreak) {
     const ctx = {
-      waitStartedAt: Math.floor(startedAt / 1000),
-      waitedMs: Math.max(0, Date.now() - startedAt),
+      waitStartedAt: Math.floor(started.epoch / 1000),
+      waitedMs: Math.max(0, Math.round(monoNow() - started.mono)),
       triggerStatus: 'unknown',
     };
     if (expectedBreak !== undefined && expectedBreak !== null) {
@@ -1631,8 +1641,8 @@ class Session {
   }
 
   async pump(timeout, withWaitContext = false) {
-    const startedAt = Date.now();
-    const deadline = startedAt + timeout * 1000;
+    const started = { epoch: Date.now(), mono: monoNow() };
+    const deadline = started.mono + timeout * 1000;
     for (;;) {
       if (!amOwner(this.cfg.dir)) {
         await this.cleanup().catch(() => {});
@@ -1640,11 +1650,11 @@ class Session {
       }
       if (this.paused) return 'stopped';
       if (this.exited) throw new BridgeErr(EXITED_MSG);
-      if (Date.now() > deadline) {
+      if (monoNow() > deadline) {
         const err = new StopTimeout(this.timeoutText(timeout));
         // wait/capture only (never continue/step/reload): the honest
         // trigger-unknown context rides structurally; prefix unchanged.
-        if (withWaitContext) err.waitContext = this.waitContext(timeout, startedAt);
+        if (withWaitContext) err.waitContext = this.waitContext(timeout, started);
         throw err;
       }
       await sleep(50);
@@ -2189,7 +2199,7 @@ class Session {
     // Entry time for the early-stage contexts below (session-gone /
     // before-armed): same seconds+ms units as every wait context; the
     // wait never happened, so waitedMs is ~0 — never faked.
-    const entryStarted = Date.now();
+    const entryStarted = { epoch: Date.now(), mono: monoNow() };
     try {
       await this.verifyTab();
       this.requireLive();
@@ -2202,8 +2212,8 @@ class Session {
       if (e instanceof BridgeErr && /closed|gone|unreachable/i.test(String((e && e.message) || e)) && !e.waitContext) {
         try {
           e.waitContext = {
-            waitStartedAt: Math.floor(entryStarted / 1000),
-            waitedMs: Math.max(0, Date.now() - entryStarted),
+            waitStartedAt: Math.floor(entryStarted.epoch / 1000),
+            waitedMs: Math.max(0, Math.round(monoNow() - entryStarted.mono)),
             triggerStatus: 'unknown',
             captureStage: 'session-gone',
             ephemeralPlanted: false,
@@ -2245,8 +2255,8 @@ class Session {
             : `capture target exited before ephemeral breakpoint was armed: ${cause}`);
           try {
             wrapped.waitContext = {
-              waitStartedAt: Math.floor(entryStarted / 1000),
-              waitedMs: Math.max(0, Date.now() - entryStarted),
+              waitStartedAt: Math.floor(entryStarted.epoch / 1000),
+              waitedMs: Math.max(0, Math.round(monoNow() - entryStarted.mono)),
               triggerStatus: 'unknown',
               captureStage: 'before-armed',
               ephemeralPlanted: false,
@@ -2269,7 +2279,7 @@ class Session {
     // surfaces here only when the pump reports it as an exit/close; a
     // reload that merely drops the stop stays a timeout
     // (armed-wait-timeout), never a stale resume.
-    const started = Date.now();
+    const started = { epoch: Date.now(), mono: monoNow() };
     const stageExit = (err) => {
       if (!(err instanceof BridgeErr) || !/exited|closed|reload/i.test(String((err && err.message) || err))) return null;
       const cause = String((err && err.message) || err);
@@ -2280,8 +2290,8 @@ class Session {
         : `target exited before capture hit${spec !== null ? ` (${spec})` : ''}: ${cause}`);
       try {
         wrapped.waitContext = {
-          waitStartedAt: Math.floor(started / 1000),
-          waitedMs: Math.max(0, Date.now() - started),
+          waitStartedAt: Math.floor(started.epoch / 1000),
+          waitedMs: Math.max(0, Math.round(monoNow() - started.mono)),
           triggerStatus: 'unknown',
           captureStage: 'armed-wait',
           ephemeralPlanted: wasPlanted,
