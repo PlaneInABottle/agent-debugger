@@ -6,6 +6,18 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Removed
+
+- Windows support (macOS/Linux only). The Windows-only paths
+  (`taskkill` reaps, `Scripts\` venv layout, `;` separators, lsof-free
+  listener probes, win32 npm wrapper branches) were untestable without
+  a local Windows host and already produced wrong behavior there
+  (misdiagnosed attach verdicts, missed venvs, RST'd close ACKs).
+  Rust fails fast with `compile_error!` on Windows; npm refuses via
+  the `os` field plus a clear postinstall error; CI and release builds
+  are POSIX-only (4 tar.gz). The v0.2.1 Windows asset stays published
+  as-is; future releases ship macOS + Linux only.
+
 ### Fixed
 
 - `doctor` probes the provisioned venv interpreter via the same
@@ -30,6 +42,17 @@ All notable changes to this project are documented here. Format follows
   the retry — plus its leaked waiter thread.
 - Browser `/json/list` fetch caps the body at 1MB: a rogue target
   list can no longer OOM the bridge by trickling forever.
+- Java `waitedMs` and capture `pauseMs` are monotonic: `waitContextJson`
+  / `captureExitContextJson` / `stageCaptureExit` take (epochMs, nanos)
+  pairs and the park records `parkedAtNanos`, so a wall-clock step can
+  no longer report a negative/hours-long wait or silently overrun a
+  capture pause budget (old overloads kept for instant contexts).
+- Unit-test harness closes the vacuous-pass hole: `tests/guard-exit.js`
+  traps `process.exit` in test files (a bridge exiting the runner read
+  as file-green), `run_gates.sh` runs each test file separately and
+  requires at least one real subtest per file, and
+  `scripts/check_negative_controls.sh` reverts 7 key fixes to prove
+  each regression test fails without its fix (manual pre-release gate).
 - `scripts/check_release.sh` default API base now hits the real
   `/repos/<owner>/<repo>/releases` endpoint (previously 404'd on every
   run, reporting "no release" for a fully published release).

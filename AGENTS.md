@@ -95,20 +95,26 @@ LIVE_RETRY=0 python3 tests/run_live.py               # disable retry-once
    children in `run_with_timeout`): force-kill (SIGKILL-grade tree-kill),
    never TERM-only — a TERM-deaf child would linger over the venv it was
    writing while the parent already failed, racing the retry.
-8. Platform layouts live in exactly one helper (`venv_python()`,
-   `find_python_launcher()`, `chrome_candidates()`) and every call site
-   — including `doctor` — uses it; never a second hardcoded POSIX path.
-   Unknown on a platform reads as unknown (Windows listener source is
-   unreadable → `None`), never a confident negative.
+8. Durations use monotonic clocks, reported timestamps use wall clock.
+   Every deadline and elapsed (`waitedMs`, `pauseMs`) runs on
+   `mono()`/`monoNow()`/`nanoTime`; epoch values (`updatedAt`,
+   `observedAt`, `waitStartedAt`, park diagnostics) stay wall clock.
+   Entry times are (epoch, monotonic) pairs.
 9. Every toolchain subprocess probe is bounded (`run_with_timeout`):
    `doctor`, Chrome lookup, debugpy/node/javac checks. A hung binary
    reads as absent after its bound; a dead candidate tries the next one
    (never `?` out of the loop).
+10. No vacuous green: unit-test helpers that drive a real `pump()` must
+    claim the session dir (`writeOwner`, like bridge `main()`), or the
+    abandonment guard calls `process.exit(0)` and kills the runner with
+    a file-level pass. `tests/guard-exit.js` traps that; every test
+    file must report at least one real subtest; key regressions prove
+    themselves via `scripts/check_negative_controls.sh`.
 
 ## Boundaries
 
 - Tests must never mutate the real `~/.agent-debugger`; only the temp HOME.
-- No local Windows host; POSIX-only tests skip on win32.
+- macOS/Linux only; Windows builds fail fast (`compile_error!`).
 - Never loosen strict timeout assertions to green a flake; fix the cause or
   let retry-once heal a genuine spike.
 - Keep diagnostics bounded and stderr-only; no unbounded waits, no background

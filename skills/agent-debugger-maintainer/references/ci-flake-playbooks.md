@@ -62,14 +62,9 @@ one-off spike.
    non-idle only); whoever holds the only pump lock sees only newer
    parks.
 
-## Windows-only unit failures
+## Retired: Windows-only unit failures
 
-Symptom: Linux/macOS green, `Test (windows-latest)` red.
-
-1. Locally unreproducible; read the WinError text in the job log.
-2. Known classes: concurrent `os.replace` onto one target (WinError 5) →
-   serialize writers or use distinct targets; MSYS path/arg munging in
-   shell gates → `cygpath -w` + `MSYS2_ARG_CONV_EXCL=*`; MSYS `ps` is
-   blind to native PIDs → `tasklist`/ctypes fallback.
-3. Keep tests platform-neutral (skip only genuinely POSIX-only cases)
-   and let CI verify Windows.
+Windows support was removed (macOS/Linux only; `compile_error!` on
+windows, POSIX-only CI/release). This playbook is kept for history:
+concurrent `os.replace` onto one target, MSYS path/arg munging in shell
+gates, and MSYS `ps` blindness to native PIDs were the known classes.

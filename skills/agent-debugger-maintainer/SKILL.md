@@ -140,9 +140,7 @@ the invariants they point at:
 
 - Tests must never mutate the real `~/.agent-debugger`; they copy
   provisioned adapter deps into an isolated temp HOME.
-- No local Windows host: validate Windows via
-  `cargo check --target x86_64-pc-windows-msvc --tests` and CI; POSIX-only
-  tests skip on win32.
+- macOS/Linux only (Windows builds fail fast via `compile_error!`).
 - Diagnostics must be bounded and stderr-only (bridge.log ships with
   bundles); never add an unbounded wait or a background process that
   outlives its step.
