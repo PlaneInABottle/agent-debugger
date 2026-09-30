@@ -453,8 +453,20 @@ async function listTargets(host, port) {
   const body = await new Promise((resolve, reject) => {
     const req = http.get(url, { timeout: 10000 }, (res) => {
       let raw = '';
-      res.on('data', (d) => { raw += d; });
-      res.on('end', () => resolve(raw));
+      let tooBig = false;
+      res.on('data', (d) => {
+        // Bounded: a rogue /json/list must not OOM the bridge by
+        // trickling an unbounded body (same 1MB discipline as framing).
+        if (tooBig) return;
+        if (raw.length + d.length > 1024 * 1024) {
+          tooBig = true;
+          req.destroy();
+          reject(new Error('target list too large'));
+          return;
+        }
+        raw += d;
+      });
+      res.on('end', () => { if (!tooBig) resolve(raw); });
     });
     req.on('timeout', () => {
       req.destroy();
