@@ -94,8 +94,27 @@ run_unit() {
   done
   passed "python unit"
 
-  section "node --test tests/*.test.js"
-  node --test tests/*.test.js || fail "node --test"
+  section "node --test tests/*.test.js (per-file: exit-guard + nonzero)"
+  # Per-file TAP invocation, each under the process.exit guard: a bridge
+  # calling process.exit() (e.g. missing owner.json in a helper) would
+  # otherwise kill the runner with code 0 and the file would "pass"
+  # vacuously. Each file must additionally report at least one real
+  # subtest/suite: an empty file yields exactly one `ok` line naming the
+  # file itself, which this check rejects (silent green, not a pass).
+  # Output stays quiet on success (rerun the file directly to inspect).
+  for f in tests/*.test.js; do
+    [ -e "$f" ] || continue
+    out=$(node --test --test-reporter=tap --import ./tests/guard-exit.js "$f" 2>&1) || {
+      printf '%s\n' "$out" >&2
+      fail "node --test $f"
+    }
+    oks=$(printf '%s\n' "$out" | grep -c '^ok [0-9][0-9]* - ') || oks=0
+    selffile=$(printf '%s\n' "$out" | grep -c "^ok [0-9][0-9]* - $f\$") || selffile=0
+    if [ "$oks" -le "$selffile" ]; then
+      printf '%s\n' "$out" >&2
+      fail "node --test $f ran no subtests (vacuous file?)"
+    fi
+  done
   passed "node --test"
 
   section "installer checksum (sh)"
