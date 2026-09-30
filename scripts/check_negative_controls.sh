@@ -161,5 +161,10 @@ expect_fail_timeout 25 "postinstall sidecar cap" scripts/postinstall.js \
   "      res.on('data', (chunk) => {\n        if (tooBig) return;\n        if (false) { // TEMP-REVERT" \
   node --test --test-name-pattern="unbounded sidecar" tests/postinstall_bounds.test.js
 
+expect_fail "postinstall tar-slip guard" scripts/postinstall.js \
+  "execSync(\`tar -xzf \"\${archivePath}\" -C \"\${destDir}\" agent-debugger\`" \
+  "execSync(\`tar -xzf \"\${archivePath}\" -C \"\${destDir}\"\`" \
+  node --test tests/postinstall_extract.test.js
+
 echo "negative controls: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

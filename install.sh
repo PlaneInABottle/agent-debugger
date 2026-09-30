@@ -137,7 +137,7 @@ log_info "Verifying checksum..."
 verify_checksum "${TMP_DIR}/${ASSET_NAME}" "$CHECKSUM_URL" || exit 1
 
 log_info "Extracting binary..."
-tar -xzf "${TMP_DIR}/${ASSET_NAME}" -C "$TMP_DIR"
+tar -xzf "${TMP_DIR}/${ASSET_NAME}" -C "$TMP_DIR" agent-debugger
 
 if [ ! -f "${TMP_DIR}/agent-debugger" ]; then
   log_error "Archive did not contain the agent-debugger binary."

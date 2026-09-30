@@ -84,6 +84,10 @@ All notable changes to this project are documented here. Format follows
   server can no longer OOM or hang `npm install` by trickling forever.
   An oversized sidecar fails verification closed; `install.sh` curl
   calls carry `--max-time` / `--max-filesize` the same way.
+- Install extraction is tar-slip safe: `install.sh` and npm
+  postinstall extract only the `agent-debugger` member — a tampered
+  archive's `../` or symlink members can no longer write outside the
+  dest dir or plant a live symlink in it.
 - Windows Python provisioning uses the `Scripts\python.exe` venv layout
   (was hardcoded `bin/python`) and falls back from `python3` to `python`;
   `NODE_PATH` joins with the platform separator (`;` on Windows).

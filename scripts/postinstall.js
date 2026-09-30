@@ -90,7 +90,7 @@ async function main() {
     await verifyChecksum(tmpArchive, checksumUrl);
 
     console.log(`[agent-debugger] Extracting binary to ${binDir}...`);
-    execSync(`tar -xzf "${tmpArchive}" -C "${binDir}"`, { stdio: 'ignore' });
+    extractArchive(tmpArchive, binDir);
 
     if (fs.existsSync(destBin)) {
       fs.chmodSync(destBin, 0o755);
@@ -118,6 +118,13 @@ async function main() {
       }
     }
   }
+}
+
+// Extract only the expected binary member: a tampered archive with
+// `../` or symlink members must not write outside the dest dir
+// (tar-slip). Release archives contain exactly `agent-debugger`.
+function extractArchive(archivePath, destDir) {
+  execSync(`tar -xzf "${archivePath}" -C "${destDir}" agent-debugger`, { stdio: 'ignore' });
 }
 
 function downloadFile(url, dest, maxRedirects = 5, opts = {}) {
@@ -297,7 +304,7 @@ function downloadText(url, maxRedirects = 5, opts = {}) {
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { verifyChecksum, sha256File, TARGET_MAP, isChecksumMismatch, main, downloadFile, downloadText };
+  module.exports = { verifyChecksum, sha256File, TARGET_MAP, isChecksumMismatch, main, downloadFile, downloadText, extractArchive };
 }
 
 // Only auto-run when executed as the npm postinstall script, never on
