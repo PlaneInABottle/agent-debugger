@@ -91,7 +91,19 @@ LIVE_RETRY=0 python3 tests/run_live.py               # disable retry-once
 7. Failure-path reap SIGTERMs first (`reap_child`: every bridge installs
    the SIGTERM teardown — launched target dies, attach detaches), waits a
    bounded 2s grace, then tree-kills; never a bare `kill()` that orphans
-   the debuggee.
+   the debuggee. The mirror rule for teardown-less tools (provision
+   children in `run_with_timeout`): force-kill (SIGKILL-grade tree-kill),
+   never TERM-only — a TERM-deaf child would linger over the venv it was
+   writing while the parent already failed, racing the retry.
+8. Platform layouts live in exactly one helper (`venv_python()`,
+   `find_python_launcher()`, `chrome_candidates()`) and every call site
+   — including `doctor` — uses it; never a second hardcoded POSIX path.
+   Unknown on a platform reads as unknown (Windows listener source is
+   unreadable → `None`), never a confident negative.
+9. Every toolchain subprocess probe is bounded (`run_with_timeout`):
+   `doctor`, Chrome lookup, debugpy/node/javac checks. A hung binary
+   reads as absent after its bound; a dead candidate tries the next one
+   (never `?` out of the loop).
 
 ## Boundaries
 

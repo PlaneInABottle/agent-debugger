@@ -8,6 +8,28 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- `doctor` probes the provisioned venv interpreter via the same
+  platform-aware helper as provisioning (`Scripts\python.exe` on
+  Windows, not a hardcoded `bin/python`), and resolves the system
+  Python through the launcher fallback (`python3` → `python`, since
+  `python3` is often absent on Windows).
+- Every toolchain probe is bounded: `doctor` probes and Chrome lookup
+  go through `run_with_timeout` (15s / 10s) — a hung binary reads as
+  absent instead of hanging `doctor` forever.
+- Chrome lookup covers Windows install paths (Program Files, user
+  `LOCALAPPDATA`, PATH names): browser readiness no longer reports
+  not-ready on Windows machines with Chrome installed. A dead list
+  entry tries the next candidate instead of aborting the search.
+- Windows attach diagnosis no longer misreports live endpoints as
+  "not listening" with high confidence: with no local listener source
+  (`/proc`, lsof) the source reads unreadable, so the verdict is
+  unknown instead of a confident negative.
+- Timed-out provision subprocesses are force-killed (SIGKILL-grade
+  tree-kill, was SIGTERM-only): a TERM-deaf child no longer lingers
+  over the venv it was writing while the parent already failed, racing
+  the retry — plus its leaked waiter thread.
+- Browser `/json/list` fetch caps the body at 1MB: a rogue target
+  list can no longer OOM the bridge by trickling forever.
 - `scripts/check_release.sh` default API base now hits the real
   `/repos/<owner>/<repo>/releases` endpoint (previously 404'd on every
   run, reporting "no release" for a fully published release).
