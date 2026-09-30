@@ -42,6 +42,8 @@ All notable changes to this project are documented here. Format follows
   the retry — plus its leaked waiter thread.
 - Browser `/json/list` fetch caps the body at 1MB: a rogue target
   list can no longer OOM the bridge by trickling forever.
+- Node `/json/list` fetches bounded the same way: `discoverAttach`
+  rejects past 1MB, `fetchTargetList` degrades to null.
 - Java `waitedMs` and capture `pauseMs` are monotonic: `waitContextJson`
   / `captureExitContextJson` / `stageCaptureExit` take (epochMs, nanos)
   pairs and the park records `parkedAtNanos`, so a wall-clock step can
