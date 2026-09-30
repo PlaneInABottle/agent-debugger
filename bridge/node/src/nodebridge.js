@@ -1509,8 +1509,18 @@ class Session {
     const body = await new Promise((resolve) => {
       const req = http.get(url, { timeout: 2000 }, (res) => {
         let raw = '';
-        res.on('data', (d) => { raw += d; });
-        res.on('end', () => resolve(raw));
+        let tooBig = false;
+        res.on('data', (d) => {
+          if (tooBig) return;
+          if (raw.length + d.length > 1024 * 1024) {
+            tooBig = true;
+            req.destroy();
+            resolve(null);
+            return;
+          }
+          raw += d;
+        });
+        res.on('end', () => { if (!tooBig) resolve(raw); });
       });
       req.on('timeout', () => {
         req.destroy();
@@ -1669,8 +1679,18 @@ class Session {
     const body = await new Promise((resolve, reject) => {
       const req = http.get(url, { timeout: 10000 }, (res) => {
         let raw = '';
-        res.on('data', (d) => { raw += d; });
-        res.on('end', () => resolve(raw));
+        let tooBig = false;
+        res.on('data', (d) => {
+          if (tooBig) return;
+          if (raw.length + d.length > 1024 * 1024) {
+            tooBig = true;
+            req.destroy();
+            reject(new Error('target list too large'));
+            return;
+          }
+          raw += d;
+        });
+        res.on('end', () => { if (!tooBig) resolve(raw); });
       });
       req.on('timeout', () => {
         req.destroy();

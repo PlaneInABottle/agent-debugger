@@ -24,6 +24,7 @@ expect_fail() {
   label="$1"; file="$2"; anchor="$3"; repl="$4"; shift 4
   bak="$(mktemp)"
   cp "$file" "$bak"
+  sum_orig="$(sha256sum "$bak" | cut -d' ' -f1)"
   if ! python3 -c "
 import sys
 p = sys.argv[1]
@@ -46,12 +47,13 @@ open(p, 'w').write(s.replace(a, r, 1))
     return
   fi
   cp "$bak" "$file"; rm -f "$bak"
-  if ! git diff --quiet -- "$file"; then
+  sum_restored="$(sha256sum "$file" | cut -d' ' -f1)"
+  if [ "$sum_orig" != "$sum_restored" ]; then
     echo "FAIL ($label): restore mismatch" >&2
     FAIL=$((FAIL + 1))
     return
   fi
-  echo "ok ($label): reverted code fails, restored tree is clean"
+  echo "ok ($label): reverted code fails, file restored byte-identically"
   PASS=$((PASS + 1))
 }
 
@@ -85,10 +87,69 @@ expect_fail "run_live heal" tests/run_live.py \
   "    passed = set(retry_ids) - still_bad - skipped_on_retry  # TEMP-REVERT" \
   python3 tests/test_run_live_retry.py RetryMergeTests.test_class_skip_on_retry_keeps_failure
 
-expect_fail 'postinstall fail-closed' scripts/postinstall.js \
+expect_fail "postinstall fail-closed" scripts/postinstall.js \
   '    throw new Error(`Checksum mismatch for ${path.basename(archivePath)} (published checksum unparseable; refusing unverified archive)`);' \
   '    return; // TEMP-REVERT' \
   node --test --test-name-pattern="unparseable" tests/install_checksum.test.js
+
+# Same as expect_fail, but the reverted test is expected to HANG (e.g. an
+# unbounded accumulation): the command is killed after <secs>s, and the
+# kill (nonzero) counts as the expected failure.
+expect_fail_timeout() {
+  secs="$1"; label="$2"; file="$3"; anchor="$4"; repl="$5"; shift 5
+  bak="$(mktemp)"
+  cp "$file" "$bak"
+  sum_orig="$(sha256sum "$bak" | cut -d' ' -f1)"
+  if ! python3 -c "
+import sys
+p = sys.argv[1]
+s = open(p).read()
+a = sys.argv[2].encode().decode('unicode_escape')
+r = sys.argv[3].encode().decode('unicode_escape')
+assert a in s, 'anchor missing: ' + a[:60]
+assert s.count(a) == 1, 'anchor not unique: ' + a[:60]
+open(p, 'w').write(s.replace(a, r, 1))
+" "$file" "$anchor" "$repl"; then
+    echo "FAIL ($label): revert anchor missing or ambiguous (code drifted?)" >&2
+    cp "$bak" "$file"; rm -f "$bak"
+    FAIL=$((FAIL + 1))
+    return
+  fi
+  if python3 -c "
+import subprocess, sys
+p = subprocess.run(sys.argv[1:], capture_output=True, timeout=$secs)
+sys.exit(p.returncode)
+" "$@" >/dev/null 2>&1; then
+    echo "FAIL ($label): test PASSED with the fix reverted (vacuous?)" >&2
+    cp "$bak" "$file"; rm -f "$bak"
+    FAIL=$((FAIL + 1))
+    return
+  fi
+  cp "$bak" "$file"; rm -f "$bak"
+  sum_restored="$(sha256sum "$file" | cut -d' ' -f1)"
+  if [ "$sum_orig" != "$sum_restored" ]; then
+    echo "FAIL ($label): restore mismatch" >&2
+    FAIL=$((FAIL + 1))
+    return
+  fi
+  echo "ok ($label): reverted code hangs/fails, file restored byte-identically"
+  PASS=$((PASS + 1))
+}
+
+expect_fail_timeout 25 "node target-list cap" bridge/node/src/nodebridge.js \
+  "            reject(new Error('target list too large'));" \
+  "            resolve('[');" \
+  node --test --test-name-pattern="discoverAttach rejects" tests/node_target_list.test.js
+
+expect_fail_timeout 25 "node fetch-list cap" bridge/node/src/nodebridge.js \
+  "          if (raw.length + d.length > 1024 * 1024) {\n            tooBig = true;\n            req.destroy();\n            resolve(null);" \
+  "          if (false) { // TEMP-REVERT\n            tooBig = true;\n            req.destroy();\n            resolve(null);" \
+  node --test --test-name-pattern="fetchTargetList degrades" tests/node_target_list.test.js
+
+expect_fail_timeout 25 "browser target-list cap" bridge/browser/src/browserbridge.js \
+  "          reject(new Error('target list too large'));" \
+  "          resolve('[');" \
+  node --test --test-name-pattern="unbounded body" tests/browser_target_list.test.js
 
 echo "negative controls: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
