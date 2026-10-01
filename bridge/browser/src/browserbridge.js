@@ -823,11 +823,12 @@ class Session {
     // not survive a reload (navigation drops CDP breakpoints); a reload
     // between plant and park surfaces as a timeout, never a stale resume.
     this.stopDiagSeq = 0; // session-monotonic stop id
-    this.prevPark = null; // previous park {target,file,line,threadId,atMs}
+    this.prevPark = null; // previous park {target,file,line,threadId,atMs,atMono}
     this.stopReason = null; // reason of the current park
     this.stopHitBps = null; // native hitBreakpoint ids of the current park
-    this.parkedAtMs = 0; // wall clock ms of the current park
-    this.lastDiag = null; // {target,stopId,sameLocation,sameThread,elapsedMs,atMs}
+    this.parkedAtMs = 0; // wall clock ms of the current park (reported value)
+    this.parkedAtMono = 0; // monotonic ms of the current park (durations)
+    this.lastDiag = null; // {target,stopId,sameLocation,sameThread,elapsedMs,atMs,atMono}
     // -- M5 concurrency: the single outstanding resume op (tid is always
     // 'main': one tab per session); live reads bypass it entirely.
     this.outstanding = new Map(); // tid -> resume cmd in flight
@@ -1980,8 +1981,14 @@ class Session {
    *  lazily at response time (frameUrl needs no traffic). */
   notePark(tid, p) {
     const now = Date.now();
+    const nowMono = monoNow();
     const prev = this.prevPark;
-    const elapsed = prev ? now - prev.atMs : null;
+    // Elapsed since the previous park is a duration: monotonic. The wall
+    // fallback covers only a record predating the mono field (same-process
+    // records always carry it).
+    const elapsed = !prev ? null
+      : (prev.atMono != null ? Math.max(0, Math.round(nowMono - prev.atMono))
+        : now - prev.atMs);
     // Location at park time, best-effort without traffic: top-frame url +
     // line (relFile is pure string work).
     let file = '?', line = -1;
@@ -1996,13 +2003,14 @@ class Session {
     const sameLoc = !!(prev && prev.file === file && prev.line === line);
     const sameThr = !!(prev && prev.target === tid && prev.threadId === 1);
     this.stopDiagSeq += 1;
-    this.prevPark = { target: tid, file, line, threadId: 1, atMs: now };
+    this.prevPark = { target: tid, file, line, threadId: 1, atMs: now, atMono: nowMono };
     this.stopReason = (p && p.reason) || null;
     this.stopHitBps = (p && Array.isArray(p.hitBreakpoints)) ? [...p.hitBreakpoints] : null;
     this.parkedAtMs = now;
+    this.parkedAtMono = nowMono;
     this.lastDiag = {
       target: tid, stopId: this.stopDiagSeq,
-      sameLocation: sameLoc, sameThread: sameThr, elapsedMs: elapsed, atMs: now,
+      sameLocation: sameLoc, sameThread: sameThr, elapsedMs: elapsed, atMs: now, atMono: nowMono,
     };
   }
 
@@ -2346,7 +2354,10 @@ class Session {
       if (staged) throw staged;
       throw e;
     }
-    const parkMs = (this.lastDiag && this.lastDiag.target === 'main' && this.lastDiag.atMs) || Date.now();
+    // Pause length is a duration: monotonic from the park, never the wall
+    // clock (an NTP step mid-capture must not flip budgetExceeded).
+    const parkMono = (this.lastDiag && this.lastDiag.target === 'main' && this.lastDiag.atMono != null)
+      ? this.lastDiag.atMono : monoNow();
     let snapErr = null, removeErr = null, resumeErr = null;
     let snapshot, framesTruncated = false, varsTruncated = false;
     try {
@@ -2386,7 +2397,7 @@ class Session {
       if (!this.paused) this.awaitingStep = false;
       resumed = true;
     } catch (e) { resumeErr = String((e && e.message) || e); }
-    const pauseMs = Date.now() - parkMs;
+    const pauseMs = Math.max(0, Math.round(monoNow() - parkMono));
     let diag;
     try {
       diag = this.stopDiag((snapshot && snapshot.threads) || []);

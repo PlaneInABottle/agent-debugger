@@ -166,5 +166,35 @@ expect_fail "postinstall tar-slip guard" scripts/postinstall.js \
   "execSync(\`tar -xzf \"\${archivePath}\" -C \"\${destDir}\"\`" \
   node --test tests/postinstall_extract.test.js
 
+expect_fail "node park-diag mono" bridge/node/src/nodebridge.js \
+  "prev.atMono != null" \
+  "false" \
+  node --test --test-name-pattern="notePark elapsedMs" tests/pause_mono.test.js
+
+expect_fail "node capture-pause mono" bridge/node/src/nodebridge.js \
+  "const pauseMs = Math.max(0, Math.round(monoNow() - parkMono));" \
+  "const pauseMs = Date.now() - parkMono; // TEMP-REVERT" \
+  node --test --test-name-pattern="capture-exit pauseDurationMs" tests/pause_mono.test.js
+
+expect_fail "browser park-diag mono" bridge/browser/src/browserbridge.js \
+  "prev.atMono != null" \
+  "false" \
+  node --test --test-name-pattern="notePark elapsedMs" tests/pause_mono.test.js
+
+expect_fail "browser capture-pause mono" bridge/browser/src/browserbridge.js \
+  "const pauseMs = Math.max(0, Math.round(monoNow() - parkMono));" \
+  "const pauseMs = Date.now() - parkMono; // TEMP-REVERT" \
+  node --test --test-name-pattern="capture-exit pauseDurationMs" tests/pause_mono.test.js
+
+expect_fail "py park-diag mono" bridge/py/src/pybridge.py \
+  "elapsed = max(0, int((now_mono - prev[\"atMono\"]) * 1000))" \
+  "elapsed = now_ms - prev[\"atMs\"] # TEMP-REVERT" \
+  python3 tests/test_pause_mono.py PauseMonoTests.test_park_elapsed_monotonic
+
+expect_fail "py capture-pause mono" bridge/py/src/pybridge.py \
+  "pause_ms = max(0, int((mono() - park_mono) * 1000))" \
+  "pause_ms = int(time.time() * 1000) - int(park_mono * 1000) # TEMP-REVERT" \
+  python3 tests/test_pause_mono.py PauseMonoTests.test_capture_pause_monotonic
+
 echo "negative controls: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

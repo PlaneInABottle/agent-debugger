@@ -92,11 +92,12 @@ class StopTimeout(BridgeErr):
 
 def mono():
     """Monotonic clock for every DEADLINE and elapsed-duration
-    computation (bounded waits, handshake budgets, waitedMs). Wall clock
-    (`time.time()`) steps backward on NTP corrections, manual changes and
-    VM restores: a wait measured against it can then run for hours past its
-    budget (or time out instantly). Epoch timestamps (`observedAt`,
-    `updatedAt`, `waitStartedAt`, park diagnostics) still use wall clock —
+    computation (bounded waits, handshake budgets, waitedMs, park/capture
+    pause durations). Wall clock (`time.time()`) steps backward on NTP
+    corrections, manual changes and VM restores: a duration measured
+    against it can then run for hours past its budget (or time out
+    instantly). Epoch timestamps (`observedAt`, `updatedAt`,
+    `waitStartedAt`, `parkedAtMs`, park diagnostics) still use wall clock —
     they are values, not durations, and stay comparable across processes."""
     return time.monotonic()
 
@@ -1458,9 +1459,10 @@ class Session:
         # previous park for same-location/same-thread diagnosis. Globals (not
         # swapped per target): every park carries its own target stamp.
         self._stop_diag_seq = 0    # session-monotonic stop id
-        self._prev_park = None     # previous park {target,file,line,threadId,atMs}
+        self._prev_park = None     # previous park {target,...,atMs,atMono}
         self._stop_reason = None   # reason of the current park
-        self._parked_at_ms = 0     # wall clock ms of the current park
+        self._parked_at_ms = 0     # wall clock ms of the current park (reported)
+        self._parked_at_mono = 0.0  # monotonic s of the current park (durations)
         self._last_diag = None     # {target,stopId,sameLocation,sameThread,elapsedMs}
         # -- layered target identity (M-ID): DAP `process` event (debuggee,
         # protocol-confirmed) + OS-observed listener owner (endpoint/adapter,
@@ -3620,17 +3622,27 @@ class Session:
         except Exception:
             here_file, here_line = "?", -1
         now_ms = int(time.time() * 1000)
+        now_mono = mono()
         prev = self._prev_park
-        elapsed = (now_ms - prev["atMs"]) if isinstance(prev, dict) else None
+        # Elapsed since the previous park is a duration: monotonic. The
+        # wall fallback covers only a record predating the mono field
+        # (same-process records always carry it).
+        if not isinstance(prev, dict):
+            elapsed = None
+        elif prev.get("atMono") is not None:
+            elapsed = max(0, int((now_mono - prev["atMono"]) * 1000))
+        else:
+            elapsed = now_ms - prev["atMs"]
         same_loc = bool(isinstance(prev, dict) and prev.get("file") == here_file
                          and prev.get("line") == here_line)
         same_thr = bool(isinstance(prev, dict) and prev.get("threadId") == tid
                          and prev.get("target") == eff)
         self._stop_diag_seq += 1
         self._prev_park = {"target": eff, "file": here_file, "line": here_line,
-                           "threadId": tid, "atMs": now_ms}
+                           "threadId": tid, "atMs": now_ms, "atMono": now_mono}
         self._stop_reason = reason
         self._parked_at_ms = now_ms
+        self._parked_at_mono = now_mono
         self._last_diag = {"target": eff, "stopId": self._stop_diag_seq,
                            "sameLocation": same_loc, "sameThread": same_thr,
                            "elapsedMs": elapsed}
@@ -4460,7 +4472,10 @@ class Session:
             if parked != "main" and parked not in self.targets:
                 parked = tid
         with self._TargetScope(self, parked):
-            park_ms = int(time.time() * 1000)
+            # Pause length is a duration: monotonic from scope entry, never
+            # the wall clock (an NTP step mid-capture must not flip
+            # budgetExceeded).
+            park_mono = mono()
             snap_err, remove_err, resume_err = None, None, None
             try:
                 snap = self._bounded_snapshot(frames_n, vars_n)
@@ -4485,7 +4500,7 @@ class Session:
                 resumed = True
             except Exception as e:
                 resume_err = str(e)
-            pause_ms = int(time.time() * 1000) - park_ms
+            pause_ms = max(0, int((mono() - park_mono) * 1000))
             try:
                 diag = self._stop_diag(parked, snap.get("threads"))
             except Exception:

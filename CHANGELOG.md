@@ -49,11 +49,17 @@ All notable changes to this project are documented here. Format follows
   pairs and the park records `parkedAtNanos`, so a wall-clock step can
   no longer report a negative/hours-long wait or silently overrun a
   capture pause budget (old overloads kept for instant contexts).
+- Stop/capture pause diagnostics are monotonic on every bridge: node /
+  browser `notePark` elapsed and capture-exit `pauseDurationMs`, and the
+  pybridge equivalents, measure against `monoNow()` / `mono()` (new
+  `atMono` / `parkedAtMono` fields, Java's `parkedAtNanos` pattern), so
+  an NTP step mid-capture can no longer report a negative/hours-long
+  pause or flip `budgetExceeded`. Reported timestamps stay wall clock.
 - Unit-test harness closes the vacuous-pass hole: `tests/guard-exit.js`
   traps `process.exit` in test files (a bridge exiting the runner read
   as file-green), `run_gates.sh` runs each test file separately and
   requires at least one real subtest per file, and
-  `scripts/check_negative_controls.sh` reverts 7 key fixes to prove
+  `scripts/check_negative_controls.sh` reverts key fixes to prove
   each regression test fails without its fix (manual pre-release gate).
 - `scripts/check_release.sh` default API base now hits the real
   `/repos/<owner>/<repo>/releases` endpoint (previously 404'd on every

@@ -1113,11 +1113,12 @@ class Session {
     // -- stop diagnostics (UX batch): session-monotonic stop id plus the
     // previous park for same-location/same-thread diagnosis.
     this.stopDiagSeq = 0; // session-monotonic stop id
-    this.prevPark = null; // previous park {target,file,line,threadId,atMs}
+    this.prevPark = null; // previous park {target,file,line,threadId,atMs,atMono}
     this.stopReason = null; // reason of the current park
     this.stopHitBps = null; // native hitBreakpoint ids of the current park
-    this.parkedAtMs = 0; // wall clock ms of the current park
-    this.lastDiag = null; // {target,stopId,sameLocation,sameThread,elapsedMs,atMs}
+    this.parkedAtMs = 0; // wall clock ms of the current park (reported value)
+    this.parkedAtMono = 0; // monotonic ms of the current park (durations)
+    this.lastDiag = null; // {target,stopId,sameLocation,sameThread,elapsedMs,atMs,atMono}
     this.serving = 'main';        // target id of the in-flight command
     this.pendingTarget = null;    // resume-wait owner for error attribution
     // -- layered target identity (M-ID): the kept /json/list entry (debuggee,
@@ -3304,21 +3305,28 @@ class Session {
    *  DAP-less unknowns stay null. loc is {file,line} or null. */
   notePark(tid, p, loc) {
     const now = Date.now();
+    const nowMono = monoNow();
     const prev = this.prevPark;
-    const elapsed = prev ? now - prev.atMs : null;
+    // Elapsed since the previous park is a duration: monotonic. The wall
+    // fallback covers only a record predating the mono field (same-process
+    // records always carry it).
+    const elapsed = !prev ? null
+      : (prev.atMono != null ? Math.max(0, Math.round(nowMono - prev.atMono))
+        : now - prev.atMs);
     const sameLoc = !!(prev && loc && prev.file === loc.file && prev.line === loc.line);
     const sameThr = !!(prev && prev.target === tid && prev.threadId === 1);
     this.stopDiagSeq += 1;
     this.prevPark = {
       target: tid, file: (loc && loc.file) || '?', line: (loc && loc.line) || -1,
-      threadId: 1, atMs: now,
+      threadId: 1, atMs: now, atMono: nowMono,
     };
     this.stopReason = (p && p.reason) || null;
     this.stopHitBps = (p && Array.isArray(p.hitBreakpoints)) ? [...p.hitBreakpoints] : null;
     this.parkedAtMs = now;
+    this.parkedAtMono = nowMono;
     this.lastDiag = {
       target: tid, stopId: this.stopDiagSeq,
-      sameLocation: sameLoc, sameThread: sameThr, elapsedMs: elapsed, atMs: now,
+      sameLocation: sameLoc, sameThread: sameThr, elapsedMs: elapsed, atMs: now, atMono: nowMono,
     };
   }
 
@@ -3701,7 +3709,10 @@ class Session {
       if (staged) throw staged;
       throw e;
     }
-    const parkMs = (this.lastDiag && this.lastDiag.target === stopped && this.lastDiag.atMs) || Date.now();
+    // Pause length is a duration: monotonic from the park, never the wall
+    // clock (an NTP step mid-capture must not flip budgetExceeded).
+    const parkMono = (this.lastDiag && this.lastDiag.target === stopped && this.lastDiag.atMono != null)
+      ? this.lastDiag.atMono : monoNow();
     return this.withTarget(stopped, async () => {
       let snapErr = null, removeErr = null, resumeErr = null;
       let snapshot, framesTruncated = false, varsTruncated = false;
@@ -3742,7 +3753,7 @@ class Session {
         this.clearResumeFlag(stopped);
         resumed = true;
       } catch (e) { resumeErr = String((e && e.message) || e); }
-      const pauseMs = Date.now() - parkMs;
+      const pauseMs = Math.max(0, Math.round(monoNow() - parkMono));
       let diag;
       try {
         diag = this.stopDiag(stopped, (snapshot && snapshot.threads) || []);
