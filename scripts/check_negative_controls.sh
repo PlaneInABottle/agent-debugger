@@ -196,5 +196,10 @@ expect_fail "py capture-pause mono" bridge/py/src/pybridge.py \
   "pause_ms = int(time.time() * 1000) - int(park_mono * 1000) # TEMP-REVERT" \
   python3 tests/test_pause_mono.py PauseMonoTests.test_capture_pause_monotonic
 
+expect_fail "java park-diag mono" bridge/java/src/BridgeSession.java \
+  "if (prevAtNanos > 0) return Math.max(0, (nowNanos - prevAtNanos) / 1_000_000);" \
+  "if (false) return 0L; // TEMP-REVERT" \
+  sh -c 'T=$(mktemp -d); javac -d $T/c bridge/java/src/*.java && javac -cp $T/c -d $T/k tests/PauseMonoJavaCheck.java && java -cp $T/c:$T/k PauseMonoJavaCheck; rc=$?; rm -rf $T; exit $rc'
+
 echo "negative controls: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

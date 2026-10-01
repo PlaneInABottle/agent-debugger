@@ -140,6 +140,7 @@ class SessionState {
         int prevParkLine = -1; // previous park line
         long prevParkThreadId = -1; // previous park thread uniqueId
         long prevParkAtMs = 0; // previous park wall clock
+        long prevParkAtNanos = 0; // previous park monotonic ns (durations)
         String stopReason = null; // reason of the current park (breakpoint/step/exception/watch/exit)
         long parkedAtMs = 0; // wall clock ms of the current park
         long parkedAtNanos = 0; // monotonic ns of the current park (pause-budget durations)

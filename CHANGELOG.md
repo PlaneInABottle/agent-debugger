@@ -50,10 +50,11 @@ All notable changes to this project are documented here. Format follows
   no longer report a negative/hours-long wait or silently overrun a
   capture pause budget (old overloads kept for instant contexts).
 - Stop/capture pause diagnostics are monotonic on every bridge: node /
-  browser `notePark` elapsed and capture-exit `pauseDurationMs`, and the
-  pybridge equivalents, measure against `monoNow()` / `mono()` (new
-  `atMono` / `parkedAtMono` fields, Java's `parkedAtNanos` pattern), so
-  an NTP step mid-capture can no longer report a negative/hours-long
+  browser / Java `notePark` elapsed and node / browser capture-exit plus
+  pybridge `pauseDurationMs` measure against `monoNow()` / `mono()` /
+  `nanoTime` (new `atMono` / `parkedAtMono` / `prevParkAtNanos` fields,
+  pure `elapsedSincePrevPark` on Java pinned by `PauseMonoJavaCheck`),
+  so an NTP step mid-capture can no longer report a negative/hours-long
   pause or flip `budgetExceeded`. Reported timestamps stay wall clock.
 - Unit-test harness closes the vacuous-pass hole: `tests/guard-exit.js`
   traps `process.exit` in test files (a bridge exiting the runner read

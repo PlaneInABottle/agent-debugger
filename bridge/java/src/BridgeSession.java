@@ -1726,6 +1726,14 @@ class BridgeSession {
      *  stay untouched, so unplant deletes exactly the ephemeral). */
     static final String CAPTURE_TAG = "agent-debugger-capture";
 
+    /** Elapsed ms since the previous park: monotonic when the previous
+     *  park recorded nanos (same-process parks always do), wall-clock
+     *  fallback otherwise. Pure (no lock/socket/state beyond params). */
+    static Long elapsedSincePrevPark(long prevAtNanos, long prevAtMs, long nowMs, long nowNanos) {
+        if (prevAtNanos > 0) return Math.max(0, (nowNanos - prevAtNanos) / 1_000_000);
+        return nowMs - prevAtMs;
+    }
+
     /** Record one genuine park for stop diagnostics. Caller holds
      *  sessionLock; st.thread/st.location are the winning stop. */
     static void notePark(SessionState st, String reason) {
@@ -1738,7 +1746,9 @@ class BridgeSession {
         try { line = st.location.lineNumber(); } catch (Exception ignored) {}
         try { tid = st.thread.uniqueID(); } catch (Exception ignored) {}
         long now = System.currentTimeMillis();
-        Long elapsed = st.prevParkFile == null ? null : now - st.prevParkAtMs;
+        long nowNanos = System.nanoTime();
+        Long elapsed = st.prevParkFile == null ? null
+                : elapsedSincePrevPark(st.prevParkAtNanos, st.prevParkAtMs, now, nowNanos);
         boolean sameLoc = file.equals(st.prevParkFile == null ? "" : st.prevParkFile)
                 && line == st.prevParkLine;
         boolean sameThread = tid != -1 && tid == st.prevParkThreadId;
@@ -1747,6 +1757,7 @@ class BridgeSession {
         st.prevParkLine = line;
         st.prevParkThreadId = tid;
         st.prevParkAtMs = now;
+        st.prevParkAtNanos = nowNanos;
         st.stopReason = reason;
         st.parkedAtMs = now;
         st.parkedAtNanos = System.nanoTime();
