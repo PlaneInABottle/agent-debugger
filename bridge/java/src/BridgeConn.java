@@ -106,9 +106,12 @@ class BridgeConn {
         java.util.Set<String> planted = new java.util.HashSet<>();
 
         vm.resume();
-        long deadline = System.currentTimeMillis() + cfg.timeoutMs;
+        // Deadline/elapsed on the monotonic clock (repo invariant: wall
+        // clock steps on NTP/manual/VM restore must never stretch or
+        // expire a bounded wait).
+        long deadlineNanos = System.nanoTime() + cfg.timeoutMs * 1_000_000L;
         while (true) {
-            long remaining = deadline - System.currentTimeMillis();
+            long remaining = (deadlineNanos - System.nanoTime()) / 1_000_000L;
             if (remaining <= 0) {
                 throw new BridgeException("timeout: no breakpoint hit within "
                         + (cfg.timeoutMs / 1000) + "s (breakpoints: " + BridgeEval.describeBreaks(cfg) + ")");
