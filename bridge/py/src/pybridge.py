@@ -5443,8 +5443,13 @@ class Session:
         return spec
 
     def cmd_logs(self, req):
+        # Explicit default (never falsy-trap): tail 0 is a valid "no
+        # lines" request, while a missing key or non-numeric value degrades
+        # to 50 (Node/Browser/Java parity). lines[-0:] === lines[0:], so 0
+        # short-circuits to [] instead of returning everything.
         try:
-            tail = max(1, min(500, int(req.get("tail", 50))))
+            raw = req.get("tail", 50) if isinstance(req, dict) else 50
+            tail = max(0, min(500, int(raw)))
         except (TypeError, ValueError):
             # Non-numeric tail degrades to the default (Node/Browser/JS
             # parity) instead of surfacing as an internal error.
@@ -5470,7 +5475,7 @@ class Session:
         dropped = getattr(self, "log_dropped", 0)
         return {"ok": True, "total": len(lines),
                 "truncated": len(lines) > tail or dropped > 0,
-                "dropped": dropped, "lines": lines[-tail:]}
+                "dropped": dropped, "lines": [] if tail == 0 else lines[-tail:]}
 
     def require_stopped(self):
         if self.targets_reg.serving == "main" and self.main_exited:

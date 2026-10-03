@@ -1352,8 +1352,10 @@ class BridgeSession {
                 synchronized (st.sessionLock) {
                 int tail = 50;
                 if (req.containsKey("tail")) {
-                    try { tail = Integer.parseInt(req.get("tail")); } catch (NumberFormatException ignored) {}
-                    if (tail < 1) tail = 1;
+                    try { tail = (int) Math.min(500L, Math.max(0L, Long.parseLong(req.get("tail")))); } catch (NumberFormatException ignored) {}
+                    // tail 0 is a valid "no lines" request (py/node/browser
+                    // parity); only negatives clamp, non-numeric keeps 50.
+                    if (tail < 0) tail = 0;
                     if (tail > 500) tail = 500;
                 }
                 List<String> lines = new ArrayList<>();

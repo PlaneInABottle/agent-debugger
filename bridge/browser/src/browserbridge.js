@@ -2552,7 +2552,12 @@ class Session {
   }
 
   cmdLogs(req) {
-    const tail = Math.max(1, Math.min(500, parseInt(req.tail || 50, 10) || 50));
+    // Explicit default (never `||`): tail 0 is a valid "no lines" request,
+    // while missing/null/NaN degrade to 50 like before. slice(-0) === slice(0),
+    // so 0 short-circuits to [] instead of returning everything.
+    const rawTail = (req.tail === undefined || req.tail === null) ? 50 : req.tail;
+    const parsed = parseInt(rawTail, 10);
+    const tail = Number.isFinite(parsed) ? Math.max(0, Math.min(500, parsed)) : 50;
     let lines = [];
     try {
       lines = fs.readFileSync(path.join(this.cfg.dir, 'logs.jsonl'), 'utf-8').split('\n');
@@ -2567,7 +2572,7 @@ class Session {
     return {
       ok: true, total: lines.length,
       truncated: lines.length > tail || dropped > 0,
-      dropped, lines: lines.slice(-tail),
+      dropped, lines: tail === 0 ? [] : lines.slice(-tail),
     };
   }
 
