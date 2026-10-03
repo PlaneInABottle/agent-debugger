@@ -283,13 +283,6 @@ fn dispatch(session: &str, cmd: cli::Commands) -> (&'static str, anyhow::Result<
                 target.as_deref(),
             ),
         ),
-        cli::Commands::Logs { tail } => (
-            "logs",
-            session::forward(
-                session,
-                &json!({"cmd": "logs", "tail": tail}),
-                Duration::from_secs(10),
-            ),
-        ),
+        cli::Commands::Logs { tail } => ("logs", session::cmd_logs(session, tail)),
     }
 }

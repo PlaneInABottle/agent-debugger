@@ -134,6 +134,25 @@ pub fn forward_target(
     }
 }
 
+/// CLI-side `logs` tail clamp (policy-core M2): mirrors the bridge-local
+/// `[0,500]` clamp frozen in `tests/contract/value_caps.json`. `tail`
+/// arrives as `usize` from clap (default 50), so only the upper bound can
+/// ever bind — 0 stays a valid "no lines" request. Bridges keep their own
+/// local checks (defense-in-depth); the bridge receives an already-clamped
+/// value, so the response shape and every envelope are unchanged.
+pub(crate) fn clamp_tail(tail: usize) -> usize {
+    tail.min(500)
+}
+
+/// `logs` command path: clamp CLI-side, then forward like before.
+pub fn cmd_logs(name: &str, tail: usize) -> anyhow::Result<Value> {
+    forward(
+        name,
+        &json!({"cmd": "logs", "tail": clamp_tail(tail)}),
+        Duration::from_secs(10),
+    )
+}
+
 /// Reload the page and wait for the next stop. Browser tabs only (CLI
 /// help): gate before any forward so py/node/java fail fast with a stable
 /// browser-only error and never spend bridge traffic. Missing, corrupt, or
@@ -229,6 +248,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn clamp_tail_matches_bridge_bounds() {
+        // Frozen contract (tests/contract/value_caps.json): [0,500].
+        // `tail` is usize from clap, so negatives are unrepresentable —
+        // only the upper bound binds; 0 stays a valid "no lines" request.
+        assert_eq!(clamp_tail(0), 0);
+        assert_eq!(clamp_tail(1), 1);
+        assert_eq!(clamp_tail(499), 499);
+        assert_eq!(clamp_tail(500), 500);
+        assert_eq!(clamp_tail(501), 500);
+        assert_eq!(clamp_tail(usize::MAX), 500);
     }
 
     #[test]

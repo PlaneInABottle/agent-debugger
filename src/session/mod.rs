@@ -73,7 +73,7 @@ pub use breaks::{cmd_breaks_add, cmd_breaks_clear, cmd_breaks_remove};
 #[allow(unused_imports)]
 pub use close_status::{close, cmd_context_target, status};
 #[allow(unused_imports)]
-pub use forward::{cmd_reload, cmd_targets, forward, forward_target, BridgeFailure};
+pub use forward::{cmd_logs, cmd_reload, cmd_targets, forward, forward_target, BridgeFailure};
 #[allow(unused_imports)]
 pub use identity::{
     attach_seed, identity_hint, launch_seed, redact_argv, target_summary, IDENTITY_ARRAY_CAP,
