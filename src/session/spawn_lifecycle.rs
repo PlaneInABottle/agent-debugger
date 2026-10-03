@@ -290,7 +290,9 @@ pub(crate) fn attach_runtime_failure(
 /// endpoint-rejected; transport takes the OS-observed listener state
 /// (pre-attach vs now) with the raw text as sanitized cause. Every v2
 /// bridge writes schemaVersion + phase. Launch (no endpoint) keeps the
-/// message verbatim.
+/// message verbatim but flattens to a plain error (display-identical; the
+/// `BridgeFailure` type is dropped) — unobservable today since the first
+/// forward never carries `waitContext`.
 pub(crate) fn route_setup_failure(
     endpoint: &Option<(String, u16)>,
     pre: Option<bool>,
