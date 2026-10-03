@@ -1,0 +1,12 @@
+{
+  "_note": "Frozen cross-language policy duplicated identically in all four bridges (py/node/browser/java), recorded here, not unified. Any bridge drift without a fixture update fails the gate by design (M1: freeze only, zero behavior change).",
+  "logsRing": 2000,
+  "tailMin": 0,
+  "tailMax": 500,
+  "tailDefault": 50,
+  "maxString": 200,
+  "maxVars": 20,
+  "maxFrames": 10,
+  "parkWarning": "parked breakpoint suspends target; HTTP handler remains open until continue/capture-resume/close(detach)",
+  "truncSuffixFormat": "… (+N more chars)"
+}

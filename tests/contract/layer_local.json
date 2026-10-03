@@ -1,0 +1,37 @@
+{
+  "_note": "Layer-local records where the four bridges differ by pre-existing design, recorded here, not unified. argv array cap exists only where argv arrays are kept (py/node); the browser drops argv wholesale and java carries seed argv under a budget, not a count. Timeout integer domain agrees (1..3600); only the message floor differs. Dispatch groups agree on wait/capture/mutation; only resume membership (browser reload) and java's conflated outstanding flag differ.",
+  "argvArrayCap": 32,
+  "argvArrayCapHolders": ["py", "node"],
+  "argvArrayCapAbsent": ["browser", "java"],
+  "timeoutMax": 3600,
+  "timeoutMessages": {
+    "py": "timeout must be between 0 and 3600 seconds",
+    "node": "timeout must be between 0 and 3600 seconds",
+    "browser": "timeout must be between 0 and 3600 seconds",
+    "java": "timeout must be between 1 and 3600 seconds"
+  },
+  "dispatchGroups": {
+    "py": {
+      "resume": ["continue", "step"],
+      "wait": ["wait"],
+      "capture": ["capture"],
+      "mutation": ["breaksAdd", "breaksRemove", "breaksClear"]
+    },
+    "node": {
+      "resume": ["continue", "step"],
+      "wait": ["wait"],
+      "capture": ["capture"],
+      "mutation": ["breaksAdd", "breaksRemove", "breaksClear"]
+    },
+    "browser": {
+      "resume": ["continue", "step", "reload"],
+      "wait": ["wait"],
+      "capture": ["capture"],
+      "mutation": ["breaksAdd", "breaksRemove", "breaksClear"]
+    },
+    "java": {
+      "conflatedOutstanding": ["continue", "step", "wait", "capture"],
+      "busyAlsoRejects": ["breaksAdd", "breaksRemove", "breaksClear", "eval"]
+    }
+  }
+}

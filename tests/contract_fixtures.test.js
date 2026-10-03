@@ -26,10 +26,10 @@ function loadBridge(rel, exports) {
 
 const node = loadBridge(
   'bridge/node/src/nodebridge.js',
-  'Session, StopTimeout, Usage, BridgeErr, ConfigError, RuntimeError, phaseOfError, setupErrorPayload, closeFromConn');
+  'Session, StopTimeout, Usage, BridgeErr, ConfigError, RuntimeError, phaseOfError, setupErrorPayload, closeFromConn, PARK_WARNING, truncStr, MAX_STRING, MAX_VARS, MAX_FRAMES, MAX_LOG_LINES, IDENT_ARRAY_CAP, RESUME_CMDS, WAIT_CMDS, CAPTURE_CMDS, MUTATION_CMDS');
 const browser = loadBridge(
   'bridge/browser/src/browserbridge.js',
-  'Session, StopTimeout, Usage, BridgeErr, ConfigError, RuntimeError, phaseOfError, setupErrorPayload, closeFromConn');
+  'Session, StopTimeout, Usage, BridgeErr, ConfigError, RuntimeError, phaseOfError, setupErrorPayload, closeFromConn, PARK_WARNING, truncStr, MAX_STRING, MAX_VARS, MAX_FRAMES, MAX_LOG_LINES, RESUME_CMDS, WAIT_CMDS, CAPTURE_CMDS, MUTATION_CMDS');
 
 function fixture(name) {
   return JSON.parse(fs.readFileSync(path.join(__dirname, 'contract', name), 'utf-8'));
@@ -127,6 +127,66 @@ test('contract: close/status shape frozen', async () => {
   assert.equal(fx.close.confirmedField, 'confirmed');
   assert.ok(fx.closeConfirmedExample.confirmed);
   assert.ok(!fx.closeUnconfirmedExample.confirmed);
+});
+
+test('contract: value caps frozen identically on node + browser', () => {
+  const fx = fixture('value_caps.json');
+  for (const [name, mod] of [['node', node], ['browser', browser]]) {
+    assert.equal(mod.MAX_STRING, fx.maxString, `${name} maxString`);
+    assert.equal(mod.MAX_VARS, fx.maxVars, `${name} maxVars`);
+    assert.equal(mod.MAX_FRAMES, fx.maxFrames, `${name} maxFrames`);
+    assert.equal(mod.MAX_LOG_LINES, fx.logsRing, `${name} logsRing`);
+    assert.equal(mod.PARK_WARNING, fx.parkWarning, `${name} parkWarning`);
+    const capped = mod.truncStr('x'.repeat(600), fx.maxString);
+    assert.equal(capped,
+      'x'.repeat(fx.maxString) + fx.truncSuffixFormat.replace('N', String(600 - fx.maxString)),
+      `${name} trunc idiom`);
+  }
+  // Byte-identical park warning across the two JS bridges (py/java held
+  // by their own harnesses + the Rust textual guard).
+  assert.equal(node.PARK_WARNING, browser.PARK_WARNING);
+});
+
+test('contract: logs tail clamp [0,500] default 50 on node + browser', () => {
+  const fx = fixture('value_caps.json');
+  for (const [name, mod, make] of [['node', node, nodeSession], ['browser', browser, browserSession]]) {
+    const st = make();
+    const lines = Array.from({ length: 100 }, (_, i) => `{"line":${i}}`);
+    fs.writeFileSync(path.join(st.cfg.dir, 'logs.jsonl'), lines.join('\n') + '\n');
+    assert.equal(st.cmdLogs({}).lines.length, fx.tailDefault, `${name} default`);
+    assert.deepEqual(st.cmdLogs({ tail: 0 }).lines, [], `${name} zero`);
+    assert.equal(st.cmdLogs({ tail: 9999 }).lines.length, 100, `${name} clamped`);
+    assert.deepEqual(st.cmdLogs({ tail: -3 }).lines, [], `${name} negative`);
+    assert.equal(st.cmdLogs({ tail: 'nonsense' }).lines.length, fx.tailDefault, `${name} non-numeric`);
+    const src = fs.readFileSync(path.join(__dirname, '..',
+      name === 'node' ? 'bridge/node/src/nodebridge.js' : 'bridge/browser/src/browserbridge.js'), 'utf-8');
+    assert.ok(src.includes('Math.max(0, Math.min(500'), `${name} clamp bound in source`);
+  }
+});
+
+test('contract: layer-local records (argv cap, timeout text, dispatch groups)', () => {
+  const fx = fixture('layer_local.json');
+  // argv array cap lives only where argv arrays are kept (node, not browser).
+  assert.equal(node.IDENT_ARRAY_CAP, fx.argvArrayCap);
+  assert.ok(fx.argvArrayCapHolders.includes('node'));
+  assert.ok(fx.argvArrayCapAbsent.includes('browser'));
+  const browserSrc = fs.readFileSync(path.join(__dirname, '..', 'bridge/browser/src/browserbridge.js'), 'utf-8');
+  assert.ok(!browserSrc.includes('IDENT_ARRAY_CAP'), 'browser drops argv wholesale');
+  assert.ok(browserSrc.includes('argv: null'), 'browser argv null record');
+  // Timeout message text per bridge; integer domain agrees at max 3600.
+  assert.equal(fx.timeoutMax, 3600);
+  for (const [name, rel] of [['node', 'bridge/node/src/nodebridge.js'], ['browser', 'bridge/browser/src/browserbridge.js']]) {
+    const src = fs.readFileSync(path.join(__dirname, '..', rel), 'utf-8');
+    assert.ok(src.includes(`'${fx.timeoutMessages[name]}'`), `${name} timeout text`);
+  }
+  // Dispatch groups: node resume is continue/step; browser resume adds reload.
+  assert.deepEqual([...node.RESUME_CMDS].sort(), fx.dispatchGroups.node.resume.sort());
+  assert.deepEqual([...node.WAIT_CMDS], fx.dispatchGroups.node.wait);
+  assert.deepEqual([...node.CAPTURE_CMDS], fx.dispatchGroups.node.capture);
+  assert.deepEqual([...node.MUTATION_CMDS].sort(), fx.dispatchGroups.node.mutation.sort());
+  assert.deepEqual([...browser.RESUME_CMDS].sort(), fx.dispatchGroups.browser.resume.sort());
+  assert.ok(browser.RESUME_CMDS.has('reload'), 'browser reload is a resume op');
+  assert.ok(!node.RESUME_CMDS.has('reload'), 'node has no reload resume');
 });
 
 test('contract: breaks echo rules frozen', async () => {

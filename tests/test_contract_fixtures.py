@@ -80,6 +80,54 @@ class ContractFixtureTests(unittest.TestCase):
         self.assertNotIn("hunter2", json.dumps(redacted))
         self.assertIn(fx["redacted"], json.dumps(redacted))
 
+    def test_value_caps(self):
+        fx = fixture("value_caps.json")
+        # Identical-all-four value caps pinned against the live module.
+        self.assertEqual(bridge.MAX_STRING, fx["maxString"])
+        self.assertEqual(bridge.MAX_VARS, fx["maxVars"])
+        self.assertEqual(bridge.MAX_FRAMES, fx["maxFrames"])
+        self.assertEqual(bridge.MAX_LOG_LINES, fx["logsRing"])
+        self.assertEqual(bridge.PARK_WARNING, fx["parkWarning"])
+        capped = bridge.trunc_str("x" * 600, fx["maxString"])
+        self.assertEqual(
+            capped,
+            "x" * fx["maxString"]
+            + fx["truncSuffixFormat"].replace("N", str(600 - fx["maxString"])),
+        )
+        # Behavioral: logs tail clamp [0,500], default 50 (M2 keeps the
+        # bridge-local check; the CLI clamps to the same values).
+        with tempfile.TemporaryDirectory() as tmp:
+            st = bridge.Session(bridge.Config())
+            st.cfg.dir = tmp
+            st.exited = True  # skip the drain pump: pure file read below
+            with open(os.path.join(tmp, "logs.jsonl"), "w") as f:
+                for n in range(100):
+                    f.write(f'{{"line":{n}}}\n')
+            self.assertEqual(len(st.cmd_logs({})["lines"]), fx["tailDefault"])
+            self.assertEqual(st.cmd_logs({"tail": 0})["lines"], [])
+            self.assertEqual(len(st.cmd_logs({"tail": 9999})["lines"]), 100)
+            self.assertEqual(st.cmd_logs({"tail": -3})["lines"], [])
+            self.assertEqual(len(st.cmd_logs({"tail": "nonsense"})["lines"]),
+                             fx["tailDefault"])
+
+    def test_layer_local(self):
+        fx = fixture("layer_local.json")
+        # py side of the layer-local records; node/browser sides are held
+        # by the JS suite, java (+ all-four textual) by the Rust guard.
+        self.assertEqual(bridge.IDENT_ARRAY_CAP, fx["argvArrayCap"])
+        self.assertIn("py", fx["argvArrayCapHolders"])
+        groups = fx["dispatchGroups"]["py"]
+        self.assertEqual(list(bridge.RESUME_CMDS), groups["resume"])
+        self.assertEqual(list(bridge.WAIT_CMDS), groups["wait"])
+        self.assertEqual(list(bridge.CAPTURE_CMDS), groups["capture"])
+        self.assertEqual(list(bridge.MUTATION_CMDS), groups["mutation"])
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(bridge.Usage) as cm:
+                bridge.parse_args(["session", "--dir", tmp, "--kind", "attach",
+                                   "--port", "1234", "--timeout", "9999"])
+            self.assertEqual(str(cm.exception), fx["timeoutMessages"]["py"])
+        self.assertEqual(fx["timeoutMax"], 3600)
+
     def test_error_phases(self):
         fx = fixture("error_phases.json")
         self.assertEqual(bridge.phase_of_error(bridge.Usage("x")), "config")

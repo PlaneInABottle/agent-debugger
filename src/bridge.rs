@@ -1214,6 +1214,8 @@ mod tests {
             "identity_caps.json",
             "error_phases.json",
             "close_status.json",
+            "value_caps.json",
+            "layer_local.json",
         ] {
             let text = std::fs::read_to_string(
                 PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1240,6 +1242,160 @@ mod tests {
             caps["causeCap"].as_u64().unwrap() as usize
         );
         assert_eq!(caps["redacted"].as_str().unwrap(), "[redacted]");
+    }
+
+    /// M1 frozen policy: the identical-all-four value caps plus the
+    /// layer-local records must match the embedded bridge sources as text.
+    /// Java has no JVM harness, so its values pin here textually (the py/JS
+    /// suites hold their own sides behaviorally); any constant changed
+    /// without a fixture update fails this gate by design.
+    #[test]
+    fn contract_value_caps_match_bridge_sources() {
+        let caps: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/contract/value_caps.json")).unwrap();
+        let local: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/contract/layer_local.json")).unwrap();
+        let warning = caps["parkWarning"].as_str().unwrap();
+        // The warning is one concatenated string at runtime but split over
+        // two source lines everywhere: pin the distinctive first-line
+        // fragment per bridge instead of the joined form.
+        const WARN_FRAG: &str = "parked breakpoint suspends target";
+        assert!(warning.contains(WARN_FRAG));
+        assert!(PYBRIDGE_SOURCE.contains(WARN_FRAG));
+        assert!(NODEBRIDGE_SOURCE.contains(WARN_FRAG));
+        assert!(BROWSERBRIDGE_SOURCE.contains(WARN_FRAG));
+        let java_session = JAVA_SOURCES
+            .iter()
+            .find(|(n, _)| *n == "BridgeSession.java")
+            .unwrap()
+            .1;
+        assert!(java_session.contains(WARN_FRAG));
+        // Identical numeric caps appear in every bridge source, spelled
+        // from the fixture (a fixture edit without a bridge change fails
+        // here; a bridge change without a fixture edit fails here too).
+        let ring = caps["logsRing"].as_u64().unwrap();
+        let max_str = caps["maxString"].as_u64().unwrap();
+        let max_vars = caps["maxVars"].as_u64().unwrap();
+        let max_frames = caps["maxFrames"].as_u64().unwrap();
+        for (name, src) in [
+            ("py", PYBRIDGE_SOURCE),
+            ("node", NODEBRIDGE_SOURCE),
+            ("browser", BROWSERBRIDGE_SOURCE),
+        ] {
+            assert!(
+                src.contains(&format!("MAX_LOG_LINES = {ring}")),
+                "{name} logs ring"
+            );
+            assert!(
+                src.contains(&format!("MAX_STRING = {max_str}")),
+                "{name} maxString"
+            );
+            assert!(
+                src.contains(&format!("MAX_VARS = {max_vars}")),
+                "{name} maxVars"
+            );
+            assert!(
+                src.contains(&format!("MAX_FRAMES = {max_frames}")),
+                "{name} maxFrames"
+            );
+        }
+        let jdi = JAVA_SOURCES
+            .iter()
+            .find(|(n, _)| *n == "JdiBridge.java")
+            .unwrap()
+            .1;
+        assert!(
+            jdi.contains(&format!("MAX_STRING = {max_str}")),
+            "java maxString"
+        );
+        assert!(
+            jdi.contains(&format!("MAX_VARS = {max_vars}")),
+            "java maxVars"
+        );
+        assert!(
+            jdi.contains(&format!("MAX_FRAMES = {max_frames}")),
+            "java maxFrames"
+        );
+        let eval = JAVA_SOURCES
+            .iter()
+            .find(|(n, _)| *n == "BridgeEval.java")
+            .unwrap()
+            .1;
+        assert!(
+            eval.contains(&format!("MAX_LOG_LINES = {ring}")),
+            "java logs ring"
+        );
+        let snapshot = JAVA_SOURCES
+            .iter()
+            .find(|(n, _)| *n == "BridgeSnapshot.java")
+            .unwrap()
+            .1;
+        assert!(snapshot.contains("more chars)"), "java trunc idiom");
+        // Eval truncation idiom shared by all four (live suites cover java).
+        assert!(caps["truncSuffixFormat"]
+            .as_str()
+            .unwrap()
+            .contains("more chars"));
+        assert!(PYBRIDGE_SOURCE.contains("more chars)"));
+        assert!(NODEBRIDGE_SOURCE.contains("more chars)"));
+        assert!(BROWSERBRIDGE_SOURCE.contains("more chars)"));
+        // Tail clamp bound + default in every bridge source, spelled from
+        // the fixture.
+        let tail_max = caps["tailMax"].as_u64().unwrap();
+        let tail_default = caps["tailDefault"].as_u64().unwrap();
+        assert_eq!(caps["tailMin"].as_u64().unwrap(), 0);
+        assert!(PYBRIDGE_SOURCE.contains(&format!("min({tail_max}")));
+        assert!(NODEBRIDGE_SOURCE.contains(&format!("Math.min({tail_max}")));
+        assert!(BROWSERBRIDGE_SOURCE.contains(&format!("Math.min({tail_max}")));
+        assert!(java_session.contains(&format!("Math.min({tail_max}L")));
+        assert!(PYBRIDGE_SOURCE.contains(&format!("tail = {tail_default}")));
+        // Layer-local: argv cap holders carry it, absent sides must not.
+        let argv_cap = local["argvArrayCap"].as_u64().unwrap();
+        assert!(PYBRIDGE_SOURCE.contains(&format!("IDENT_ARRAY_CAP = {argv_cap}")));
+        assert!(NODEBRIDGE_SOURCE.contains(&format!("IDENT_ARRAY_CAP = {argv_cap}")));
+        assert!(!BROWSERBRIDGE_SOURCE.contains("IDENT_ARRAY_CAP"));
+        for (n, src) in JAVA_SOURCES {
+            assert!(!src.contains("IDENT_ARRAY_CAP"), "{n} has no array cap");
+        }
+        // Layer-local: timeout message floors differ, ceiling agrees.
+        for (name, src, want) in [
+            (
+                "py",
+                PYBRIDGE_SOURCE,
+                "timeout must be between 0 and 3600 seconds",
+            ),
+            (
+                "node",
+                NODEBRIDGE_SOURCE,
+                "timeout must be between 0 and 3600 seconds",
+            ),
+            (
+                "browser",
+                BROWSERBRIDGE_SOURCE,
+                "timeout must be between 0 and 3600 seconds",
+            ),
+        ] {
+            assert!(src.contains(want), "{name} timeout text");
+            assert_eq!(local["timeoutMessages"][name].as_str().unwrap(), want);
+        }
+        let cli = JAVA_SOURCES
+            .iter()
+            .find(|(n, _)| *n == "BridgeCli.java")
+            .unwrap()
+            .1;
+        assert!(cli.contains("timeout must be between 1 and 3600 seconds"));
+        assert_eq!(
+            local["timeoutMessages"]["java"].as_str().unwrap(),
+            "timeout must be between 1 and 3600 seconds"
+        );
+        let timeout_max = local["timeoutMax"].as_u64().unwrap();
+        assert!(cli.contains(&format!("seconds <= {timeout_max}")));
+        assert!(NODEBRIDGE_SOURCE.contains(&format!("timeout > {timeout_max}")));
+        // Layer-local: dispatch-group structure.
+        assert!(BROWSERBRIDGE_SOURCE.contains("'continue', 'step', 'reload'"));
+        assert!(NODEBRIDGE_SOURCE.contains("'continue', 'step'"));
+        assert!(!NODEBRIDGE_SOURCE.contains("'reload'"));
+        assert!(java_session.contains("cmd.equals(\"continue\") || cmd.equals(\"step\")"));
     }
 
     /// Marker completeness: every embedded source contributes at least one
