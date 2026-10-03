@@ -281,6 +281,35 @@ pub(crate) fn attach_runtime_failure(
     .into()
 }
 
+/// One phase-routing site for every attach setup failure (fast
+/// error.json, late-settling error.json, first-forward transport): config
+/// phase (connection was established) keeps the semantic message top-level
+/// with no endpoint diagnosis; runtime phase (unexpected internal failure
+/// after a successful operation) keeps the truthful internal message
+/// top-level with no endpoint diagnosis and is never called
+/// endpoint-rejected; transport takes the OS-observed listener state
+/// (pre-attach vs now) with the raw text as sanitized cause. Every v2
+/// bridge writes schemaVersion + phase. Launch (no endpoint) keeps the
+/// message verbatim.
+pub(crate) fn route_setup_failure(
+    endpoint: &Option<(String, u16)>,
+    pre: Option<bool>,
+    phase: Option<&str>,
+    message: String,
+    spec: &SpawnSpec,
+) -> anyhow::Error {
+    if let Some((host, port)) = endpoint {
+        if is_config_phase(phase) {
+            return attach_config_failure(message, &spec.target_identity, &spec.requested);
+        }
+        if is_runtime_phase(phase) {
+            return attach_runtime_failure(message, &spec.target_identity, &spec.requested);
+        }
+        return attach_setup_failure(host, *port, pre, message, spec);
+    }
+    anyhow::anyhow!("{message}")
+}
+
 /// Preflight rejection when a live session already owns the endpoint.
 /// Names the confirmed owner and the redacted endpoint; tells the agent to
 /// reuse or close it. No bridge is ever spawned, so the first session's
@@ -514,40 +543,13 @@ pub(crate) fn spawn_in(
             if failure.corrupt {
                 anyhow::bail!("{}", failure.message);
             }
-            // Attach setup failure: config phase (connection was
-            // established) keeps the semantic message top-level with no
-            // endpoint diagnosis; runtime phase (unexpected internal
-            // failure after a successful operation) keeps the truthful
-            // internal message top-level with no endpoint diagnosis and
-            // is never called endpoint-rejected; transport takes the
-            // OS-observed listener state (pre-attach vs now) with the raw
-            // text as sanitized cause. Every v2 bridge writes
-            // schemaVersion + phase.
-            if let Some((host, port)) = &endpoint {
-                if is_config_phase(failure.phase.as_deref()) {
-                    return Err(attach_config_failure(
-                        failure.message,
-                        &spec.target_identity,
-                        &spec.requested,
-                    ));
-                }
-                if is_runtime_phase(failure.phase.as_deref()) {
-                    return Err(attach_runtime_failure(
-                        failure.message,
-                        &spec.target_identity,
-                        &spec.requested,
-                    ));
-                }
-                let pre = pre_listener.flatten();
-                return Err(attach_setup_failure(
-                    host,
-                    *port,
-                    pre,
-                    failure.message,
-                    spec,
-                ));
-            }
-            anyhow::bail!("{}", failure.message);
+            return Err(route_setup_failure(
+                &endpoint,
+                pre_listener.flatten(),
+                failure.phase.as_deref(),
+                failure.message,
+                spec,
+            ));
         }
         if dir.join("session.json").exists() {
             // Retain the handle until the first request is validated.
@@ -587,36 +589,13 @@ pub(crate) fn spawn_in(
                         if failure.corrupt {
                             anyhow::bail!("{}", failure.message);
                         }
-                        // Late-settling attach failure: same phase routing
-                        // as the fast path (config keeps the semantic
-                        // message; runtime keeps the truthful internal
-                        // message, never endpoint-rejected; transport
-                        // takes a fresh probe).
-                        if let Some((host, port)) = &endpoint {
-                            if is_config_phase(failure.phase.as_deref()) {
-                                return Err(attach_config_failure(
-                                    failure.message,
-                                    &spec.target_identity,
-                                    &spec.requested,
-                                ));
-                            }
-                            if is_runtime_phase(failure.phase.as_deref()) {
-                                return Err(attach_runtime_failure(
-                                    failure.message,
-                                    &spec.target_identity,
-                                    &spec.requested,
-                                ));
-                            }
-                            let pre = pre_listener.flatten();
-                            return Err(attach_setup_failure(
-                                host,
-                                *port,
-                                pre,
-                                failure.message,
-                                spec,
-                            ));
-                        }
-                        anyhow::bail!("{}", failure.message);
+                        return Err(route_setup_failure(
+                            &endpoint,
+                            pre_listener.flatten(),
+                            failure.phase.as_deref(),
+                            failure.message,
+                            spec,
+                        ));
                     }
                     // Fast program + logpoints-only: the target may exit before
                     // the first read, but its logs are already on disk. The
@@ -643,17 +622,13 @@ pub(crate) fn spawn_in(
                     // classified envelope (fresh post probe + identities).
                     bridge::reap_child(&mut child);
                     let _ = std::fs::remove_dir_all(&dir);
-                    if let Some((host, port)) = &endpoint {
-                        let pre = pre_listener.flatten();
-                        return Err(attach_setup_failure(
-                            host,
-                            *port,
-                            pre,
-                            format!("{e:#}"),
-                            spec,
-                        ));
-                    }
-                    return Err(e);
+                    return Err(route_setup_failure(
+                        &endpoint,
+                        pre_listener.flatten(),
+                        None,
+                        format!("{e:#}"),
+                        spec,
+                    ));
                 }
             }
         }
