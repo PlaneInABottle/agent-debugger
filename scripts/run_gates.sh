@@ -121,6 +121,10 @@ run_unit() {
   sh tests/test_install_checksum.sh || fail "test_install_checksum.sh"
   passed "installer checksum"
 
+  section "installer tar-slip guard (sh)"
+  sh tests/test_install_tarslip.sh || fail "test_install_tarslip.sh"
+  passed "installer tar-slip guard"
+
   section "nodebridge owner routing"
   scripts/check_nodebridge_owners.sh || fail "check_nodebridge_owners"
   scripts/check_nodebridge_owners.sh --self-test || fail "check_nodebridge_owners --self-test"

@@ -64,3 +64,33 @@ test('extractArchive ignores ../ and symlink members (no escape, no planted link
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('extractArchive refuses a symlink member named agent-debugger (tar-slip refusal)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'adb-slip-'));
+  try {
+    const outside = path.join(dir, 'outside');
+    fs.mkdirSync(outside, { recursive: true });
+    const payload = path.join(outside, 'payload.txt');
+    fs.writeFileSync(payload, 'EVIL');
+    const archive = path.join(dir, 'pkg.tar.gz');
+    execSync(
+      `python3 - <<'PY'\n` +
+      `import tarfile\n` +
+      `p = ${JSON.stringify(archive)}\n` +
+      `with tarfile.open(p, 'w:gz') as t:\n` +
+      `    li = tarfile.TarInfo('agent-debugger'); li.type = tarfile.SYMTYPE; li.linkname = ${JSON.stringify(payload)}; t.addfile(li)\n` +
+      `PY`,
+      { stdio: 'ignore' },
+    );
+    const dest = path.join(dir, 'dest');
+    fs.mkdirSync(dest);
+    // The isSymbolicLink() refusal (not the member filter): the tar
+    // invocation above explicitly selects `agent-debugger`, so only the
+    // refusal branch can stop the planted link.
+    assert.throws(() => postinstall.extractArchive(archive, dest), /tar-slip/);
+    assert.ok(!fs.existsSync(path.join(dest, 'agent-debugger')), 'planted link removed, not left live');
+    assert.equal(fs.readFileSync(payload, 'utf8'), 'EVIL', 'outside payload untouched');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

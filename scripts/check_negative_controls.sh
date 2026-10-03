@@ -166,6 +166,11 @@ expect_fail "postinstall tar-slip guard" scripts/postinstall.js \
   "spawnSync('tar', ['-xzf', archivePath, '-C', destDir]" \
   node --test tests/postinstall_extract.test.js
 
+expect_fail "postinstall symlink refusal" scripts/postinstall.js \
+  "  if (st.isSymbolicLink()) {\n    try { fs.unlinkSync(member); } catch { /* best effort */ }\n    throw new Error('refusing symlink member in archive (possible tar-slip)');\n  }\n" \
+  "  // TEMP-REVERT: symlink refusal removed\n" \
+  node --test --test-name-pattern="symlink member named" tests/postinstall_extract.test.js
+
 expect_fail "node park-diag mono" bridge/node/src/nodebridge.js \
   "prev.atMono != null" \
   "false" \
