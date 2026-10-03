@@ -3,7 +3,7 @@ const path = require('path');
 const https = require('https');
 const http = require('http');
 const crypto = require('crypto');
-const { execSync } = require('child_process');
+const { spawnSync } = require('child_process');
 
 const pkg = require('../package.json');
 
@@ -99,7 +99,7 @@ async function main() {
       console.warn('[agent-debugger] Warning: Extraction succeeded but binary file not found at expected location.');
     }
   } catch (err) {
-    if (isChecksumMismatch(err)) {
+    if (isChecksumMismatch(err) || isTarSlip(err)) {
       // Tamper/corruption signal: never downgrade to a warning (a warn
       // leaves npm install "successful" with no binary, hiding the
       // attack). Rethrown to the fatal handler below.
@@ -121,10 +121,30 @@ async function main() {
 }
 
 // Extract only the expected binary member: a tampered archive with
-// `../` or symlink members must not write outside the dest dir
-// (tar-slip). Release archives contain exactly `agent-debugger`.
+// `../` members must not write outside the dest dir (tar-slip). Release
+// archives contain exactly `agent-debugger`. No shell interpolation (paths
+// are argv, never a command string), and a symlink member named
+// `agent-debugger` is refused after extraction instead of chmod/executed
+// through (chmod/exec follow links).
 function extractArchive(archivePath, destDir) {
-  execSync(`tar -xzf "${archivePath}" -C "${destDir}" agent-debugger`, { stdio: 'ignore' });
+  const r = spawnSync('tar', ['-xzf', archivePath, '-C', destDir, 'agent-debugger'], { stdio: 'ignore' });
+  if (r.status !== 0) {
+    throw new Error(`tar extraction failed (exit ${r.status})`);
+  }
+  const member = path.join(destDir, 'agent-debugger');
+  let st;
+  try {
+    st = fs.lstatSync(member);
+  } catch {
+    throw new Error('extraction succeeded but binary file not found at expected location');
+  }
+  if (st.isSymbolicLink()) {
+    try { fs.unlinkSync(member); } catch { /* best effort */ }
+    throw new Error('refusing symlink member in archive (possible tar-slip)');
+  }
+  if (!st.isFile()) {
+    throw new Error('archive member is not a regular file (possible tar-slip)');
+  }
 }
 
 function downloadFile(url, dest, maxRedirects = 5, opts = {}) {
@@ -261,6 +281,12 @@ function isChecksumMismatch(err) {
   return !!err && /Checksum mismatch/.test(String((err && err.message) || err));
 }
 
+// A symlink/non-file archive member is a tamper signal like a checksum
+// mismatch: fail loudly, never warn-and-continue with no binary.
+function isTarSlip(err) {
+  return !!err && /tar-slip/.test(String((err && err.message) || err));
+}
+
 function downloadText(url, maxRedirects = 5, opts = {}) {
   const timeoutMs = opts.timeoutMs || 30000;
   const maxChars = opts.maxChars || 16 * 1024;
@@ -304,7 +330,7 @@ function downloadText(url, maxRedirects = 5, opts = {}) {
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { verifyChecksum, sha256File, TARGET_MAP, isChecksumMismatch, main, downloadFile, downloadText, extractArchive };
+  module.exports = { verifyChecksum, sha256File, TARGET_MAP, isChecksumMismatch, isTarSlip, main, downloadFile, downloadText, extractArchive };
 }
 
 // Only auto-run when executed as the npm postinstall script, never on
@@ -313,7 +339,7 @@ if (typeof module !== 'undefined' && module.exports) {
 // on fresh checkouts without bin/ or target/release).
 if (typeof require !== 'undefined' && require.main === module) {
   main().catch((err) => {
-    if (isChecksumMismatch(err)) {
+    if (isChecksumMismatch(err) || isTarSlip(err)) {
       console.error(`[agent-debugger] ${err.message}`);
       console.error('[agent-debugger] Refusing to finish installation with a corrupt binary.');
       process.exit(1);

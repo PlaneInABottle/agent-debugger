@@ -139,6 +139,12 @@ verify_checksum "${TMP_DIR}/${ASSET_NAME}" "$CHECKSUM_URL" || exit 1
 log_info "Extracting binary..."
 tar -xzf "${TMP_DIR}/${ASSET_NAME}" -C "$TMP_DIR" agent-debugger
 
+if [ -L "${TMP_DIR}/agent-debugger" ]; then
+  log_error "Refusing symlink member in archive (possible tar-slip)."
+  rm -f "${TMP_DIR}/agent-debugger"
+  exit 1
+fi
+
 if [ ! -f "${TMP_DIR}/agent-debugger" ]; then
   log_error "Archive did not contain the agent-debugger binary."
   exit 1

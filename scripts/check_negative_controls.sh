@@ -162,8 +162,8 @@ expect_fail_timeout 25 "postinstall sidecar cap" scripts/postinstall.js \
   node --test --test-name-pattern="unbounded sidecar" tests/postinstall_bounds.test.js
 
 expect_fail "postinstall tar-slip guard" scripts/postinstall.js \
-  "execSync(\`tar -xzf \"\${archivePath}\" -C \"\${destDir}\" agent-debugger\`" \
-  "execSync(\`tar -xzf \"\${archivePath}\" -C \"\${destDir}\"\`" \
+  "spawnSync('tar', ['-xzf', archivePath, '-C', destDir, 'agent-debugger']" \
+  "spawnSync('tar', ['-xzf', archivePath, '-C', destDir]" \
   node --test tests/postinstall_extract.test.js
 
 expect_fail "node park-diag mono" bridge/node/src/nodebridge.js \
