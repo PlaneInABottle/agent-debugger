@@ -162,8 +162,10 @@ pub(crate) fn reload_gate(lang: Option<&str>) -> anyhow::Result<()> {
 /// unknown/missing langs which forward rather than assume main-only) own
 /// their roster; main-only adapters (java/browser) get a uniform main-only
 /// roster built from the bridge-maintained session.json (no new bridge
-/// protocol needed before Batch3). A dead bridge still errors via forward —
-/// no fabricated roster — preserving dead-session behavior.
+/// protocol needed before Batch3). The local roster is served from disk
+/// without probing the bridge, so a dead java/browser session reports the
+/// last-published stop/running state instead of erroring — liveness is
+/// answered by commands that forward (context/threads), not by targets.
 pub fn cmd_targets(name: &str) -> anyhow::Result<Value> {
     check_name(name)?;
     let dir = checked_session_dir(name)?;
